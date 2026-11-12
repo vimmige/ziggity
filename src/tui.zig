@@ -2452,6 +2452,81 @@ const help_lines = [_][]const u8{
     "                 in the bottom bar)",
 };
 
+fn helpWordChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+fn helpMatchRank(text: []const u8, query: []const u8) u8 {
+    const trimmed = std.mem.trim(u8, text, " ");
+    var rank: u8 = 3;
+    var offset: usize = 0;
+    while (std.ascii.findIgnoreCase(trimmed[offset..], query)) |relative| {
+        const start = offset + relative;
+        const end = start + query.len;
+        if (start == 0 and end == trimmed.len) return 0;
+        const word = (start == 0 or !helpWordChar(trimmed[start - 1])) and
+            (end == trimmed.len or !helpWordChar(trimmed[end]));
+        rank = @min(rank, if (word) @as(u8, 1) else 2);
+        offset = start + 1;
+        if (offset > trimmed.len) break;
+    }
+    return rank;
+}
+
+const HelpResults = struct {
+    lines: [help_lines.len * 2]usize = undefined,
+    len: usize = 0,
+
+    fn append(self: *HelpResults, index: usize) void {
+        self.lines[self.len] = index;
+        self.len += 1;
+    }
+};
+
+fn helpSearch(raw_query: []const u8) HelpResults {
+    const query = std.mem.trim(u8, raw_query, " ");
+    var results: HelpResults = .{};
+    if (query.len == 0) {
+        for (help_lines, 0..) |_, i| results.append(i);
+        return results;
+    }
+    var last_section: ?usize = null;
+    // Three stable passes keep ties in their original order without sorting.
+    for (0..3) |tier| {
+        var section: usize = 0;
+        var i: usize = 0;
+        while (i < help_lines.len) {
+            const line = help_lines[i];
+            if (line.len == 0) {
+                i += 1;
+                continue;
+            }
+            if (line[0] != ' ') {
+                section = i;
+                i += 1;
+                continue;
+            }
+            const start = i;
+            var rank = helpMatchRank(help_lines[section], query);
+            if (helpKeyEnd(line)) |end| {
+                var keys = std.mem.splitScalar(u8, line[2..end], ',');
+                while (keys.next()) |key| rank = @min(rank, helpMatchRank(key, query));
+                rank = @min(rank, helpMatchRank(line[end..], query));
+            }
+            while (i < help_lines.len) : (i += 1) {
+                const part = help_lines[i];
+                if (i > start and (part.len == 0 or part[0] != ' ' or helpKeyEnd(part) != null)) break;
+                rank = @min(rank, helpMatchRank(part, query));
+            }
+            if (rank != tier) continue;
+            if (last_section == null or last_section.? != section) results.append(section);
+            last_section = section;
+            for (start..i) |index| results.append(index);
+        }
+    }
+    return results;
+}
+
 fn drawHelpPopup(root: vaxis.Window, app: *app_mod.App) void {
     const st = styles();
     // Size the popup to the longest line so nothing is cut on a wide terminal;
@@ -2468,7 +2543,9 @@ fn drawHelpPopup(root: vaxis.Window, app: *app_mod.App) void {
     // so the dialog can open scrolled to it.
     var focus_start: ?usize = null;
     const want = app.help_focus_header;
-    for (help_lines) |line| {
+    const results = helpSearch(app.help_query.items);
+    for (results.lines[0..results.len]) |index| {
+        const line = help_lines[index];
         // Section headers have no leading indent; their wrapped parts keep the style.
         const header = line.len > 0 and line[0] != ' ';
         if (line.len == 0) {
@@ -2491,7 +2568,7 @@ fn drawHelpPopup(root: vaxis.Window, app: *app_mod.App) void {
         }
     }
 
-    const h: u16 = @intCast(@min(@as(usize, root.height -| 1), total + 2));
+    const h: u16 = @intCast(@min(@as(usize, root.height -| 1), @max(total, 1) + 2));
     // The inner content height is `h` minus the top and bottom border rows; the
     // max scroll follows from it. Computed before `popup()` so the one-shot
     // jump below is reflected in the scrollbar it draws (no first-frame mismatch).
@@ -2506,11 +2583,14 @@ fn drawHelpPopup(root: vaxis.Window, app: *app_mod.App) void {
         app.help_scroll_to_focus = false;
     }
 
-    const win = popup(root, w, h, "Keybindings", .{ .len = total, .pos = app.help_scroll });
+    app.help_scroll = @min(app.help_scroll, max_scroll);
+    const title = if (app.help_searching) "Search help (enter scroll, esc clear)" else if (app.help_query.items.len > 0) "Help (/ edit search, esc clear)" else "Keybindings (/ search)";
+    const win = popup(root, w, h, title, .{ .len = total, .pos = app.help_scroll });
 
     const px0: u16 = (root.width - w) / 2;
     const py0: u16 = (root.height - h) / 2;
     app.beginDialogGrid(px0 + 1, py0 + 1, win.height);
+    if (total == 0) print(win, 0, 0, "No matches", st.warning);
 
     // The matched header is drawn as a full-width highlighted bar (an arrow
     // marker plus a selected-row background) so it stands out from the other,
@@ -5276,7 +5356,15 @@ fn drawBottom(win: vaxis.Window, app: *app_mod.App) void {
         return;
     }
     if (app.mode == .help) {
-        print(win, 0, 0, "help  -  j/k scroll  -  any other key closes", st.bottom_accent);
+        if (app.help_searching or app.help_query.items.len > 0) {
+            const prefix = if (app.help_searching) "/ " else "help / ";
+            print(win, 0, 0, prefix, st.bottom_accent);
+            const sc = app_mod.viewScroll(0, win.width -| prefix.len, app.help_cursor);
+            print(win, 0, @intCast(prefix.len), app.help_query.items[sc.origin..], st.bottom);
+            if (app.help_searching) win.showCursor(@intCast(prefix.len + sc.view), 0);
+        } else {
+            print(win, 0, 0, "help  -  / search  -  j/k scroll  -  esc close", st.bottom_accent);
+        }
         return;
     }
 
@@ -6785,4 +6873,47 @@ test "helpKeyEnd isolates the key column of a command line" {
             if (helpKeyEnd(line)) |end| try std.testing.expect(end > 2);
         }
     }
+}
+
+test "help search ranks full matches then whole words then substrings" {
+    try std.testing.expectEqual(@as(u8, 0), helpMatchRank(" R ", "R"));
+    try std.testing.expectEqual(@as(u8, 1), helpMatchRank("press R now", "R"));
+    try std.testing.expectEqual(@as(u8, 2), helpMatchRank("PR page", "R"));
+    try std.testing.expectEqual(@as(u8, 2), helpMatchRank("refresh", "R"));
+    try std.testing.expectEqual(@as(u8, 1), helpMatchRank("preword word", "word"));
+    const all = helpSearch("");
+    try std.testing.expectEqual(help_lines.len, all.len);
+    for (all.lines[0..all.len], 0..) |index, i| try std.testing.expectEqual(i, index);
+    try std.testing.expectEqual(@as(usize, 0), helpSearch("no-such-help-entry").len);
+    const matches = helpSearch("R ");
+    var exact_keys: usize = 0;
+    var seen_partial = false;
+    for (matches.lines[0..matches.len]) |index| {
+        const line = help_lines[index];
+        if (helpKeyEnd(line)) |end| {
+            if (std.ascii.eqlIgnoreCase(line[2..end], "r")) {
+                try std.testing.expect(!seen_partial);
+                exact_keys += 1;
+            } else {
+                seen_partial = true;
+            }
+        }
+    }
+    try std.testing.expect(exact_keys >= 2);
+    try std.testing.expect(seen_partial);
+    const lower = helpSearch("copy");
+    const upper = helpSearch("Copy");
+    try std.testing.expect(lower.len > 0);
+    try std.testing.expectEqualSlices(usize, lower.lines[0..lower.len], upper.lines[0..upper.len]);
+    const continued = helpSearch("diamond");
+    var found = false;
+    for (continued.lines[0..continued.len], 0..) |index, i| {
+        if (std.mem.indexOf(u8, help_lines[index], "diamond") != null) {
+            found = true;
+            try std.testing.expect(i > 1);
+            try std.testing.expect(helpKeyEnd(help_lines[continued.lines[1]]) != null);
+            try std.testing.expectEqual(index + 1, continued.lines[i + 1]);
+        }
+    }
+    try std.testing.expect(found);
 }

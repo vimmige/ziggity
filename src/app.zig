@@ -4070,6 +4070,9 @@ pub const App = struct {
     stash_path_owned: ?[]u8 = null,
     mode: Mode = .normal,
     status_filter_index: usize = 0,
+    help_searching: bool = false,
+    help_query: std.ArrayList(u8) = .empty,
+    help_cursor: usize = 0,
     help_scroll: usize = 0,
     help_max_scroll: usize = 0,
     /// When the help dialog opens, the section header matching the current
@@ -4423,6 +4426,7 @@ pub const App = struct {
         self.allocator.free(self.commit_preserved_subject);
         self.allocator.free(self.commit_preserved_body);
         if (self.commit_draft_path) |p| self.allocator.free(p);
+        self.help_query.deinit(self.allocator);
         self.file_filter_buffer.deinit(self.allocator);
         for (self.filter_history.items) |entry| self.allocator.free(entry);
         self.filter_history.deinit(self.allocator);
@@ -5042,6 +5046,28 @@ pub const App = struct {
             return;
         }
         if (self.mode == .help) {
+            if (self.isEscapeKey(key) and (self.help_searching or self.help_query.items.len > 0)) {
+                self.help_searching = false;
+                self.help_query.clearRetainingCapacity();
+                self.help_cursor = 0;
+                self.help_scroll = 0;
+                self.clearDialogSelection();
+                return;
+            }
+            if (self.help_searching) {
+                if (self.isEnterKey(key)) {
+                    self.help_searching = false;
+                } else if (try self.editLine(&self.help_query, &self.help_cursor, key) == .changed) {
+                    self.help_scroll = 0;
+                    self.help_scroll_to_focus = false;
+                    self.clearDialogSelection();
+                }
+                return;
+            }
+            if (key.matches('/', .{})) {
+                self.help_searching = true;
+                return;
+            }
             if (self.config.keymap.down.matches(key) or key.matches(vaxis.Key.down, .{})) {
                 self.help_scroll = @min(self.help_scroll + 1, self.help_max_scroll);
                 self.clearDialogSelection();
@@ -5466,6 +5492,9 @@ pub const App = struct {
             },
             .help => {
                 self.mode = .help;
+                self.help_searching = false;
+                self.help_query.clearRetainingCapacity();
+                self.help_cursor = 0;
                 self.help_scroll = 0;
                 // Open the help scrolled to (and highlighting) the section that
                 // matches where the user pressed `?`.
@@ -14166,6 +14195,33 @@ test "help dialog scrolling clamps at the bottom and resumes up immediately" {
     try std.testing.expectEqual(@as(usize, 1), app.help_scroll);
 }
 
+test "help search edits text before navigation and escape clears before closing" {
+    var no_files = [_]model.FileStatus{};
+    var app = try testApp(std.testing.allocator, &no_files);
+    defer deinitTestApp(&app);
+    app.mode = .help;
+    app.help_scroll = 2;
+    app.help_scroll_to_focus = true;
+    try app.handleKey(.{ .codepoint = '/' });
+    try app.handleKey(.{ .codepoint = 'j', .text = "j" });
+    try app.handleKey(.{ .codepoint = 'k', .text = "k" });
+    try std.testing.expectEqualStrings("jk", app.help_query.items);
+    try std.testing.expectEqual(@as(usize, 0), app.help_scroll);
+    try std.testing.expect(!app.help_scroll_to_focus);
+    try app.handleKey(.{ .codepoint = vaxis.Key.backspace });
+    try std.testing.expectEqualStrings("j", app.help_query.items);
+    try app.handleKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expect(!app.help_searching);
+    app.help_max_scroll = 2;
+    try app.handleKey(.{ .codepoint = 'j' });
+    try std.testing.expectEqual(@as(usize, 1), app.help_scroll);
+    try app.handleKey(.{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(Mode.help, app.mode);
+    try std.testing.expectEqual(@as(usize, 0), app.help_query.items.len);
+    try app.handleKey(.{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(Mode.normal, app.mode);
+}
+
 test "appendDiffColumns strips ANSI, respects columns, preserves tabs" {
     const a = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
@@ -19687,6 +19743,7 @@ fn deinitTestApp(app: *App) void {
     app.allocator.free(app.commit_preserved_subject);
     app.allocator.free(app.commit_preserved_body);
     if (app.commit_draft_path) |p| app.allocator.free(p);
+    app.help_query.deinit(app.allocator);
     app.file_filter_buffer.deinit(app.allocator);
     for (app.filter_history.items) |entry| app.allocator.free(entry);
     app.filter_history.deinit(app.allocator);
