@@ -22,7 +22,7 @@ Sleep 2.5s
 Show
 
 # Focus the Branches panel; the feature branch is checked out and selected.
-Type "4"
+Type "5"
 Sleep 1.2s
 
 # Open the AI-generate menu and choose "Generate PR description".

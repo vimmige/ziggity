@@ -28,7 +28,7 @@ Show
 # Status panel and the UI never blocks.
 Type "f"
 Sleep 300ms
-Type "5"
+Type "4"
 Sleep 200ms
 Type "j"
 Sleep 200ms

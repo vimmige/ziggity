@@ -429,8 +429,8 @@ test "normal key mapping handles global and focused actions" {
     try std.testing.expectEqual(Action.refresh, fromNormalKey(testKey('R'), keymap, .files).?);
     try std.testing.expectEqual(Action.focus_status, fromNormalKey(testKey('1'), keymap, .files).?);
     try std.testing.expectEqual(Action.focus_files, fromNormalKey(testKey('2'), keymap, .files).?);
-    try std.testing.expectEqual(Action.focus_branches, fromNormalKey(testKey('4'), keymap, .files).?);
-    try std.testing.expectEqual(Action.focus_commits, fromNormalKey(testKey('5'), keymap, .files).?);
+    try std.testing.expectEqual(Action.focus_branches, fromNormalKey(testKey('5'), keymap, .files).?);
+    try std.testing.expectEqual(Action.focus_commits, fromNormalKey(testKey('4'), keymap, .files).?);
     try std.testing.expectEqual(Action.focus_stash, fromNormalKey(testKey('6'), keymap, .files).?);
     try std.testing.expectEqual(Action.stage_all, fromNormalKey(testKey('a'), keymap, .files).?);
     try std.testing.expectEqual(Action.discard_selected, fromNormalKey(testKey('d'), keymap, .files).?);

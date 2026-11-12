@@ -22,20 +22,20 @@ Sleep 3s
 Show
 Sleep 800ms
 
-# Press 4 to focus Branches (Local tab), then 4 again to walk the tabs.
-Type "4"
+# Press 5 to focus Branches (Local tab), then 5 again to walk the tabs.
+Type "5"
 Sleep 1.6s
-Type "4"
+Type "5"
 Sleep 1.6s
-Type "4"
+Type "5"
 Sleep 1.6s
-Type "4"
+Type "5"
 Sleep 1.2s
 
-# 5 walks the Commits panel tabs: Commits -> Reflog -> Divergence.
-Type "5"
+# 4 walks the Commits panel tabs: Commits -> Reflog -> Divergence.
+Type "4"
 Sleep 1.4s
-Type "5"
+Type "4"
 Sleep 1.4s
-Type "5"
+Type "4"
 Sleep 1.6s

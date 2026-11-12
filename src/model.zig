@@ -160,8 +160,8 @@ pub const Focus = enum {
     status,
     files,
     staged,
-    branches,
     commits,
+    branches,
     stash,
     main,
 

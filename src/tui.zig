@@ -1509,10 +1509,10 @@ fn sidePanelWidth(total: u16, percent: u8) u16 {
     return @max(@as(u16, 20), @min(raw, main_floor));
 }
 
-const SidePanelHeights = struct { status: u16, files: u16, staged: u16, branches: u16, commits: u16, stash: u16 };
+const SidePanelHeights = struct { status: u16, files: u16, staged: u16, commits: u16, branches: u16, stash: u16 };
 
 fn sidePanelHeights(body_h: u16, focused: model.Focus, accordion: bool, expanded_weight: u16, extra_status_rows: u16, collapse_status: bool, modes: app_mod.PanelScreenModes) SidePanelHeights {
-    const panels = [_]model.Focus{ .status, .files, .staged, .branches, .commits, .stash };
+    const panels = [_]model.Focus{ .status, .files, .staged, .commits, .branches, .stash };
     var heights: [6]u16 = @splat(0);
     var weights: [6]u16 = @splat(0);
     var remaining = body_h;
@@ -1582,7 +1582,7 @@ fn sidePanelHeights(body_h: u16, focused: model.Focus, accordion: bool, expanded
             }
         }
     }
-    return .{ .status = heights[0], .files = heights[1], .staged = heights[2], .branches = heights[3], .commits = heights[4], .stash = heights[5] };
+    return .{ .status = heights[0], .files = heights[1], .staged = heights[2], .commits = heights[3], .branches = heights[4], .stash = heights[5] };
 }
 
 fn diffTitleRef(ref: []const u8) []const u8 {
@@ -1663,8 +1663,8 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
         .{ .focus = .status, .x = 0, .y = 0, .w = side_w, .h = status_h },
         .{ .focus = .files, .x = 0, .y = status_h, .w = side_w, .h = files_h },
         .{ .focus = .staged, .x = 0, .y = status_h + files_h, .w = side_w, .h = staged_h },
-        .{ .focus = .branches, .x = 0, .y = status_h + files_h + staged_h, .w = side_w, .h = branches_h },
-        .{ .focus = .commits, .x = 0, .y = status_h + files_h + staged_h + branches_h, .w = side_w, .h = commits_h },
+        .{ .focus = .commits, .x = 0, .y = status_h + files_h + staged_h, .w = side_w, .h = commits_h },
+        .{ .focus = .branches, .x = 0, .y = status_h + files_h + staged_h + commits_h, .w = side_w, .h = branches_h },
         .{ .focus = .stash, .x = 0, .y = status_h + files_h + staged_h + branches_h + commits_h, .w = side_w, .h = stash_h },
         .{ .focus = .main, .x = side_w, .y = 0, .w = main_w, .h = body_h },
     };
@@ -1709,46 +1709,15 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
             endListPan(app, .staged, w.width);
         }
         y += staged_h;
-        if (branches_h > 0) {
-            // Drilled into a branch's sub-commits / files: a plain descriptive title.
-            // Otherwise the title is the tab strip (Local / Remotes / Tags / …).
-            const branches_tabs = [_][]const u8{ "Local", "Remotes", "Tags" };
-            const w = if (app.branch_commits_active) blk: {
-                const t = if (app.branchFilesActive())
-                    (if (patch_mod.branchFilesPatchCount(app) > 0)
-                        (std.fmt.bufPrint(&app.branches_title_buf, "[4] Commit files (patch: {d}) (esc back)", .{patch_mod.branchFilesPatchCount(app)}) catch "[4] Commit files (esc back)")
-                    else
-                        "[4] Commit files  (space: add to patch) (esc back)")
-                else
-                    (std.fmt.bufPrint(&app.branches_title_buf, "[4] Commits ({s}) (esc back)", .{app.branch_commits_ref}) catch "[4] Commits (esc back)");
-                break :blk panel(root, 0, y, side_w, branches_h, t, app.focus == .branches, listScrollInfo(app, .branches));
-            } else if (app.remoteDrillActive()) blk: {
-                // Drilled into a remote's branches.
-                const t = std.fmt.bufPrint(&app.branches_title_buf, "[4] {s} (esc back)", .{app.remote_drill.?}) catch "[4] Remote (esc back)";
-                break :blk panel(root, 0, y, side_w, branches_h, t, app.focus == .branches, listScrollInfo(app, .branches));
-            } else blk: {
-                // The Local tab's name filter (`/`) shows a title hint, mirroring
-                // the Commits filter: a clear-hint while focused, else "(filtered)".
-                const suffix = if (app.branches_tab == .local and app.branch_filter.len > 0)
-                    (if (app.focus == .branches) "(esc to cancel filter)" else "(filtered)")
-                else
-                    "";
-                break :blk tabbedPanel(root, 0, y, side_w, branches_h, 4, &branches_tabs, @backingInt(app.branches_tab), suffix, app.focus == .branches, listScrollInfo(app, .branches));
-            };
-            beginListPan(app, .branches);
-            drawBranches(w, app);
-            endListPan(app, .branches, w.width);
-        }
-        y += branches_h;
         if (commits_h > 0) {
             const commits_tabs = [_][]const u8{ "Commits", "Reflog", "Divergence" };
             const w = if (app.mode == .rebase_plan) blk: {
-                break :blk panel(root, 0, y, side_w, commits_h, "[5] Interactive rebase (enter run, esc cancel)", app.focus == .commits, listScrollInfo(app, .commits));
+                break :blk panel(root, 0, y, side_w, commits_h, "[4] Interactive rebase (enter run, esc cancel)", app.focus == .commits, listScrollInfo(app, .commits));
             } else if (app.commitsFilesActive()) blk: {
                 const t = if (patch_mod.commitFilesPatchCount(app) > 0)
-                    (std.fmt.bufPrint(&app.commits_title_buf, "[5] Commit files (patch: {d}) (esc back)", .{patch_mod.commitFilesPatchCount(app)}) catch "[5] Commit files (esc back)")
+                    (std.fmt.bufPrint(&app.commits_title_buf, "[4] Commit files (patch: {d}) (esc back)", .{patch_mod.commitFilesPatchCount(app)}) catch "[4] Commit files (esc back)")
                 else
-                    "[5] Commit files  (space: add to patch) (esc back)";
+                    "[4] Commit files  (space: add to patch) (esc back)";
                 break :blk panel(root, 0, y, side_w, commits_h, t, app.focus == .commits, listScrollInfo(app, .commits));
             } else blk: {
                 // When the Commits list is filtered (Commits tab only), the title
@@ -1759,13 +1728,44 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
                     (if (app.focus == .commits) "(esc to cancel filter)" else "(filtered)")
                 else
                     "";
-                break :blk tabbedPanel(root, 0, y, side_w, commits_h, 5, &commits_tabs, @backingInt(app.commits_tab), suffix, app.focus == .commits, listScrollInfo(app, .commits));
+                break :blk tabbedPanel(root, 0, y, side_w, commits_h, 4, &commits_tabs, @backingInt(app.commits_tab), suffix, app.focus == .commits, listScrollInfo(app, .commits));
             };
             beginListPan(app, .commits);
             drawCommits(w, app);
             endListPan(app, .commits, w.width);
         }
         y += commits_h;
+        if (branches_h > 0) {
+            // Drilled into a branch's sub-commits / files: a plain descriptive title.
+            // Otherwise the title is the tab strip (Local / Remotes / Tags / …).
+            const branches_tabs = [_][]const u8{ "Local", "Remotes", "Tags" };
+            const w = if (app.branch_commits_active) blk: {
+                const t = if (app.branchFilesActive())
+                    (if (patch_mod.branchFilesPatchCount(app) > 0)
+                        (std.fmt.bufPrint(&app.branches_title_buf, "[5] Commit files (patch: {d}) (esc back)", .{patch_mod.branchFilesPatchCount(app)}) catch "[5] Commit files (esc back)")
+                    else
+                        "[5] Commit files  (space: add to patch) (esc back)")
+                else
+                    (std.fmt.bufPrint(&app.branches_title_buf, "[5] Commits ({s}) (esc back)", .{app.branch_commits_ref}) catch "[5] Commits (esc back)");
+                break :blk panel(root, 0, y, side_w, branches_h, t, app.focus == .branches, listScrollInfo(app, .branches));
+            } else if (app.remoteDrillActive()) blk: {
+                // Drilled into a remote's branches.
+                const t = std.fmt.bufPrint(&app.branches_title_buf, "[5] {s} (esc back)", .{app.remote_drill.?}) catch "[5] Remote (esc back)";
+                break :blk panel(root, 0, y, side_w, branches_h, t, app.focus == .branches, listScrollInfo(app, .branches));
+            } else blk: {
+                // The Local tab's name filter (`/`) shows a title hint, mirroring
+                // the Commits filter: a clear-hint while focused, else "(filtered)".
+                const suffix = if (app.branches_tab == .local and app.branch_filter.len > 0)
+                    (if (app.focus == .branches) "(esc to cancel filter)" else "(filtered)")
+                else
+                    "";
+                break :blk tabbedPanel(root, 0, y, side_w, branches_h, 5, &branches_tabs, @backingInt(app.branches_tab), suffix, app.focus == .branches, listScrollInfo(app, .branches));
+            };
+            beginListPan(app, .branches);
+            drawBranches(w, app);
+            endListPan(app, .branches, w.width);
+        }
+        y += branches_h;
         if (stash_h > 0) {
             const w = panel(root, 0, y, side_w, stash_h, "[6] Stash", app.focus == .stash, listScrollInfo(app, .stash));
             beginListPan(app, .stash);

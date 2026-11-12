@@ -44,7 +44,7 @@ Escape
 Sleep 800ms
 
 # Commits panel with per-commit diff preview (incl. GPG signature status).
-Type "5"
+Type "4"
 Sleep 700ms
 Type "j"
 Sleep 1.5s
@@ -58,7 +58,7 @@ Escape
 Sleep 700ms
 
 # Diffing mode: mark a ref, the title tracks the comparison in git's notation.
-Type "4"
+Type "5"
 Sleep 700ms
 Type "j"
 Sleep 500ms

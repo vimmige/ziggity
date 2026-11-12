@@ -8,7 +8,7 @@ the written reference. Every binding is remappable, see
 
 | Key | Action |
 |---|---|
-| `1`–`6` | Focus Status / Files / Staged / Branches / Commits / Stash (press again to cycle that panel's tabs) |
+| `1`–`6` | Focus Status / Files / Staged / Commits / Branches / Stash (press again to cycle that panel's tabs) |
 | `h` `l` / arrows | Move focus between side panels |
 | `j` `k` / arrows | Move selection |
 | `tab` | Focus the Diff panel (and back) |
@@ -211,8 +211,8 @@ the written reference. Every binding is remappable, see
 The Branches, Files and Commits panels each have tabs (`[` and `]` switch
 them). You can also walk those tabs with the panel's own number key: press it
 once to focus the panel, then press it again to move to the next tab. So `4`
-goes Branches, then Local, Remotes, Tags; `5` goes Commits, then Reflog and
-Divergence; `2` walks Files, Worktrees and Submodules. The key still jumps
+goes Commits, then Reflog and Divergence; `5` goes Branches, then Local,
+Remotes and Tags; `2` walks Files, Worktrees and Submodules. The key still jumps
 straight to the panel from anywhere else, so nothing is lost. It is on by
 default and can be turned off with `switch_tabs_with_panel_keys = false`.
 
@@ -220,4 +220,4 @@ default and can be turned off with `switch_tabs_with_panel_keys = false`.
   <img src="assets/ziggity-tabs.gif" alt="Pressing a panel number key repeatedly cycles its tabs" width="900">
 </p>
 
-<p align="center"><i>Pressing 4 repeatedly walks Local, Remotes and Tags; 5 walks Commits, Reflog and Divergence.</i></p>
+<p align="center"><i>Pressing 4 repeatedly walks Commits, Reflog and Divergence; 5 walks Local, Remotes and Tags.</i></p>

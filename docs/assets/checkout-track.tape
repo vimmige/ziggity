@@ -19,7 +19,7 @@ Hide
 Type "Z=$PWD/zig-out/bin/ziggity; cd /tmp/zdemo-co/clone && $Z"
 Enter
 Sleep 2.5s
-Type "4"
+Type "5"
 Sleep 800ms
 Show
 

@@ -8425,9 +8425,9 @@ pub const App = struct {
         self.focus = switch (self.focus) {
             .status => .files,
             .files => .staged,
-            .staged => .branches,
-            .branches => .commits,
-            .commits => .stash,
+            .staged => .commits,
+            .commits => .branches,
+            .branches => .stash,
             .stash => .status,
             .main => unreachable,
         };
@@ -8441,9 +8441,9 @@ pub const App = struct {
             .status => .stash,
             .files => .status,
             .staged => .files,
-            .branches => .staged,
-            .commits => .branches,
-            .stash => .commits,
+            .commits => .staged,
+            .branches => .commits,
+            .stash => .branches,
             .main => unreachable,
         };
         self.resetMainView();

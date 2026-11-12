@@ -19,7 +19,7 @@ Hide
 Type "Z=$PWD/zig-out/bin/ziggity; cd /tmp/zdemo-graph && $Z"
 Enter
 Sleep 2.5s
-Type "5"
+Type "4"
 Sleep 500ms
 Ctrl+L
 Sleep 3s
