@@ -1630,6 +1630,13 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
     const main_w = root.width - side_w;
 
     var y: u16 = 0;
+    var panel_modes = app.panel_modes;
+    for ([_]model.Focus{ .files, .staged, .commits, .branches }) |focus| {
+        const mode = panel_modes.get(focus);
+        if (focus != app.contentFocus() and app.activeListLen(focus) == 0 and (mode == .normal or mode == .half)) {
+            panel_modes.set(focus, if (body_h < 24) .collapsed else .single);
+        }
+    }
     const heights = sidePanelHeights(
         body_h,
         app.contentFocus(),
@@ -1637,7 +1644,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
         app.config.expanded_side_panel_weight,
         app.statusIndicatorRows() -| 1, // one indicator line fits the base height; the rest add a row each
         app.statusCollapsed(),
-        app.panel_modes,
+        panel_modes,
     );
     // Full mode on a side panel gives that one panel the whole body; the others
     // collapse to nothing (their draw calls are height-guarded below).
