@@ -203,10 +203,11 @@ const WorktreeRun = struct {
     untracked: git_mod.Git.UntrackedFiles = .all,
     generation: u64,
     result: ?app_mod.WorktreeSnapshot = null,
+    amend_view: ?git_mod.Git.AmendView = null,
 };
 
 fn worktreeWorker(wr: *WorktreeRun) void {
-    wr.result = app_mod.WorktreeSnapshot.load(async_allocator, wr.io, wr.environ, wr.root, wr.git_dir, wr.untracked) catch null;
+    wr.result = app_mod.WorktreeSnapshot.load(async_allocator, wr.io, wr.environ, wr.root, wr.git_dir, wr.untracked, wr.amend_view) catch null;
     _ = wr.loop.tryPostEvent(.worktree_done) catch false;
 }
 
@@ -401,10 +402,11 @@ const MutationRun = struct {
     environ: *std.process.Environ.Map,
     mutation: app_mod.Mutation,
     result: ?git_mod.ExecResult = null,
+    amend_view: ?git_mod.Git.AmendView = null,
 };
 
 fn mutationWorker(mr: *MutationRun) void {
-    mr.result = mr.mutation.run(async_allocator, mr.io, mr.environ, mr.root, mr.git_dir) catch null;
+    mr.result = mr.mutation.run(async_allocator, mr.io, mr.environ, mr.root, mr.git_dir, mr.amend_view) catch null;
     _ = mr.loop.tryPostEvent(.mutation_done) catch false;
 }
 
@@ -422,10 +424,11 @@ const RepoLoadRun = struct {
     untracked: git_mod.Git.UntrackedFiles = .all,
     commit_limit: usize = app_mod.commit_load_batch,
     result: ?model.RepoData = null,
+    amend_view: ?git_mod.Git.AmendView = null,
 };
 
 fn repoLoadWorker(rl: *RepoLoadRun) void {
-    rl.result = app_mod.loadRepoDataAsync(async_allocator, rl.io, rl.environ, rl.root, rl.git_dir, rl.branch_sort, rl.log_order, rl.untracked, rl.commit_limit);
+    rl.result = app_mod.loadRepoDataAsync(async_allocator, rl.io, rl.environ, rl.root, rl.git_dir, rl.branch_sort, rl.log_order, rl.untracked, rl.commit_limit, rl.amend_view);
     _ = rl.loop.tryPostEvent(.repo_load_done) catch false;
 }
 
@@ -449,6 +452,8 @@ const ScopedLoadRun = struct {
     commit_limit: usize = app_mod.commit_load_batch,
     result: ?app_mod.ScopedData = null,
 
+    amend_view: ?git_mod.Git.AmendView = null,
+
     fn freeFilters(self: *ScopedLoadRun) void {
         if (self.grep) |g| async_allocator.free(g);
         if (self.author) |a| async_allocator.free(a);
@@ -464,7 +469,7 @@ fn scopedLoadWorker(sr: *ScopedLoadRun) void {
         .grep = sr.grep,
         .author = sr.author,
         .path = sr.path,
-    }, sr.branch_sort, sr.log_order, sr.untracked, sr.commit_limit);
+    }, sr.branch_sort, sr.log_order, sr.untracked, sr.commit_limit, sr.amend_view);
     _ = sr.loop.tryPostEvent(.scoped_load_done) catch false;
 }
 
@@ -769,7 +774,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
     // Load the repo off-thread: the loop's initial winsize event
     // paints the skeleton with "Loading…" placeholders right away, and the
     // panels fill in when `repo_load_done` lands — no startup freeze, no flash.
-    var repo_load_run: RepoLoadRun = .{ .io = io, .loop = &loop, .root = app.git.root, .git_dir = app.git.git_dir, .environ = app.git.environ, .branch_sort = app.git.branch_sort, .log_order = app.git.log_order, .untracked = app.git.untracked_files, .commit_limit = app.commit_limit };
+    var repo_load_run: RepoLoadRun = .{ .io = io, .loop = &loop, .root = app.git.root, .git_dir = app.git.git_dir, .environ = app.git.environ, .branch_sort = app.git.branch_sort, .log_order = app.git.log_order, .untracked = app.git.untracked_files, .amend_view = app.git.amend_view, .commit_limit = app.commit_limit };
     var repo_load_future: ?std.Io.Future(void) = null;
     defer if (repo_load_future) |*f| {
         f.cancel(io);
@@ -1033,7 +1038,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
             // On a successful switch the app marks an initial load pending; start
             // it against the new root. (A failed switch leaves the app unchanged.)
             if (app.initial_load_pending) {
-                repo_load_run = .{ .io = io, .loop = &loop, .root = app.git.root, .git_dir = app.git.git_dir, .environ = app.git.environ, .branch_sort = app.git.branch_sort, .log_order = app.git.log_order, .untracked = app.git.untracked_files, .commit_limit = app.commit_limit };
+                repo_load_run = .{ .io = io, .loop = &loop, .root = app.git.root, .git_dir = app.git.git_dir, .environ = app.git.environ, .branch_sort = app.git.branch_sort, .log_order = app.git.log_order, .untracked = app.git.untracked_files, .amend_view = app.git.amend_view, .commit_limit = app.commit_limit };
                 repo_load_future = io.concurrent(repoLoadWorker, .{&repo_load_run}) catch blk: {
                     app.applyRepoLoad(null, async_allocator);
                     break :blk null;
@@ -1105,6 +1110,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                     .git_dir = app.git.git_dir,
                     .environ = app.git.environ,
                     .untracked = app.git.untracked_files,
+                    .amend_view = app.git.amend_view,
                     .generation = generation,
                     .result = null,
                 };
@@ -1185,7 +1191,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
         // input gate keeps another mutation from being requested meanwhile.
         if (mutation_future == null) {
             if (app.takeMutation()) |mutation| {
-                mutation_run = .{ .io = io, .loop = &loop, .root = app.git.root, .git_dir = app.git.git_dir, .environ = app.git.environ, .mutation = mutation, .result = null };
+                mutation_run = .{ .io = io, .loop = &loop, .root = app.git.root, .git_dir = app.git.git_dir, .environ = app.git.environ, .mutation = mutation, .amend_view = app.git.amend_view, .result = null };
                 mutation_future = io.concurrent(mutationWorker, .{&mutation_run}) catch blk: {
                     try app.completeMutation(mutation, null, async_allocator);
                     break :blk null;
@@ -1213,6 +1219,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                     .branch_sort = app.git.branch_sort,
                     .log_order = app.git.log_order,
                     .untracked = app.git.untracked_files,
+                    .amend_view = app.git.amend_view,
                     .commit_limit = app.commit_limit,
                     .result = null,
                 };
@@ -1696,7 +1703,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
         }
         y += files_h;
         if (staged_h > 0) {
-            const w = panel(root, 0, y, side_w, staged_h, "[3] Staged", app.focus == .staged, listScrollInfo(app, .staged));
+            const w = panel(root, 0, y, side_w, staged_h, if (app.git.amend_view != null) "[3] Staged (amend)" else "[3] Staged", app.focus == .staged, listScrollInfo(app, .staged));
             beginListPan(app, .staged);
             drawFiles(w, app, .staged);
             endListPan(app, .staged, w.width);
@@ -3618,7 +3625,7 @@ fn drawFiles(win: vaxis.Window, app: *const app_mod.App, focus: model.Focus) voi
         print(win, 0, 0, if (app.initial_load_pending) "Loading..." else if (focus == .staged) "No staged files" else "Working tree clean", styles().muted);
         return;
     }
-    if (focus == .staged and app.data.stagedCount() == 0) {
+    if (focus == .staged and app.panelFileCount(.staged) == 0) {
         print(win, 0, 0, "No staged files", styles().muted);
         return;
     }
@@ -5527,7 +5534,7 @@ fn footerHints(c: FooterCtx) []const u8 {
         else
             "j/k commit  enter files  c/V/C copy/paste/clear commit  y copy hash  esc back" ++ global;
     }
-    if (c.conflict and c.focus == .files) {
+    if (c.conflict and (c.focus == .files or c.focus == .staged)) {
         // No "esc back" here: the Files panel is at the top level during a
         // conflict, so esc has nothing to back out to (only `q` quits). `enter`
         // opens the per-conflict resolver directly; `space` opens the menu with
@@ -5549,7 +5556,7 @@ fn footerHints(c: FooterCtx) []const u8 {
             .tags => "space checkout  n new-tag  d delete  P push  g reset  y copy  w worktree  W diff  [/] tabs" ++ global_branches,
         };
     }
-    if (c.focus == .staged) return "space unstage  a unstage all  c commit  enter hunks  ` tree  ~ fold tree" ++ global;
+    if (c.focus == .staged) return "space unstage  a unstage all  c commit  A amend  enter hunks  ` tree  ~ fold tree" ++ global;
     if (c.focus == .files) {
         return switch (c.files_tab) {
             .files => "space stage  a all  c/w commit/no-verify  A amend  e edit  d discard  i ignore/exclude  y copy  ^f fixup-base  s stash  / filter  ` tree  enter hunks  [/] tabs" ++ global,

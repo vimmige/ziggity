@@ -163,6 +163,39 @@ pub const Git = struct {
     /// and our — default, but a large repo can set `normal`/`no` to make status
     /// far cheaper.
     untracked_files: UntrackedFiles = .all,
+    amend_view: ?AmendView = null,
+
+    pub const AmendView = struct {
+        head: [65]u8 = @splat(0),
+        base: [65]u8 = @splat(0),
+    };
+
+    pub fn openAmendView(self: *Git) !void {
+        const head = try self.headHash();
+        defer self.allocator.free(head);
+        if (head.len == 0 or head.len > 64) return GitError.UnexpectedOutput;
+        const base = try self.output(&.{ "rev-parse", self.amendBaseRef() });
+        defer self.allocator.free(base);
+        const trimmed = std.mem.trim(u8, base, " \t\r\n");
+        if (trimmed.len == 0 or trimmed.len > 64) return GitError.UnexpectedOutput;
+        var view = AmendView{};
+        @memcpy(view.head[0..head.len], head);
+        @memcpy(view.base[0..trimmed.len], trimmed);
+        self.amend_view = view;
+    }
+
+    pub fn stagingBaseRef(self: *Git) ?[]const u8 {
+        if (self.amend_view) |*view| return std.mem.sliceTo(&view.base, 0);
+        return null;
+    }
+
+    pub fn clearStaleAmendView(self: *Git) !void {
+        if (self.amend_view) |view| {
+            const head = try self.headHash();
+            defer self.allocator.free(head);
+            if (!std.mem.eql(u8, head, std.mem.sliceTo(&view.head, 0)) or (self.detectState() != .clean and !self.isRebaseEdit())) self.amend_view = null;
+        }
+    }
 
     pub const LogFilter = enum { grep, author, path };
 
@@ -390,6 +423,7 @@ pub const Git = struct {
         const context_arg = try std.fmt.allocPrint(self.allocator, "--unified={d}", .{diff_context});
         defer self.allocator.free(context_arg);
         if (staged) {
+            if (self.stagingBaseRef()) |base| return self.output(&.{ "diff", "--staged", "--no-ext-diff", "--no-color", context_arg, base, "--", path });
             return self.output(&.{ "diff", "--staged", "--no-ext-diff", "--no-color", context_arg, "--", path });
         }
         return self.output(&.{ "diff", "--no-ext-diff", "--no-color", context_arg, "--", path });
@@ -399,6 +433,7 @@ pub const Git = struct {
     /// find which commit a change should be fixed up into.
     pub fn diffForFixup(self: *Git, staged: bool) ![]u8 {
         if (staged) {
+            if (self.stagingBaseRef()) |base| return self.output(&.{ "diff", "--staged", "--no-ext-diff", "--no-color", "--unified=3", base, "--" });
             return self.output(&.{ "diff", "--staged", "--no-ext-diff", "--no-color", "--unified=3", "--" });
         }
         return self.output(&.{ "diff", "--no-ext-diff", "--no-color", "--unified=3", "--" });
@@ -595,6 +630,10 @@ pub const Git = struct {
         return .clean;
     }
 
+    pub fn isRebaseEdit(self: *Git) bool {
+        return self.gitPathExists("rebase-merge/amend");
+    }
+
     pub fn isBisecting(self: *Git) bool {
         return self.gitPathExists("BISECT_LOG");
     }
@@ -767,7 +806,42 @@ pub const Git = struct {
     /// background worker can capture the (slow) git output off the UI thread and
     /// let the UI thread do the cheap parsing with its own allocator.
     pub fn statusPorcelain(self: *Git) ![]u8 {
-        return self.output(&.{ "status", "--porcelain", "-z", self.untracked_files.flag(), "--find-renames=50%" });
+        try self.clearStaleAmendView();
+        const base = self.stagingBaseRef() orelse
+            return self.output(&.{ "status", "--porcelain", "-z", self.untracked_files.flag(), "--find-renames=50%" });
+        const bytes = try self.output(&.{ "status", "--porcelain", "-z", self.untracked_files.flag(), "--no-renames" });
+        defer self.allocator.free(bytes);
+        const files = try parseStatus(self.allocator, bytes);
+        defer model.deinitFileStatuses(self.allocator, files);
+        const staged = try self.output(&.{ "diff", "--cached", "--name-status", "-z", "--find-renames=50%", base, "--" });
+        defer self.allocator.free(staged);
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer out.deinit();
+        var parts = std.mem.splitScalar(u8, staged, 0);
+        while (parts.next()) |status| {
+            if (status.len == 0) continue;
+            const source = parts.next() orelse return GitError.UnexpectedOutput;
+            const renamed = status[0] == 'R' or status[0] == 'C';
+            const path = if (renamed) parts.next() orelse return GitError.UnexpectedOutput else source;
+            var unstaged: u8 = ' ';
+            for (files) |*file| {
+                if (std.mem.eql(u8, path, file.path) and file.short_status[0] != '?') {
+                    unstaged = file.short_status[1];
+                    file.short_status[1] = ' ';
+                    break;
+                }
+            }
+            try out.writer.print("{c}{c} {s}\x00", .{ status[0], unstaged, path });
+            if (renamed) try out.writer.print("{s}\x00", .{source});
+        }
+        for (files) |file| {
+            if (file.short_status[0] == '?') {
+                try out.writer.print("{c}{c} {s}\x00", .{ file.short_status[0], file.short_status[1], file.path });
+            } else if (file.short_status[1] != ' ') {
+                try out.writer.print(" {c} {s}\x00", .{ file.short_status[1], file.path });
+            }
+        }
+        return out.toOwnedSlice();
     }
 
     pub fn loadFiles(self: *Git) ![]model.FileStatus {
@@ -1054,6 +1128,7 @@ pub const Git = struct {
     /// The staged patch (`git diff --cached`), the AI context for commit
     /// authoring. Owned by the caller; empty on failure.
     pub fn stagedDiff(self: *Git) ![]u8 {
+        if (self.amend_view != null) return self.amendDiff();
         // The full staged diff can be enormous (e.g. a vendored toolchain: tens of
         // thousands of files, hundreds of MB), overflowing exec's 16 MB output cap.
         // Only the first ~16 KB is ever used in the AI prompt, so rather than fail
@@ -1211,6 +1286,7 @@ pub const Git = struct {
 
     /// Newline-separated names of staged files (`git diff --cached --name-only`).
     pub fn stagedFileNames(self: *Git) ![]u8 {
+        if (self.amend_view != null) return self.amendFileNames();
         var res = try self.exec(&.{ "diff", "--cached", "--name-only" });
         defer res.deinit(self.allocator);
         if (!res.ok()) return self.allocator.dupe(u8, "");
@@ -1498,7 +1574,7 @@ pub const Git = struct {
         if (paths.len == 0) return self.successResult();
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(self.allocator);
-        try args.appendSlice(self.allocator, &.{ "reset", "HEAD", "--" });
+        try args.appendSlice(self.allocator, &.{ "reset", self.stagingBaseRef() orelse "HEAD", "--" });
         try args.appendSlice(self.allocator, paths);
         return self.exec(args.items);
     }
@@ -1508,6 +1584,7 @@ pub const Git = struct {
     }
 
     pub fn unstageAll(self: *Git) !ExecResult {
+        if (self.stagingBaseRef()) |base| return self.exec(&.{ "reset", base, "--", "." });
         return self.exec(&.{"reset"});
     }
 
@@ -1515,7 +1592,7 @@ pub const Git = struct {
         if (file.isRename()) {
             if (try self.resetFilePaths(file)) |failure| return failure;
             if (file.previous_path) |previous| {
-                if (try self.runStep(&.{ "checkout", "HEAD", "--", previous })) |failure| return failure;
+                if (try self.runStep(&.{ "checkout", self.stagingBaseRef() orelse "HEAD", "--", previous })) |failure| return failure;
             }
             if (try self.runStep(&.{ "clean", "-fd", "--", file.path })) |failure| return failure;
             return self.successResult();
@@ -1529,7 +1606,7 @@ pub const Git = struct {
             return self.successResult();
         }
 
-        if (try self.runStep(&.{ "checkout", "HEAD", "--", file.path })) |failure| return failure;
+        if (try self.runStep(&.{ "checkout", self.stagingBaseRef() orelse "HEAD", "--", file.path })) |failure| return failure;
         return self.successResult();
     }
 
@@ -2297,7 +2374,7 @@ pub const Git = struct {
     fn resetFilePaths(self: *Git, file: model.FileStatus) !?ExecResult {
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(self.allocator);
-        try args.appendSlice(self.allocator, &.{ "reset", "HEAD", "--", file.path });
+        try args.appendSlice(self.allocator, &.{ "reset", self.stagingBaseRef() orelse "HEAD", "--", file.path });
         if (file.previous_path) |previous| try args.append(self.allocator, previous);
         return self.runStep(args.items);
     }

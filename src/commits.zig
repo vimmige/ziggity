@@ -9,10 +9,12 @@ const vaxis = @import("vaxis");
 const app_mod = @import("app.zig");
 const commitops_mod = @import("commitops.zig");
 const aiauthor_mod = @import("aiauthor.zig");
+const staging_mod = @import("staging.zig");
 
 const App = app_mod.App;
 
 pub fn startCommitPrompt(app: *App, no_verify: bool) !void {
+    if (app.git.amend_view != null) return startAmendReword(app);
     if (app.data.stagedCount() == 0) {
         try app.setMessage("stage files before committing", .{});
         return;
@@ -222,15 +224,23 @@ pub fn startAmendCommit(app: *App) !void {
 }
 
 pub fn amendLastCommit(app: *App) !void {
-    if (app.data.state != .clean) {
+    if (app.data.state != .clean and !(app.data.state == .rebasing and app.git.isRebaseEdit())) {
         try app.setMessage("finish the in-progress operation first (m)", .{});
         return;
     }
-    if (app.data.stagedCount() == 0) {
-        var key_buf: [16]u8 = undefined;
-        const reword_key = app.config.keymap.commit_reword.label(&key_buf);
-        try app.setMessage("stage changes to amend, or use {s} in the Commits panel to just reword the last commit", .{reword_key});
-        return;
+    if (app.git.amend_view == null) {
+        if (app.stage_all_pending != null or app.stage_pending.count() > 0) return app.setMessage("wait for staging to finish", .{});
+        app.git.openAmendView() catch |err| {
+            if (err == error.UnexpectedOutput) return app.setMessage("no commit to amend", .{});
+            return err;
+        };
+        staging_mod.clearStaging(app);
+        errdefer app.git.amend_view = null;
+        try app.refreshFiles();
+        app.focus = .staged;
+        app.resetMainView();
+        try app.updatePreview();
+        return app.setMessage("amend view: A to amend, c to edit message, esc to exit", .{});
     }
     // With `reword_on_amend`, open the message editor prefilled with HEAD's
     // message so the amend can also reword in one step. Submitting the editor is
@@ -243,16 +253,13 @@ pub fn amendLastCommit(app: *App) !void {
 }
 
 /// Open the commit editor prefilled with HEAD's message so an amend can reword
-/// it while folding in the staged changes (`reword_on_amend`). HEAD is the
-/// newest entry of the Commits log. Submitting runs `git commit --amend -m`.
+/// it while folding in staged changes. Submitting runs `git commit --amend -m`.
 fn startAmendReword(app: *App) !void {
-    if (app.data.commits.len == 0) {
-        // No commit to amend into: fall back to the classic confirmed amend.
-        return app.requestConfirmation(.amend, "confirm amend last commit", .{});
-    }
-    const commit = app.data.commits[0];
-    const body = app.git.commitBody(commit.hash) catch try app.allocator.alloc(u8, 0);
-    defer app.allocator.free(body);
+    const message = try app.git.commitMessage("HEAD");
+    defer app.allocator.free(message);
+    const subject_end = std.mem.indexOfScalar(u8, message, '\n') orelse message.len;
+    const subject = message[0..subject_end];
+    const body = std.mem.trimStart(u8, message[subject_end..], "\r\n");
 
     app.mode = .commit_prompt;
     app.commit_action = .amend;
@@ -260,7 +267,7 @@ fn startAmendReword(app: *App) !void {
     app.commit_ai_source = aiauthor_mod.DiffSource.forAmend(); // AI describes HEAD plus the staged changes
     app.commit_field = .subject;
     app.commit_buffer.clearRetainingCapacity();
-    try app.commit_buffer.appendSlice(app.allocator, commit.subject);
+    try app.commit_buffer.appendSlice(app.allocator, subject);
     app.commit_body_buffer.clearRetainingCapacity();
     try app.commit_body_buffer.appendSlice(app.allocator, body);
     app.commit_cursor = app.commit_buffer.items.len;

@@ -1117,11 +1117,14 @@ fn dupArgv(parts: []const []const u8) ![]const []const u8 {
 /// `--submodule`, `--find-renames`, and — for a renamed/copied file — the
 /// previous path in the pathspec, so the diff is paired against its source
 /// instead of coming back empty (or as a misleading whole-file add).
-fn fileDiffArgv(staged: bool, ctx_arg: []const u8, path: []const u8, previous_path: ?[]const u8) ![]const []const u8 {
+fn fileDiffArgv(base: ?[]const u8, staged: bool, ctx_arg: []const u8, path: []const u8, previous_path: ?[]const u8) ![]const []const u8 {
     var parts: std.ArrayList([]const u8) = .empty;
     defer parts.deinit(page_alloc);
     try parts.append(page_alloc, "diff");
-    if (staged) try parts.append(page_alloc, "--staged");
+    if (staged) {
+        try parts.append(page_alloc, "--staged");
+        if (base) |ref| try parts.append(page_alloc, ref);
+    }
     try parts.appendSlice(page_alloc, &.{ "--no-ext-diff", "--submodule", "--color=always", ctx_arg, "--find-renames=50%", "--" });
     try parts.append(page_alloc, path);
     if (previous_path) |prev| try parts.append(page_alloc, prev);
@@ -1131,11 +1134,14 @@ fn fileDiffArgv(staged: bool, ctx_arg: []const u8, path: []const u8, previous_pa
 /// Build a page-allocated `git diff` argv for everything under a working-tree
 /// directory. The empty path omits the pathspec, so the diff covers the whole
 /// tree (the root row). A `--stat` header lists the affected files.
-fn dirDiffArgv(staged: bool, ctx_arg: []const u8, path: []const u8) ![]const []const u8 {
+fn dirDiffArgv(base: ?[]const u8, staged: bool, ctx_arg: []const u8, path: []const u8) ![]const []const u8 {
     var parts: std.ArrayList([]const u8) = .empty;
     defer parts.deinit(page_alloc);
     try parts.append(page_alloc, "diff");
-    if (staged) try parts.append(page_alloc, "--staged");
+    if (staged) {
+        try parts.append(page_alloc, "--staged");
+        if (base) |ref| try parts.append(page_alloc, ref);
+    }
     try parts.appendSlice(page_alloc, &.{ "--no-ext-diff", "--submodule", "--color=always", "--stat", "--patch", ctx_arg, "--find-renames=50%" });
     if (path.len > 0) try parts.appendSlice(page_alloc, &.{ "--", path });
     return dupArgv(parts.items);
@@ -1267,7 +1273,7 @@ pub const WorktreeSnapshot = struct {
     /// Worker-thread entry point. `gpa` is the page allocator; everything
     /// returned is owned by it. Borrows `root`/`environ` read-only from the
     /// app's Git (never mutated by these read-only commands).
-    pub fn load(gpa: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, root: []u8, git_dir: []const u8, untracked: git_mod.Git.UntrackedFiles) !WorktreeSnapshot {
+    pub fn load(gpa: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, root: []u8, git_dir: []const u8, untracked: git_mod.Git.UntrackedFiles, amend_view: ?git_mod.Git.AmendView) !WorktreeSnapshot {
         // A throwaway Git bound to the page allocator. The commands it runs
         // (branch/rev-parse/rev-list/status) are all read-only, so its command
         // log stays empty and `root`/`git_dir` are only ever read — no deinit.
@@ -1278,6 +1284,7 @@ pub const WorktreeSnapshot = struct {
             .root = root,
             .git_dir = @constCast(git_dir),
             .untracked_files = untracked,
+            .amend_view = amend_view,
         };
         var status = try wgit.loadStatusSummary();
         errdefer status.deinit(gpa);
@@ -1379,6 +1386,7 @@ const RepoLoadCtx = struct {
     log_order: model.LogOrder,
     untracked: git_mod.Git.UntrackedFiles,
     commit_limit: usize,
+    amend_view: ?git_mod.Git.AmendView,
 
     status: ?model.StatusSummary = null,
     state: model.RepoState = .clean,
@@ -1394,7 +1402,7 @@ const RepoLoadCtx = struct {
     stash: ?[]model.StashEntry = null,
 
     fn git(self: *const RepoLoadCtx) git_mod.Git {
-        return .{ .allocator = self.gpa, .io = self.io, .environ = self.environ, .root = self.root, .git_dir = @constCast(self.git_dir), .branch_sort = self.branch_sort, .log_order = self.log_order, .untracked_files = self.untracked };
+        return .{ .allocator = self.gpa, .io = self.io, .environ = self.environ, .root = self.root, .git_dir = @constCast(self.git_dir), .branch_sort = self.branch_sort, .log_order = self.log_order, .untracked_files = self.untracked, .amend_view = self.amend_view };
     }
 };
 
@@ -1447,8 +1455,8 @@ fn loadStashW(ctx: *RepoLoadCtx) void {
 /// instead of the sum of them all. The result is page-owned; the UI thread
 /// deep-copies it into the gpa (see `App.applyRepoLoad`). `root`/`environ` are
 /// borrowed read-only.
-pub fn loadRepoDataAsync(gpa: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, root: []u8, git_dir: []const u8, branch_sort: model.BranchSortOrder, log_order: model.LogOrder, untracked: git_mod.Git.UntrackedFiles, commit_limit: usize) ?model.RepoData {
-    var ctx = RepoLoadCtx{ .gpa = gpa, .io = io, .environ = environ, .root = root, .git_dir = git_dir, .branch_sort = branch_sort, .log_order = log_order, .untracked = untracked, .commit_limit = commit_limit };
+pub fn loadRepoDataAsync(gpa: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, root: []u8, git_dir: []const u8, branch_sort: model.BranchSortOrder, log_order: model.LogOrder, untracked: git_mod.Git.UntrackedFiles, commit_limit: usize, amend_view: ?git_mod.Git.AmendView) ?model.RepoData {
+    var ctx = RepoLoadCtx{ .gpa = gpa, .io = io, .environ = environ, .root = root, .git_dir = git_dir, .branch_sort = branch_sort, .log_order = log_order, .untracked = untracked, .commit_limit = commit_limit, .amend_view = amend_view };
 
     // Tags are left out: `tag --sort=-creatordate` peels every annotated tag,
     // which on a repo like linux.git is the slowest command of the lot and would
@@ -1524,8 +1532,8 @@ pub const ScopedData = struct {
 /// Worker-thread entry: load just the requested views on a throwaway
 /// page-allocator `Git`. `filters` are applied to the commits load so an active
 /// Commits filter is preserved. Borrows `root`/`environ`/filter strings.
-pub fn loadScopesAsync(gpa: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, root: []u8, git_dir: []const u8, scopes: ScopeSet, filters: LogFilters, branch_sort: model.BranchSortOrder, log_order: model.LogOrder, untracked: git_mod.Git.UntrackedFiles, commit_limit: usize) ScopedData {
-    var wgit = git_mod.Git{ .allocator = gpa, .io = io, .environ = environ, .root = root, .git_dir = @constCast(git_dir), .branch_sort = branch_sort, .log_order = log_order, .untracked_files = untracked };
+pub fn loadScopesAsync(gpa: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, root: []u8, git_dir: []const u8, scopes: ScopeSet, filters: LogFilters, branch_sort: model.BranchSortOrder, log_order: model.LogOrder, untracked: git_mod.Git.UntrackedFiles, commit_limit: usize, amend_view: ?git_mod.Git.AmendView) ScopedData {
+    var wgit = git_mod.Git{ .allocator = gpa, .io = io, .environ = environ, .root = root, .git_dir = @constCast(git_dir), .branch_sort = branch_sort, .log_order = log_order, .untracked_files = untracked, .amend_view = amend_view };
     // Borrowed filter strings (owned by the caller's run struct); wgit only
     // reads them and we never call clearLogFilters, so nothing is freed here.
     wgit.log_grep = @constCast(filters.grep);
@@ -1703,12 +1711,14 @@ pub const Mutation = union(enum) {
     /// Worker-thread entry point: run the mutation on a throwaway page-allocator
     /// `Git`. The wgit's command log (mutations are recorded) is page-allocated
     /// and freed here since the real app log is updated separately on request.
-    pub fn run(self: Mutation, gpa: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, root: []u8, git_dir: []const u8) !git_mod.ExecResult {
-        var wgit = git_mod.Git{ .allocator = gpa, .io = io, .environ = environ, .root = root, .git_dir = @constCast(git_dir) };
+    pub fn run(self: Mutation, gpa: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, root: []u8, git_dir: []const u8, amend_view: ?git_mod.Git.AmendView) !git_mod.ExecResult {
+        var wgit = git_mod.Git{ .allocator = gpa, .io = io, .environ = environ, .root = root, .git_dir = @constCast(git_dir), .amend_view = amend_view };
         defer {
             for (wgit.command_log.items) |e| gpa.free(e);
             wgit.command_log.deinit(gpa);
         }
+        try wgit.clearStaleAmendView();
+        if (amend_view != null and wgit.amend_view == null) return git_mod.GitError.CommandFailed;
         return switch (self) {
             .commit => |x| wgit.commit(x.message, x.no_verify),
             .amend => wgit.amendCommit(),
@@ -4885,6 +4895,9 @@ pub const App = struct {
             if (path) |value| self.allocator.free(value);
         };
 
+        if (self.git.amend_view) |view| {
+            if (!std.mem.eql(u8, snap.head, std.mem.sliceTo(&view.head, 0)) or (snap.state != .clean and !self.git.isRebaseEdit())) self.git.amend_view = null;
+        }
         const prev_conflicts = self.conflictFileCount();
         self.data.replaceStatus(self.allocator, status);
         status = .{};
@@ -5313,6 +5326,11 @@ pub const App = struct {
                 }
                 if (self.staging_active) {
                     try staging_mod.closeStaging(self);
+                } else if (self.git.amend_view != null and self.focus.isFilePanel()) {
+                    if (self.stage_all_pending != null or self.stage_pending.count() > 0) return self.setMessage("wait for staging to finish", .{});
+                    self.git.amend_view = null;
+                    try self.refreshFiles();
+                    try self.setMessage("exited amend view", .{});
                 } else if (self.focus == .main) {
                     try self.leaveMain();
                 } else if (self.focus == .commits and self.commit_files_active) {
@@ -6860,7 +6878,7 @@ pub const App = struct {
     }
 
     /// How many working-tree files currently have a merge conflict.
-    fn conflictFileCount(self: *const App) usize {
+    pub fn conflictFileCount(self: *const App) usize {
         var n: usize = 0;
         for (self.data.files) |f| {
             if (f.conflict) n += 1;
@@ -6890,7 +6908,7 @@ pub const App = struct {
     }
 
     pub fn fileMatchesPanelFilter(self: *const App, file: model.FileStatus, focus: model.Focus) bool {
-        if (focus == .staged) return file.has_staged and !file.conflict;
+        if (focus == .staged) return if (file.conflict) self.data.state == .rebasing else file.has_staged;
         if (!self.file_display_filter.matches(file)) return false;
         if (self.file_filter.len == 0) return true;
         if (textmatch.pathMatchesFilter(file.path, self.file_filter)) return true;
@@ -6904,7 +6922,7 @@ pub const App = struct {
         return self.panelFileCount(self.contentFocus());
     }
 
-    fn panelFileCount(self: *const App, focus: model.Focus) usize {
+    pub fn panelFileCount(self: *const App, focus: model.Focus) usize {
         var count: usize = 0;
         for (self.data.files) |file| {
             if (self.fileMatchesPanelFilter(file, focus)) count += 1;
@@ -12505,12 +12523,12 @@ pub const App = struct {
                 } else {
                     const staged = kind == .staged_file;
                     try sections.append(page_alloc, .{
-                        .argv = try fileDiffArgv(staged, ctx_arg, f.path, f.previous_path),
-                        .label = if (staged) "Staged\n\n" else "Unstaged\n\n",
+                        .argv = try fileDiffArgv(self.git.stagingBaseRef(), staged and !f.conflict, ctx_arg, f.path, f.previous_path),
+                        .label = if (f.conflict) "Conflicted (resolve before continuing)\n\n" else if (staged) "Staged\n\n" else "Unstaged\n\n",
                     });
-                    if (kind == .file and self.file_display_filter != .unstaged) {
+                    if (kind == .file and !f.conflict and self.file_display_filter != .unstaged) {
                         try sections.append(page_alloc, .{
-                            .argv = try fileDiffArgv(true, ctx_arg, f.path, f.previous_path),
+                            .argv = try fileDiffArgv(self.git.stagingBaseRef(), true, ctx_arg, f.path, f.previous_path),
                             .label = "Staged\n\n",
                         });
                     }
@@ -12520,12 +12538,18 @@ pub const App = struct {
                 empty_msg = if (kind == .staged_dir) "No staged changes under this directory.\n" else if (self.file_display_filter == .unstaged) "No unstaged changes under this directory.\n" else "No changes under this directory.\n";
                 const staged = kind == .staged_dir;
                 try sections.append(page_alloc, .{
-                    .argv = try dirDiffArgv(staged, ctx_arg, p),
+                    .argv = try dirDiffArgv(self.git.stagingBaseRef(), staged, ctx_arg, p),
                     .label = if (staged) "Staged\n\n" else "Unstaged\n\n",
                 });
+                if (staged and self.data.state == .rebasing and self.conflictFileCount() > 0) {
+                    try sections.append(page_alloc, .{
+                        .argv = try dupArgv(&.{ "diff", "--no-ext-diff", "--submodule", "--color=always", ctx_arg, "--diff-filter=U", "--", if (p.len > 0) p else "." }),
+                        .label = "Conflicted (resolve before continuing)\n\n",
+                    });
+                }
                 if (kind == .dir and self.file_display_filter != .unstaged) {
                     try sections.append(page_alloc, .{
-                        .argv = try dirDiffArgv(true, ctx_arg, p),
+                        .argv = try dirDiffArgv(self.git.stagingBaseRef(), true, ctx_arg, p),
                         .label = "Staged\n\n",
                     });
                 }
@@ -13232,6 +13256,7 @@ pub const App = struct {
             var mutable = result;
             defer mutable.deinit(gpa);
             if (mutable.ok()) {
+                if (std.meta.activeTag(job) != .stage_batch) self.git.amend_view = null;
                 // The commit landed: drop the preserved draft that submitCommit
                 // kept in case this failed. (On failure it stays, so reopening
                 // the commit dialog restores the message.) `cherry_pick_message`
@@ -13990,7 +14015,7 @@ pub const App = struct {
 
     pub fn collectVisiblePaths(self: *const App, paths: *std.ArrayList([]const u8), kind: VisiblePathKind) !void {
         for (self.data.files) |file| {
-            if (!self.fileMatchesFilter(file)) continue;
+            if (!self.fileMatchesFilter(file) or file.conflict) continue;
             const include = switch (kind) {
                 .staged => file.has_staged,
                 .unstaged => file.has_unstaged,
@@ -14091,7 +14116,7 @@ test "word and line motion helpers" {
 test "fileDiffArgv pairs renames and sets rename/submodule flags" {
     // A renamed file: the previous path must be appended so the diff is paired
     // against its source (otherwise it can come back empty / as a whole-file add).
-    const argv = try fileDiffArgv(true, "--unified=3", "new/path.zig", "old/path.zig");
+    const argv = try fileDiffArgv(null, true, "--unified=3", "new/path.zig", "old/path.zig");
     defer {
         for (argv) |a| page_alloc.free(a);
         page_alloc.free(argv);
@@ -14109,7 +14134,7 @@ test "fileDiffArgv pairs renames and sets rename/submodule flags" {
     try std.testing.expect(has_submodule and has_rename);
 
     // A normal (non-renamed) file: no previous path, no --staged.
-    const argv2 = try fileDiffArgv(false, "--unified=3", "file.zig", null);
+    const argv2 = try fileDiffArgv(null, false, "--unified=3", "file.zig", null);
     defer {
         for (argv2) |a| page_alloc.free(a);
         page_alloc.free(argv2);
@@ -15247,21 +15272,25 @@ test "paste-and-edit keeps its message when the cherry-pick conflicts (issue #35
     try std.testing.expectEqual(@as(usize, 0), app.commit_preserved_body.len);
 }
 
-test "amending the last commit asks first, but only with staged changes" {
+test "amending from the amend view asks first" {
     const allocator = std.testing.allocator;
     var staged = [_]model.FileStatus{.{ .path = @constCast("g.py"), .short_status = .{ 'M', ' ' }, .has_staged = true, .has_unstaged = false, .tracked = true, .added = false, .deleted = false, .conflict = false }};
     var app = try testApp(allocator, &staged);
     defer deinitTestApp(&app);
 
-    // Clean repo + staged changes: amend confirms first
+    app.git.amend_view = .{};
+
+    // Loaded amend view: submitting confirms first
     // instead of rewriting HEAD outright.
     try commits_mod.amendLastCommit(&app);
     try std.testing.expect(app.pending_confirmation != null and app.pending_confirmation.? == .amend);
     try std.testing.expect(app.mode == .confirmation);
 
-    // Nothing staged: nothing to fold in, so no prompt — just a hint message.
+    // An in-progress merge prevents opening the amend view.
     var none = [_]model.FileStatus{};
     app.data.files = &none;
+    app.git.amend_view = null;
+    app.data.state = .merging;
     app.pending_confirmation = null;
     app.mode = .normal;
     try commits_mod.amendLastCommit(&app);
@@ -15782,7 +15811,7 @@ test "a scoped refresh reflects bisect start and reset (issue #29)" {
     // files scope, exactly as a mutation refresh does off the UI loop.
     const refresh = struct {
         fn run(app_: *App, tio_: std.Io, env_: *std.process.Environ.Map, root: []u8) void {
-            const sd = loadScopesAsync(page_alloc, tio_, env_, root, app_.git.git_dir, ScopeSet.init(.{ .files = true }), .{}, .date, .date, .all, 200);
+            const sd = loadScopesAsync(page_alloc, tio_, env_, root, app_.git.git_dir, ScopeSet.init(.{ .files = true }), .{}, .date, .date, .all, 200, null);
             app_.applyScopedLoad(sd, page_alloc);
         }
     }.run;
@@ -19121,7 +19150,7 @@ test "real threaded load then App.deinit is allocator-clean (issue #19)" {
     // payload) applied through `applyRepoLoad`, which deep-copies into gpa-owned
     // `data`. Then the full `App.deinit` runs under the checking allocator, which
     // panics on any invalid/double free — reproducing issue #19 if present.
-    const loaded = loadRepoDataAsync(page_alloc, tio, &env, app.git.root, app.git.git_dir, app.git.branch_sort, app.git.log_order, app.git.untracked_files, app.commit_limit);
+    const loaded = loadRepoDataAsync(page_alloc, tio, &env, app.git.root, app.git.git_dir, app.git.branch_sort, app.git.log_order, app.git.untracked_files, app.commit_limit, app.git.amend_view);
     app.applyRepoLoad(loaded, page_alloc);
     app.deinit();
 }
