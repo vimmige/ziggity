@@ -3648,7 +3648,7 @@ pub const App = struct {
     // outlive the flush, like every other cell-backing string (paths, diffs).
     branches_title_buf: [96]u8 = undefined,
     commits_title_buf: [80]u8 = undefined,
-    main_title_buf: [128]u8 = undefined,
+    main_title_buf: [4096]u8 = undefined,
     // Independent view scroll for the side list panels, so the mouse wheel
     // scrolls the view without moving the selection. The view re-anchors to the
     // selection only when the *selection* changes (keyboard/click/refresh), not
@@ -12405,7 +12405,7 @@ pub const App = struct {
     /// When a range of commits is selected (and we're on the commit list, not a
     /// commit's file drill), the oldest/newest endpoints for a combined range
     /// diff. Null for a single selection or a non-commit list.
-    fn commitRangeEndpoints(self: *const App) ?struct { from: []const u8, to: []const u8 } {
+    pub fn commitRangeEndpoints(self: *const App) ?struct { from: []const u8, to: []const u8 } {
         if (self.commitsFilesActive() or self.branchFilesActive()) return null;
         const b = self.rangeBounds() orelse return null;
         if (b.lo == b.hi) return null;

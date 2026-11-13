@@ -44,7 +44,7 @@ var word_diff_enabled: bool = true;
 /// Scratch for the Diff panel title with the soft-wrap indicator appended, so
 /// the current wrap state is always visible in the header (not just a transient
 /// message). Module-level so the title outlives the frame flush.
-var main_title_wrap_buf: [128]u8 = undefined;
+var main_title_wrap_buf: [4112]u8 = undefined;
 var split_title_buf: [64]u8 = undefined;
 var review_footer_buf: [256]u8 = undefined;
 
@@ -1592,6 +1592,50 @@ fn diffTitleRef(ref: []const u8) []const u8 {
     return ref[0..@min(ref.len, @as(usize, if (is_sha) 8 else 40))];
 }
 
+fn diffTitle(app: *app_mod.App) []const u8 {
+    var writer = std.Io.Writer.fixed(&app.main_title_buf);
+    writer.writeAll("Diff") catch unreachable;
+    if (app.diff_base) |ref| {
+        const base = diffTitleRef(ref);
+        const target = if (diffmode_mod.selectedRefForDiff(app)) |t| diffTitleRef(t) else "selected";
+        writer.print(" [{s}{s}{s}]", .{
+            if (app.diff_reverse) target else base,
+            if (app.diff_three_dot) "..." else "..",
+            if (app.diff_reverse) base else target,
+        }) catch {};
+    } else switch (app.contentFocus()) {
+        .commits, .branches => {
+            if (app.contentFocus() == .branches and !app.branch_commits_active) {
+                return if (app.selectedBranchRefName() != null) "Log" else "Diff";
+            }
+            if (app.commitRangeEndpoints()) |range| {
+                writer.print(" [{s}^..{s}]", .{ diffTitleRef(range.from), diffTitleRef(range.to) }) catch {};
+            } else if (app.selectedCommit()) |commit| {
+                writer.print(" · {s} · {s}", .{ commit.short_hash, commit.subject }) catch {};
+            }
+        },
+        .files, .staged => {
+            if (app.contentFocus() == .files and app.files_tab != .files) return "Diff";
+            const source = if (app.contentFocus() == .staged) "Staged" else if (app.file_display_filter == .all) "Unstaged + Staged" else "Unstaged";
+            const path = if (app.tree_view) blk: {
+                const row = app.fileTree().selectedRow() orelse return "Diff";
+                break :blk if (row.path.len == 0) "." else row.path;
+            } else if (app.selectedFile()) |file| file.path else return "Diff";
+            writer.print(" · {s} · {s}", .{ source, path }) catch {};
+            if (app.focus == .main and app.selectedFile() != null) {
+                writer.writeAll(" (enter to stage)") catch {};
+            }
+        },
+        .stash => {
+            if (app.selectedStash()) |entry| {
+                writer.print(" · {s} · {s}", .{ entry.selector, entry.message }) catch {};
+            }
+        },
+        else => {},
+    }
+    return writer.buffered();
+}
+
 fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
     // Start a fresh grapheme arena for this frame: multibyte cells written below
     // reference it, and it must stay valid until vaxis flushes (which copies the
@@ -1794,28 +1838,8 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
             "Building patch (esc back)"
         else if (app.staging_active)
             (if (app.staging_staged_view) "Staging - staged" else "Staging - unstaged")
-        else if (app.diff_base) |diff_ref| blk: {
-            // git's own notation carries the whole state: the order around the
-            // dots is the direction (left = the diff's "from"), and the dot count
-            // is the mode (.. full difference, ... merge-base / only the selected
-            // side's changes). Both sides show their real ref; "selected" only
-            // appears when the cursor is somewhere without a diffable ref.
-            const dots: []const u8 = if (app.diff_three_dot) "..." else "..";
-            const base = diffTitleRef(diff_ref);
-            const target: []const u8 = if (diffmode_mod.selectedRefForDiff(app)) |t| diffTitleRef(t) else "selected";
-            break :blk (if (app.diff_reverse)
-                std.fmt.bufPrint(&app.main_title_buf, "Diff [{s}{s}{s}]", .{ target, dots, base })
-            else
-                std.fmt.bufPrint(&app.main_title_buf, "Diff [{s}{s}{s}]", .{ base, dots, target })) catch "Diff [diffing]";
-        } else if (app.contentFocus() == .branches and app.selectedBranchRefName() != null)
-            // A selected branch/tag shows its commit graph, titled "Log".
-            "Log"
-        else if (app.focus == .main and app.contentFocus().isFilePanel() and (app.contentFocus() == .staged or app.files_tab == .files) and app.selectedFile() != null)
-            // Tabbed into a working-tree file's diff: advertise that <enter> opens
-            // the stage/unstage view (the behaviour isn't otherwise discoverable).
-            "Diff (enter to stage)"
         else
-            "Diff";
+            diffTitle(app);
         // Clamp the main panel's scroll to the current content (using the previous
         // frame's measured size) before drawing. Selecting a different item replaces
         // the preview without touching the scroll, so a scroll left over from a
@@ -1835,15 +1859,13 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
             const main = if (app.staging_active and !app.staging_patch_mode) blk: {
                 const staging_tabs = [_][]const u8{ "Unstaged", "Staged" };
                 break :blk tabbedPanel(root, side_w, 0, main_w, body_h, null, &staging_tabs, @as(usize, if (app.staging_staged_view) 1 else 0), wrap_tag, app.focus == .main, scroll);
-            } else if (app.diff_base != null) blk: {
-                // Diffing mode: the title carries the whole state (base..selected),
-                // so draw it in the warning colour — the same "a mode is active"
-                // signal the commit-filter indicator uses.
+            } else blk: {
                 const frame = panelBorder(root, side_w, 0, main_w, body_h, app.focus == .main, scroll);
-                if (main_w >= 4 and body_h >= 3)
-                    _ = drawTitleSpan(frame.raw, main_w, 2, title_shown, styles().warning);
+                if (main_w >= 4 and body_h >= 3) {
+                    drawDiffTitle(frame.raw, title_shown, if (app.diff_base != null) styles().warning else if (app.focus == .main) styles().active_title else styles().title);
+                }
                 break :blk frame.inner;
-            } else panel(root, side_w, 0, main_w, body_h, title_shown, app.focus == .main, scroll);
+            };
             app.main_view_height = main.height;
             app.main_view_width = main.width;
             if (app.showAboutSplash()) drawAbout(main, app) else {
@@ -3514,6 +3536,31 @@ fn drawTitleSpan(raw: vaxis.Window, w: u16, col: u16, text: []const u8, style: v
     const avail = limit - col;
     const shown = if (text.len > avail) text[0..avail] else text;
     return printSpan(raw, 0, col, shown, style);
+}
+
+fn drawDiffTitle(raw: vaxis.Window, text: []const u8, style: vaxis.Style) void {
+    const available = raw.width -| 3;
+    var width: u16 = 0;
+    var end: usize = 0;
+    var clipped_end: usize = 0;
+    while (end < text.len) {
+        if (text[end] == '\n' or text[end] == '\r') {
+            break;
+        }
+        const cell = decodeCell(raw, text, end);
+        const cell_width = if (text[end] == '\t') 4 else cell.width;
+        if (cell_width > available - width) {
+            const col = printSpan(raw, 0, 2, text[0..clipped_end], style);
+            _ = printSpan(raw, 0, col, "…", style);
+            return;
+        }
+        width += cell_width;
+        end += cell.len;
+        if (width < available) {
+            clipped_end = end;
+        }
+    }
+    _ = printSpan(raw, 0, 2, text[0..end], style);
 }
 
 /// A panel whose title is the strip of views that `[`/`]` switches between (the
