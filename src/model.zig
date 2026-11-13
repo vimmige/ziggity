@@ -229,6 +229,7 @@ pub const FileDisplayFilter = enum {
     }
 
     pub fn matches(self: FileDisplayFilter, file: FileStatus) bool {
+        if (self != .all and !file.has_unstaged and !file.conflict) return false;
         return switch (self) {
             .unstaged => file.has_unstaged or file.conflict,
             .all => true,
@@ -931,7 +932,7 @@ test "file display filter follows status filter semantics" {
     try std.testing.expect(FileDisplayFilter.unstaged.matches(untracked));
     try std.testing.expect(!FileDisplayFilter.unstaged.matches(staged_untracked));
     try std.testing.expect(FileDisplayFilter.all.matches(staged_untracked));
-    try std.testing.expect(FileDisplayFilter.tracked.matches(staged_untracked));
+    try std.testing.expect(!FileDisplayFilter.tracked.matches(staged_untracked));
     try std.testing.expect(!FileDisplayFilter.untracked.matches(staged_untracked));
     try std.testing.expect(FileDisplayFilter.untracked.matches(untracked));
 }

@@ -623,8 +623,9 @@ pub fn toggleAllStaged(app: *App) !void {
     // queues the work; the loop flushes it off the UI thread so `a` is
     // non-blocking too. A filter narrows it to the visible paths (a per-path
     // batch); unfiltered, it uses the efficient `git add -A` / `git reset`.
+    const filtered = if (app.contentFocus() == .staged) app.staged_filter.len > 0 else app.anyFileFilterActive();
     if (app.visibleUnstagedCount() > 0) {
-        if (app.anyFileFilterActive() or app.conflictFileCount() > 0) {
+        if (filtered or app.conflictFileCount() > 0) {
             var paths: std.ArrayList([]const u8) = .empty;
             defer paths.deinit(app.allocator);
             try app.collectVisiblePaths(&paths, .unstaged);
@@ -635,7 +636,7 @@ pub fn toggleAllStaged(app: *App) !void {
         return;
     }
     if (app.visibleStagedCount() > 0) {
-        if (app.anyFileFilterActive() or app.conflictFileCount() > 0) {
+        if (filtered or app.conflictFileCount() > 0) {
             var paths: std.ArrayList([]const u8) = .empty;
             defer paths.deinit(app.allocator);
             try app.collectVisiblePaths(&paths, .staged);

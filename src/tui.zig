@@ -1710,7 +1710,14 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
         }
         y += files_h;
         if (staged_h > 0) {
-            const w = panel(root, 0, y, side_w, staged_h, if (app.git.amend_view != null) "[3] Staged (amend)" else "[3] Staged", app.focus == .staged, listScrollInfo(app, .staged));
+            const title = if (app.git.amend_view != null) "[3] Staged (amend)" else "[3] Staged";
+            var staged_filter_buf: [512]u8 = undefined;
+            const staged_title = if (app.staged_filter.len == 0) title else std.fmt.bufPrint(&staged_filter_buf, "{s} ({s}{s})", .{
+                title,
+                app.staged_filter,
+                if (app.focus == .staged) "; esc to cancel filter" else "",
+            }) catch title;
+            const w = panel(root, 0, y, side_w, staged_h, staged_title, app.focus == .staged, listScrollInfo(app, .staged));
             beginListPan(app, .staged);
             drawFiles(w, app, .staged);
             endListPan(app, .staged, w.width);
@@ -2283,7 +2290,7 @@ const help_lines = [_][]const u8{
     "  D              discard all",
     "  s              stash menu (all, +untracked, staged, file, keep-changes);",
     "                 asks for an optional message (empty = git's default name)",
-    "  /              filter by path",
+    "  /              filter Files or Staged independently by path",
     "  ctrl+b         status filter",
     "  alt+b          cycle status filter",
     "  `              toggle the directory tree",
@@ -3678,11 +3685,17 @@ fn drawStatus(win: vaxis.Window, app: *const app_mod.App) void {
     if (app.anyFileFilterActive()) {
         var fbuf: [256]u8 = undefined;
         const line = if (app.fileDisplayFilterActive() and app.fileFilterActive())
-            std.fmt.bufPrint(&fbuf, "filtering files ({s}, {d}/{d}: {s})", .{ app.file_display_filter.label(), app.visibleFileCount(), app.data.files.len, app.file_filter }) catch return
+            std.fmt.bufPrint(&fbuf, "filtering files ({s}, {d}/{d}: {s})", .{ app.file_display_filter.label(), app.panelFileCount(.files), app.data.files.len, app.file_filter }) catch return
         else if (app.fileDisplayFilterActive())
-            std.fmt.bufPrint(&fbuf, "filtering files ({s}, {d}/{d})", .{ app.file_display_filter.label(), app.visibleFileCount(), app.data.files.len }) catch return
+            std.fmt.bufPrint(&fbuf, "filtering files ({s}, {d}/{d})", .{ app.file_display_filter.label(), app.panelFileCount(.files), app.data.files.len }) catch return
         else
-            std.fmt.bufPrint(&fbuf, "filtering files ({d}/{d}: {s})", .{ app.visibleFileCount(), app.data.files.len, app.file_filter }) catch return;
+            std.fmt.bufPrint(&fbuf, "filtering files ({d}/{d}: {s})", .{ app.panelFileCount(.files), app.data.files.len, app.file_filter }) catch return;
+        print(win, filter_row, 0, line, st.warning);
+        filter_row += 1;
+    }
+    if (app.staged_filter.len > 0) {
+        var fbuf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&fbuf, "filtering staged ({d}/{d}: {s})", .{ app.panelFileCount(.staged), app.data.stagedCount(), app.staged_filter }) catch return;
         print(win, filter_row, 0, line, st.warning);
         filter_row += 1;
     }
@@ -3723,7 +3736,7 @@ fn drawFiles(win: vaxis.Window, app: *const app_mod.App, focus: model.Focus) voi
     if (app.tree_view) return drawFileTree(win, app, focus);
     const visible_count = app.activeListLen(focus);
     if (visible_count == 0) {
-        print(win, 0, 0, if (focus == .staged) "No staged files" else "No files match filter", styles().muted);
+        print(win, 0, 0, if (focus == .staged and app.staged_filter.len == 0) "No staged files" else "No files match filter", styles().muted);
         return;
     }
     const start = app.listScroll(focus);

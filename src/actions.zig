@@ -309,8 +309,7 @@ pub fn fromNormalKey(key: vaxis.Key, keymap: config_mod.KeyMap, focus: model.Foc
     if (keymap.diff_mark.matches(key)) return .diff_mark;
     if (keymap.patch_menu.matches(key)) return .patch_menu;
     if (keymap.refresh.matches(key)) return .refresh;
-    // Only the Files panel gets the file filter; other panels handled `/` above.
-    if (focus == .files and keymap.file_filter.matches(key)) return .start_file_filter;
+    if (focus.isFilePanel() and keymap.file_filter.matches(key)) return .start_file_filter;
     if (keymap.fetch.matches(key)) return .fetch;
     if (keymap.pull.matches(key)) return .pull;
     if (keymap.push.matches(key)) return .push;
@@ -436,6 +435,7 @@ test "normal key mapping handles global and focused actions" {
     try std.testing.expectEqual(Action.discard_selected, fromNormalKey(testKey('d'), keymap, .files).?);
     try std.testing.expectEqual(Action.discard_all, fromNormalKey(testKey('D'), keymap, .files).?);
     try std.testing.expectEqual(Action.start_file_filter, fromNormalKey(testKey('/'), keymap, .files).?);
+    try std.testing.expectEqual(Action.start_file_filter, fromNormalKey(testKey('/'), keymap, .staged).?);
     // `/` filters the current panel, and must not steal focus to Files elsewhere.
     try std.testing.expectEqual(Action.start_commit_filter, fromNormalKey(testKey('/'), keymap, .commits).?);
     try std.testing.expectEqual(Action.start_branch_filter, fromNormalKey(testKey('/'), keymap, .branches).?);

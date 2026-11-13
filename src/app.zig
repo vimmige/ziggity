@@ -3912,6 +3912,7 @@ pub const App = struct {
     diff: []u8 = &.{},
     message: []u8 = &.{},
     file_filter: []u8 = &.{},
+    staged_filter: []u8 = &.{},
     // Live name filter for the Branches panel's Local tab (the `/` prompt),
     // mirroring `file_filter`. `branch_index` is a visible ordinal over the
     // matching branches, so an empty filter behaves exactly like no filter.
@@ -4416,6 +4417,7 @@ pub const App = struct {
         self.allocator.free(self.diff);
         self.allocator.free(self.message);
         self.allocator.free(self.file_filter);
+        self.allocator.free(self.staged_filter);
         self.allocator.free(self.branch_filter);
         self.branch_filter_buffer.deinit(self.allocator);
         self.allocator.free(self.op_command);
@@ -5083,10 +5085,6 @@ pub const App = struct {
 
         if (key.matches(vaxis.Key.page_up, .{})) return self.scrollMain(-10);
         if (key.matches(vaxis.Key.page_down, .{})) return self.scrollMain(10);
-        if (self.isEscapeKey(key) and self.fileFilterActive()) {
-            try self.clearFileFilter();
-            return;
-        }
 
         // In the staging view, c / A commit / amend the staged changes (the
         // Files panel allows the same). Gated to the staging view so they don't
@@ -5334,7 +5332,7 @@ pub const App = struct {
                     try self.updatePreview();
                     return;
                 }
-                if (self.fileFilterActive()) {
+                if (self.focus.isFilePanel() and self.fileTab() == .files and self.fileFilter().len > 0) {
                     try self.clearFileFilter();
                     return;
                 }
@@ -6667,6 +6665,10 @@ pub const App = struct {
         return if (self.contentFocus() == .staged) &self.staged_index else &self.file_index;
     }
 
+    fn fileFilter(self: anytype) @TypeOf(&self.file_filter) {
+        return if (self.contentFocus() == .staged) &self.staged_filter else &self.file_filter;
+    }
+
     pub fn selectedFile(self: *const App) ?model.FileStatus {
         if (self.data.files.len == 0) return null;
         if (self.tree_view) {
@@ -6889,11 +6891,12 @@ pub const App = struct {
         return self.branch_filter.len > 0;
     }
 
-    /// How many panels are currently filtered (Files, Branches, Commits). Drives
+    /// How many panels are currently filtered. Drives
     /// the Status panel's stacked filter lines and its height.
     pub fn activeFilterCount(self: *const App) u16 {
         var n: u16 = 0;
         if (self.anyFileFilterActive()) n += 1;
+        if (self.staged_filter.len > 0) n += 1;
         if (self.branchFilterActive()) n += 1;
         if (self.git.hasLogFilter()) n += 1;
         return n;
@@ -6937,12 +6940,14 @@ pub const App = struct {
     }
 
     pub fn fileMatchesPanelFilter(self: *const App, file: model.FileStatus, focus: model.Focus) bool {
-        if (focus == .staged) return if (file.conflict) self.data.state == .rebasing else file.has_staged;
-        if (!self.file_display_filter.matches(file)) return false;
-        if (self.file_filter.len == 0) return true;
-        if (textmatch.pathMatchesFilter(file.path, self.file_filter)) return true;
+        if (focus == .staged) {
+            if (!(if (file.conflict) self.data.state == .rebasing else file.has_staged)) return false;
+        } else if (!self.file_display_filter.matches(file)) return false;
+        const filter = if (focus == .staged) self.staged_filter else self.file_filter;
+        if (filter.len == 0) return true;
+        if (textmatch.pathMatchesFilter(file.path, filter)) return true;
         if (file.previous_path) |previous| {
-            return textmatch.pathMatchesFilter(previous, self.file_filter);
+            return textmatch.pathMatchesFilter(previous, filter);
         }
         return false;
     }
@@ -7825,6 +7830,8 @@ pub const App = struct {
 
         a.free(self.file_filter);
         self.file_filter = a.dupe(u8, "") catch &.{};
+        a.free(self.staged_filter);
+        self.staged_filter = &.{};
         self.file_display_filter = .unstaged;
         self.file_filter_buffer.clearRetainingCapacity();
 
@@ -10923,16 +10930,15 @@ pub const App = struct {
     }
 
     fn startFileFilterPrompt(self: *App) !void {
-        self.focus = .files;
         self.resetMainView();
         self.mode = .file_filter_prompt;
         self.file_filter_buffer.clearRetainingCapacity();
-        try self.file_filter_buffer.appendSlice(self.allocator, self.file_filter);
+        try self.file_filter_buffer.appendSlice(self.allocator, self.fileFilter().*);
         self.file_filter_cursor = self.file_filter_buffer.items.len;
         self.file_filter_scroll = 0;
         self.filter_history_index = null;
         try self.updateFileFilterFromPrompt();
-        try self.setMessage("filter files (up/down for history)", .{});
+        try self.setMessage("filter {s} (up/down for history)", .{if (self.focus == .staged) "staged" else "files"});
     }
 
     /// Replace the filter prompt buffer with a value (used for history recall).
@@ -12347,7 +12353,7 @@ pub const App = struct {
                 if (self.selectedFile()) |file| {
                     return self.requestGitPreview(if (self.contentFocus() == .staged) .{ .staged_file = file } else .{ .file = file });
                 }
-                if (self.contentFocus() == .staged) return self.setCheapPreview(try self.allocator.dupe(u8, "No staged files.\n"));
+                if (self.contentFocus() == .staged) return self.setCheapPreview(try self.allocator.dupe(u8, if (self.staged_filter.len > 0) "No files match the active filter.\n" else "No staged files.\n"));
                 if (self.anyFileFilterActive() and self.data.files.len > 0) return self.setCheapPreview(try self.allocator.dupe(u8, "No files match the active filter.\n"));
                 return self.setCheapPreview(try self.allocator.dupe(u8, if (self.file_display_filter == .unstaged) "No unstaged files.\n" else "Working tree clean.\n"));
             },
@@ -12467,13 +12473,13 @@ pub const App = struct {
         return switch (kind) {
             .file, .staged_file => |f| std.fmt.allocPrint(gpa, "f:{d}:{c}:{c}{c}{c}:{s}", .{
                 ctx,
-                @as(u8, if (kind == .staged_file) 'S' else if (self.file_display_filter == .unstaged) 'U' else 'A'),
+                @as(u8, if (kind == .staged_file) 'S' else if (self.file_display_filter == .all) 'A' else 'U'),
                 @as(u8, if (f.tracked) 'T' else 'u'),
                 @as(u8, if (f.has_staged) 'S' else '_'),
                 @as(u8, if (f.has_unstaged) 'U' else '_'),
                 f.path,
             }),
-            .dir => |p| std.fmt.allocPrint(gpa, "fd:{d}:{c}:{s}", .{ ctx, @as(u8, if (self.file_display_filter == .unstaged) 'U' else 'A'), p }),
+            .dir => |p| std.fmt.allocPrint(gpa, "fd:{d}:{c}:{s}", .{ ctx, @as(u8, if (self.file_display_filter == .all) 'A' else 'U'), p }),
             .staged_dir => |p| std.fmt.allocPrint(gpa, "f:staged-dir:{d}:{s}", .{ ctx, p }),
             .branch => |name| std.fmt.allocPrint(gpa, "b:{s}", .{name}),
             .commit => |hash| std.fmt.allocPrint(gpa, "c:{d}:{s}", .{ ctx, hash }),
@@ -12556,7 +12562,7 @@ pub const App = struct {
                         .argv = try fileDiffArgv(self.git.stagingBaseRef(), staged and !f.conflict, ctx_arg, f.path, f.previous_path),
                         .label = if (f.conflict) "Conflicted (resolve before continuing)\n\n" else if (staged) "Staged\n\n" else "Unstaged\n\n",
                     });
-                    if (kind == .file and !f.conflict and self.file_display_filter != .unstaged) {
+                    if (kind == .file and !f.conflict and self.file_display_filter == .all) {
                         try sections.append(page_alloc, .{
                             .argv = try fileDiffArgv(self.git.stagingBaseRef(), true, ctx_arg, f.path, f.previous_path),
                             .label = "Staged\n\n",
@@ -12565,7 +12571,7 @@ pub const App = struct {
                 }
             },
             .dir, .staged_dir => |p| {
-                empty_msg = if (kind == .staged_dir) "No staged changes under this directory.\n" else if (self.file_display_filter == .unstaged) "No unstaged changes under this directory.\n" else "No changes under this directory.\n";
+                empty_msg = if (kind == .staged_dir) "No staged changes under this directory.\n" else if (self.file_display_filter == .all) "No changes under this directory.\n" else "No unstaged changes under this directory.\n";
                 const staged = kind == .staged_dir;
                 try sections.append(page_alloc, .{
                     .argv = try dirDiffArgv(self.git.stagingBaseRef(), staged, ctx_arg, p),
@@ -12577,7 +12583,7 @@ pub const App = struct {
                         .label = "Conflicted (resolve before continuing)\n\n",
                     });
                 }
-                if (kind == .dir and self.file_display_filter != .unstaged) {
+                if (kind == .dir and self.file_display_filter == .all) {
                     try sections.append(page_alloc, .{
                         .argv = try dirDiffArgv(self.git.stagingBaseRef(), true, ctx_arg, p),
                         .label = "Staged\n\n",
@@ -13856,10 +13862,10 @@ pub const App = struct {
         self.filter_history_index = null;
         try self.setFileFilter(filter);
         self.file_filter_buffer.clearRetainingCapacity();
-        if (self.file_filter.len == 0) {
-            try self.setMessage("file filter cleared", .{});
+        if (self.fileFilter().len == 0) {
+            try self.setMessage("{s} filter cleared", .{if (self.contentFocus() == .staged) "staged" else "file"});
         } else {
-            try self.setMessage("filter \"{s}\" ({d}/{d})", .{ self.file_filter, self.visibleFileCount(), self.data.files.len });
+            try self.setMessage("filter \"{s}\" ({d}/{d})", .{ self.fileFilter().*, self.visibleFileCount(), self.data.files.len });
         }
     }
 
@@ -13944,17 +13950,17 @@ pub const App = struct {
     fn updateFileFilterFromPrompt(self: *App) !void {
         const filter = std.mem.trim(u8, self.file_filter_buffer.items, " \t\r\n");
         try self.setFileFilter(filter);
-        if (self.file_filter.len == 0) {
-            try self.setMessage("filter files", .{});
+        if (self.fileFilter().len == 0) {
+            try self.setMessage("filter {s}", .{if (self.contentFocus() == .staged) "staged" else "files"});
         } else {
-            try self.setMessage("filter \"{s}\" ({d}/{d})", .{ self.file_filter, self.visibleFileCount(), self.data.files.len });
+            try self.setMessage("filter \"{s}\" ({d}/{d})", .{ self.fileFilter().*, self.visibleFileCount(), self.data.files.len });
         }
     }
 
     fn setFileFilter(self: *App, filter: []const u8) !void {
         const next_filter = try self.allocator.dupe(u8, filter);
-        self.allocator.free(self.file_filter);
-        self.file_filter = next_filter;
+        self.allocator.free(self.fileFilter().*);
+        self.fileFilter().* = next_filter;
         self.fileIndex().* = self.firstMatchingFileIndex() orelse 0;
         if (self.tree_view) try self.rebuildTree(null);
         self.resetMainView();
@@ -16360,6 +16366,12 @@ test "optimistic staging flips file state in the model immediately" {
         }
         try std.testing.expectEqual(staged, cached);
         try std.testing.expectEqualStrings(if (staged) "Staged\n\n" else "Unstaged\n\n", job.sections[0].label);
+        app.file_display_filter = .tracked;
+        const tracked_key = try app.previewKey(page_alloc, kind);
+        const tracked_job = try app.buildPreviewJob(kind, tracked_key);
+        defer tracked_job.deinit(page_alloc);
+        try std.testing.expectEqual(@as(usize, 1), tracked_job.sections.len);
+        try std.testing.expectEqualStrings(key, tracked_key);
         app.file_display_filter = .all;
         const all_key = try app.previewKey(page_alloc, kind);
         const all_job = try app.buildPreviewJob(kind, all_key);
@@ -18053,24 +18065,44 @@ test "merge conflicts do not hijack a filter the user chose" {
     try std.testing.expectEqual(model.FileDisplayFilter.tracked, app.file_display_filter);
 }
 
-test "escape clears active file filter before quitting" {
+test "escape clears only the focused panel's text filter" {
     const allocator = std.testing.allocator;
-    var app = App{
-        .allocator = allocator,
-        .git = undefined,
-        .config = .{},
-        .diff = try allocator.dupe(u8, "old preview"),
-        .message = try allocator.dupe(u8, "old message"),
-        .file_filter = try allocator.dupe(u8, "app"),
-    };
-    defer allocator.free(app.diff);
-    defer allocator.free(app.message);
-    defer allocator.free(app.file_filter);
+    const files = try git_mod.parseStatus(allocator, "MM app.zig\x00M  other.zig\x00?? scratch.txt\x00");
+    defer model.deinitFileStatuses(allocator, files);
+    var app = try testApp(allocator, files);
+    defer deinitTestApp(&app);
+    app.file_display_filter = .tracked;
+    try app.setFileFilter("app");
+    try std.testing.expectEqual(@as(usize, 1), app.panelFileCount(.files));
+    try std.testing.expectEqual(@as(usize, 2), app.panelFileCount(.staged));
 
+    app.focus = .staged;
+    try app.handleKey(.{ .codepoint = '/', .text = "/" });
+    try std.testing.expectEqual(Mode.file_filter_prompt, app.mode);
+    try std.testing.expectEqual(model.Focus.staged, app.focus);
+    try app.handleKey(.{ .codepoint = 'o', .text = "other" });
+    try app.handleKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqualStrings("other", app.staged_filter);
+    try std.testing.expectEqualStrings("app", app.file_filter);
+    try std.testing.expectEqual(@as(usize, 1), app.panelFileCount(.staged));
+    try std.testing.expectEqual(@as(usize, 1), app.panelFileCount(.files));
+
+    try app.handleKey(.{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(@as(usize, 0), app.staged_filter.len);
+    try std.testing.expectEqualStrings("app", app.file_filter);
+
+    app.focus = .branches;
+    try app.setBranchFilter("main");
+    try app.handleKey(.{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(@as(usize, 0), app.branch_filter.len);
+    try std.testing.expectEqualStrings("app", app.file_filter);
+
+    app.focus = .files;
     try app.handleKey(.{ .codepoint = vaxis.Key.escape });
 
     try std.testing.expect(app.running);
     try std.testing.expectEqual(@as(usize, 0), app.file_filter.len);
+    try std.testing.expectEqual(model.FileDisplayFilter.tracked, app.file_display_filter);
     try std.testing.expectEqualStrings("file filter cleared", app.message);
 }
 
@@ -19711,6 +19743,7 @@ fn deinitTestApp(app: *App) void {
     app.allocator.free(app.diff);
     app.allocator.free(app.message);
     app.allocator.free(app.file_filter);
+    app.allocator.free(app.staged_filter);
     app.allocator.free(app.branch_filter);
     app.branch_filter_buffer.deinit(app.allocator);
     app.allocator.free(app.op_command);
