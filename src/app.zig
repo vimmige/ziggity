@@ -20191,7 +20191,7 @@ test "file tree builds rows, selects files, and collapses directories" {
     try app.handleKey(.{ .codepoint = ' ' });
     try std.testing.expect(!files[1].has_staged);
     try std.testing.expect(files[1].has_unstaged);
-    try std.testing.expectEqual(@as(usize, 1), app.staged_tree.rows.len);
+    try std.testing.expectEqual(@as(usize, 0), app.staged_tree.rows.len);
     try std.testing.expectEqual(@as(usize, 6), app.files_tree.rows.len);
 }
 

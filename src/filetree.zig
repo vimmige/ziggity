@@ -42,7 +42,7 @@ pub fn build(allocator: std.mem.Allocator, entries: []const Entry, collapsed: *c
     errdefer rows.deinit(allocator);
 
     const base_depth: u16 = if (show_root) 1 else 0;
-    if (show_root) {
+    if (show_root and entries.len > 0) {
         const root_collapsed = collapsed.contains("");
         try rows.append(allocator, .{ .is_dir = true, .depth = 0, .path = "", .collapsed = root_collapsed });
         if (root_collapsed) return rows.toOwnedSlice(allocator);
