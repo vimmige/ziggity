@@ -10927,7 +10927,8 @@ pub const App = struct {
         self.resetMainView();
         self.mode = .file_filter_prompt;
         self.file_filter_buffer.clearRetainingCapacity();
-        self.file_filter_cursor = 0;
+        try self.file_filter_buffer.appendSlice(self.allocator, self.file_filter);
+        self.file_filter_cursor = self.file_filter_buffer.items.len;
         self.file_filter_scroll = 0;
         self.filter_history_index = null;
         try self.updateFileFilterFromPrompt();
