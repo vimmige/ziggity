@@ -40,7 +40,7 @@ Escape
 Sleep 800ms
 
 # 03: the Commits panel with a diff preview a few rows in.
-Type "4"
+Type "5"
 Sleep 600ms
 Type "j"
 Sleep 250ms
@@ -100,7 +100,7 @@ Escape
 Sleep 800ms
 
 # 05: the Branches panel (a local branch, tracking state, time column).
-Type "3"
+Type "4"
 Sleep 1s
 Screenshot docs/screenshots/05-branches.png
 Sleep 300ms
@@ -114,7 +114,7 @@ Screenshot docs/screenshots/06-tags.png
 Sleep 300ms
 
 # 07: the Stash panel with named stashes and a diff preview.
-Type "5"
+Type "6"
 Sleep 1s
 Screenshot docs/screenshots/07-stash.png
 Sleep 300ms

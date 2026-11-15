@@ -21,7 +21,7 @@ Hide
 Type "Z=$PWD/zig-out/bin/ziggity; cd /tmp/zshot/ziggity && $Z"
 Enter
 Sleep 2.5s
-Type "3"
+Type "4"
 Sleep 500ms
 Type "j"
 Sleep 500ms

@@ -18,7 +18,7 @@ pub fn selectedRefForDiff(app: *const App) ?[]const u8 {
     return switch (app.contentFocus()) {
         .commits => if (app.selectedCommit()) |commit| commit.hash else null,
         .branches => app.selectedBranchRefName(),
-        .status, .files, .stash, .main => null,
+        .status, .files, .staged, .stash, .main => null,
     };
 }
 
@@ -284,7 +284,7 @@ pub fn selectionWebUrl(app: *const App, base: []const u8) ![]u8 {
                 return refWebUrl(app.allocator, base, tag.name, true);
             },
         },
-        .status, .files, .stash, .main => {},
+        .status, .files, .staged, .stash, .main => {},
     }
     return app.allocator.dupe(u8, base);
 }

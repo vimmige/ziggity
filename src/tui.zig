@@ -1499,144 +1499,75 @@ fn sidePanelWidth(total: u16, percent: u8) u16 {
     return @max(@as(u16, 20), @min(raw, main_floor));
 }
 
-const SidePanelHeights = struct { status: u16, files: u16, branches: u16, commits: u16, stash: u16 };
+const SidePanelHeights = struct { status: u16, files: u16, staged: u16, branches: u16, commits: u16, stash: u16 };
 
-/// Side-panel sizing: the status panel is a fixed height; files,
-/// branches and commits share the remaining space by weight (1 each); and the
-/// stash panel is a small fixed height *unless it is focused*, in which case it
-/// joins the weighted group. With the accordion (`expand_focused_side_panel`),
-/// the focused list panel gets `expanded_weight` instead of 1, growing at the
-/// others' expense. With `collapse_status`, the status panel shrinks to a single
-/// title-bar row and its space flows to the lists. The returned heights always
-/// sum to `body_h`.
 fn sidePanelHeights(body_h: u16, focused: model.Focus, accordion: bool, expanded_weight: u16, extra_status_rows: u16, collapse_status: bool) SidePanelHeights {
-    // The Status panel is normally up to 5 tall (3 content rows: repo, summary,
-    // and one filter line). The Files, Branches and Commits panels can all be
-    // filtered at once, so each active filter beyond the first gets its own row.
-    // Collapsed (config `collapse_status`), it is a single title-bar row and its
-    // filter rows are dropped, so the space flows to the list panels below.
-    const status_h: u16 = if (collapse_status) 1 else @min(body_h, 5 + extra_status_rows);
-    const stash_fixed: u16 = @min(body_h -| status_h, 3);
-    const stash_focused = focused == .stash;
-
-    // On a short column, the weight only changes the tall layout below
-    // regardless of the accordion setting: the focused list panel takes the
-    // remaining space and the others collapse to a fixed small size — a
-    // framed 3 rows when moderately short, a title-only 1 row when very
-    // short (the renderer draws a 1-2 row panel as a title bar).
-    // This keeps the focused panel usable on a small terminal and lets a high
-    // `expanded_side_panel_weight` actually make it dominate, instead of every
-    // other panel's framed minimum capping it. Status keeps its own
-    // fixed height. (`accordion` only affects the tall layout further down.)
-    if (body_h < 28) {
-        const squashed: u16 = if (body_h >= 21) 3 else 1;
-        var sh = [4]u16{ squashed, squashed, squashed, squashed };
-        const avail = body_h -| status_h;
-        const focus_idx: ?usize = switch (focused) {
-            .files => 0,
-            .branches => 1,
-            .commits => 2,
-            .stash => 3,
-            else => null,
-        };
-        if (focus_idx) |idx| {
-            // The focused list panel gets everything the others don't.
-            const taken = squashed * 3;
-            sh[idx] = if (avail > taken) avail - taken else squashed;
+    const panels = [_]model.Focus{ .status, .files, .staged, .branches, .commits, .stash };
+    var heights: [6]u16 = @splat(0);
+    var weights: [6]u16 = @splat(0);
+    var remaining = body_h;
+    // Reserve each title first, even when the terminal is very short.
+    for (&heights) |*height| {
+        height.* = @min(remaining, 1);
+        remaining -= height.*;
+    }
+    for (panels, 0..) |focus, i| {
+        if (focus == .status) {
+            if (!collapse_status) {
+                const extra = @min(remaining, 4 + extra_status_rows);
+                heights[i] += extra;
+                remaining -= extra;
+            }
+        } else if (focus == .stash and focused != .stash) {
+            const extra = @min(remaining, if (body_h < 24) @as(u16, 0) else 2);
+            heights[i] += extra;
+            remaining -= extra;
         } else {
-            // Focus is on Status or the Diff: no list panel expands, so let the
-            // top one absorb the slack and keep the column filled.
-            const taken = squashed * 4;
-            if (avail > taken) sh[0] += avail - taken;
-        }
-        return .{ .status = status_h, .files = sh[0], .branches = sh[1], .commits = sh[2], .stash = sh[3] };
-    }
-
-    // Weights for files, branches, commits, stash. Stash stays fixed (weight 0)
-    // unless it is the focused panel.
-    var weights = [4]u16{ 1, 1, 1, if (stash_focused) @as(u16, 1) else 0 };
-    if (accordion) {
-        const ew: u16 = @max(1, expanded_weight);
-        switch (focused) {
-            .files => weights[0] = ew,
-            .branches => weights[1] = ew,
-            .commits => weights[2] = ew,
-            .stash => weights[3] = ew,
-            else => {},
+            weights[i] = if (accordion and focus == focused) @max(1, expanded_weight) else 1;
         }
     }
-
-    const reserved = status_h + (if (stash_focused) @as(u16, 0) else stash_fixed);
-    const dynamic = body_h -| reserved;
-    const total = weights[0] + weights[1] + weights[2] + weights[3];
-    const unit = if (total > 0) dynamic / total else 0;
-    var rem = if (total > 0) dynamic % total else 0;
-
-    // The panels actually sharing `dynamic` (captured before the remainder loop
-    // below zeroes their weights), and how many — for the minimum-height floor.
-    const active = [4]bool{ weights[0] > 0, weights[1] > 0, weights[2] > 0, weights[3] > 0 };
-    var active_count: u16 = 0;
-    for (active) |a| active_count += @intFromBool(a);
-
-    var h = [4]u16{ unit * weights[0], unit * weights[1], unit * weights[2], unit * weights[3] };
-    // Hand out the integer-division remainder a row at a time, decrementing each
-    // panel's weight as it takes one. Without the decrement the remainder is split
-    // evenly, so a weight-1 panel keeps claiming rows alongside the focused one —
-    // which on short terminals or high weights dilutes the accordion badly (the
-    // unfocused panels stay fat, the focused one never reaches its weighted
-    // share). Decrementing sends the bulk of the remainder to the heavy (focused)
-    // panel, so proportions match the weights. Safe from an infinite loop:
-    // `rem = dynamic % total < total`, i.e. strictly less than the panels'
-    // combined remainder capacity.
-    var i: usize = 0;
-    while (rem > 0) : (i = (i + 1) % 4) {
-        if (weights[i] > 0) {
-            h[i] += 1;
-            weights[i] -= 1;
-            rem -= 1;
+    // On short terminals, keep the focused list usable before sharing slack.
+    if (body_h < 28) {
+        const minimum: u16 = if (body_h >= 24) 2 else 0;
+        for (weights, 0..) |weight, i| {
+            if (weight == 0) continue;
+            const extra = @min(remaining, minimum);
+            heights[i] += extra;
+            remaining -= extra;
         }
-    }
-
-    // Minimum framed height (3 rows: the title-bearing top border, one content
-    // row, and the bottom border) for every panel sharing the dynamic space. A
-    // strongly weighted accordion can otherwise squeeze an unfocused panel below
-    // what the renderer can draw — it drops the border and title and spills raw
-    // content with no box. Move rows from the tallest panel (the focused one)
-    // into any that fall short. Skipped when the column is too short to frame
-    // them all (nothing we can do), leaving the proportional split as-is.
-    const min_panel_h: u16 = 3;
-    if (active_count > 0 and dynamic >= active_count * min_panel_h) {
-        while (true) {
-            // The shortest active panel still below the floor, if any.
-            var poorest: ?usize = null;
-            for (0..4) |j| {
-                if (!active[j] or h[j] >= min_panel_h) continue;
-                if (poorest == null or h[j] < h[poorest.?]) poorest = j;
+        for (panels, 0..) |focus, i| {
+            if (focus == focused and weights[i] > 0) {
+                heights[i] += remaining;
+                remaining = 0;
             }
-            const p = poorest orelse break;
-            // Donate a row from the tallest active panel (kept at/above the floor).
-            var richest: usize = p;
-            for (0..4) |j| {
-                if (active[j] and h[j] > h[richest]) richest = j;
-            }
-            if (richest == p or h[richest] <= min_panel_h) break; // no donor with surplus
-            h[richest] -= 1;
-            h[p] += 1;
         }
     }
-
-    return .{
-        .status = status_h,
-        .files = h[0],
-        .branches = h[1],
-        .commits = h[2],
-        .stash = if (stash_focused) h[3] else stash_fixed,
-    };
+    // Give active lists one row per weight, retaining a framed minimum when possible.
+    var total: u16 = 0;
+    for (weights) |weight| total += weight;
+    if (total > 0) {
+        for (weights, 0..) |weight, i| {
+            if (weight == 0) continue;
+            const extra = @min(remaining, 2);
+            heights[i] += extra;
+            remaining -= extra;
+        }
+        const available = remaining;
+        for (weights, 0..) |weight, i| {
+            const extra = @as(u16, @intCast(@as(u32, available) * weight / total));
+            heights[i] += extra;
+            remaining -= extra;
+        }
+        for (weights, 0..) |weight, i| {
+            if (weight > 0 and remaining > 0) {
+                heights[i] += 1;
+                remaining -= 1;
+            }
+        }
+    }
+    return .{ .status = heights[0], .files = heights[1], .staged = heights[2], .branches = heights[3], .commits = heights[4], .stash = heights[5] };
 }
 
-/// Shorten a ref for the diffing title: a full hex SHA becomes its short hash,
-/// names get a generous cap so a truncated branch name cannot masquerade as
-/// the three-dot notation.
 fn diffTitleRef(ref: []const u8) []const u8 {
     const is_sha = ref.len == 40 and for (ref) |ch| {
         if (!std.ascii.isHex(ch)) break false;
@@ -1695,6 +1626,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
     const fs: ?model.Focus = if (app.sidePanelFullscreen()) app.contentFocus() else null;
     const status_h = if (fs) |f| (if (f == .status) body_h else 0) else heights.status;
     const files_h = if (fs) |f| (if (f == .files) body_h else 0) else heights.files;
+    const staged_h = if (fs) |f| (if (f == .staged) body_h else 0) else heights.staged;
     const branches_h = if (fs) |f| (if (f == .branches) body_h else 0) else heights.branches;
     const commits_h = if (fs) |f| (if (f == .commits) body_h else 0) else heights.commits;
     const stash_h = if (fs) |f| (if (f == .stash) body_h else 0) else heights.stash;
@@ -1703,6 +1635,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
     // height minus the border) before drawing: re-anchors to the selection if it
     // moved, leaves a wheel-scrolled view alone, and clamps to the content.
     app.syncListView(.files, files_h -| 2);
+    app.syncListView(.staged, staged_h -| 2);
     app.syncListView(.branches, branches_h -| 2);
     app.syncListView(.commits, commits_h -| 2);
     app.syncListView(.stash, stash_h -| 2);
@@ -1711,12 +1644,13 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
     app.panel_rects = .{
         .{ .focus = .status, .x = 0, .y = 0, .w = side_w, .h = status_h },
         .{ .focus = .files, .x = 0, .y = status_h, .w = side_w, .h = files_h },
-        .{ .focus = .branches, .x = 0, .y = status_h + files_h, .w = side_w, .h = branches_h },
-        .{ .focus = .commits, .x = 0, .y = status_h + files_h + branches_h, .w = side_w, .h = commits_h },
-        .{ .focus = .stash, .x = 0, .y = status_h + files_h + branches_h + commits_h, .w = side_w, .h = stash_h },
+        .{ .focus = .staged, .x = 0, .y = status_h + files_h, .w = side_w, .h = staged_h },
+        .{ .focus = .branches, .x = 0, .y = status_h + files_h + staged_h, .w = side_w, .h = branches_h },
+        .{ .focus = .commits, .x = 0, .y = status_h + files_h + staged_h + branches_h, .w = side_w, .h = commits_h },
+        .{ .focus = .stash, .x = 0, .y = status_h + files_h + staged_h + branches_h + commits_h, .w = side_w, .h = stash_h },
         .{ .focus = .main, .x = side_w, .y = 0, .w = main_w, .h = body_h },
     };
-    app.panel_rect_count = 6;
+    app.panel_rect_count = 7;
 
     if (!app.mainFullscreen()) {
         if (status_h > 0) {
@@ -1730,25 +1664,33 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
         y += status_h;
         if (files_h > 0) {
             const files_tabs = [_][]const u8{ "Files", "Worktrees", "Submodules" };
-            // A filtered Files list carries the same yellow title hint as the
-            // Commits/Branches panels. Esc clears the path filter (`/`) while the
-            // panel is focused; a status-only filter shows just "(filtered)".
+            var files_filter_buf: [512]u8 = undefined;
             const files_suffix = if (app.files_tab != .files or !app.anyFileFilterActive())
                 ""
-            else if (app.focus == .files and app.fileFilterActive())
-                "(esc to cancel filter)"
             else
-                "(filtered)";
+                std.fmt.bufPrint(&files_filter_buf, "({s}{s}{s}{s})", .{
+                    if (app.fileDisplayFilterActive()) app.file_display_filter.label() else "",
+                    if (app.fileDisplayFilterActive() and app.fileFilterActive()) ", " else "",
+                    app.file_filter,
+                    if (app.focus == .files and app.fileFilterActive()) "; esc to cancel filter" else "",
+                }) catch app.file_filter;
             const w = tabbedPanel(root, 0, y, side_w, files_h, 2, &files_tabs, @intFromEnum(app.files_tab), files_suffix, app.focus == .files, listScrollInfo(app, .files));
             beginListPan(app, .files);
             switch (app.files_tab) {
-                .files => drawFiles(w, app),
+                .files => drawFiles(w, app, .files),
                 .worktrees => drawWorktrees(w, app),
                 .submodules => drawSubmodules(w, app),
             }
             endListPan(app, .files, w.width);
         }
         y += files_h;
+        if (staged_h > 0) {
+            const w = panel(root, 0, y, side_w, staged_h, "[3] Staged", app.focus == .staged, listScrollInfo(app, .staged));
+            beginListPan(app, .staged);
+            drawFiles(w, app, .staged);
+            endListPan(app, .staged, w.width);
+        }
+        y += staged_h;
         if (branches_h > 0) {
             // Drilled into a branch's sub-commits / files: a plain descriptive title.
             // Otherwise the title is the tab strip (Local / Remotes / Tags / …).
@@ -1756,15 +1698,15 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
             const w = if (app.branch_commits_active) blk: {
                 const t = if (app.branchFilesActive())
                     (if (patch_mod.branchFilesPatchCount(app) > 0)
-                        (std.fmt.bufPrint(&app.branches_title_buf, "[3] Commit files (patch: {d}) (esc back)", .{patch_mod.branchFilesPatchCount(app)}) catch "[3] Commit files (esc back)")
+                        (std.fmt.bufPrint(&app.branches_title_buf, "[4] Commit files (patch: {d}) (esc back)", .{patch_mod.branchFilesPatchCount(app)}) catch "[4] Commit files (esc back)")
                     else
-                        "[3] Commit files  (space: add to patch) (esc back)")
+                        "[4] Commit files  (space: add to patch) (esc back)")
                 else
-                    (std.fmt.bufPrint(&app.branches_title_buf, "[3] Commits ({s}) (esc back)", .{app.branch_commits_ref}) catch "[3] Commits (esc back)");
+                    (std.fmt.bufPrint(&app.branches_title_buf, "[4] Commits ({s}) (esc back)", .{app.branch_commits_ref}) catch "[4] Commits (esc back)");
                 break :blk panel(root, 0, y, side_w, branches_h, t, app.focus == .branches, listScrollInfo(app, .branches));
             } else if (app.remoteDrillActive()) blk: {
                 // Drilled into a remote's branches.
-                const t = std.fmt.bufPrint(&app.branches_title_buf, "[3] {s} (esc back)", .{app.remote_drill.?}) catch "[3] Remote (esc back)";
+                const t = std.fmt.bufPrint(&app.branches_title_buf, "[4] {s} (esc back)", .{app.remote_drill.?}) catch "[4] Remote (esc back)";
                 break :blk panel(root, 0, y, side_w, branches_h, t, app.focus == .branches, listScrollInfo(app, .branches));
             } else blk: {
                 // The Local tab's name filter (`/`) shows a title hint, mirroring
@@ -1773,7 +1715,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
                     (if (app.focus == .branches) "(esc to cancel filter)" else "(filtered)")
                 else
                     "";
-                break :blk tabbedPanel(root, 0, y, side_w, branches_h, 3, &branches_tabs, @intFromEnum(app.branches_tab), suffix, app.focus == .branches, listScrollInfo(app, .branches));
+                break :blk tabbedPanel(root, 0, y, side_w, branches_h, 4, &branches_tabs, @intFromEnum(app.branches_tab), suffix, app.focus == .branches, listScrollInfo(app, .branches));
             };
             beginListPan(app, .branches);
             drawBranches(w, app);
@@ -1783,12 +1725,12 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
         if (commits_h > 0) {
             const commits_tabs = [_][]const u8{ "Commits", "Reflog", "Divergence" };
             const w = if (app.mode == .rebase_plan) blk: {
-                break :blk panel(root, 0, y, side_w, commits_h, "[4] Interactive rebase (enter run, esc cancel)", app.focus == .commits, listScrollInfo(app, .commits));
+                break :blk panel(root, 0, y, side_w, commits_h, "[5] Interactive rebase (enter run, esc cancel)", app.focus == .commits, listScrollInfo(app, .commits));
             } else if (app.commitsFilesActive()) blk: {
                 const t = if (patch_mod.commitFilesPatchCount(app) > 0)
-                    (std.fmt.bufPrint(&app.commits_title_buf, "[4] Commit files (patch: {d}) (esc back)", .{patch_mod.commitFilesPatchCount(app)}) catch "[4] Commit files (esc back)")
+                    (std.fmt.bufPrint(&app.commits_title_buf, "[5] Commit files (patch: {d}) (esc back)", .{patch_mod.commitFilesPatchCount(app)}) catch "[5] Commit files (esc back)")
                 else
-                    "[4] Commit files  (space: add to patch) (esc back)";
+                    "[5] Commit files  (space: add to patch) (esc back)";
                 break :blk panel(root, 0, y, side_w, commits_h, t, app.focus == .commits, listScrollInfo(app, .commits));
             } else blk: {
                 // When the Commits list is filtered (Commits tab only), the title
@@ -1799,7 +1741,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
                     (if (app.focus == .commits) "(esc to cancel filter)" else "(filtered)")
                 else
                     "";
-                break :blk tabbedPanel(root, 0, y, side_w, commits_h, 4, &commits_tabs, @intFromEnum(app.commits_tab), suffix, app.focus == .commits, listScrollInfo(app, .commits));
+                break :blk tabbedPanel(root, 0, y, side_w, commits_h, 5, &commits_tabs, @intFromEnum(app.commits_tab), suffix, app.focus == .commits, listScrollInfo(app, .commits));
             };
             beginListPan(app, .commits);
             drawCommits(w, app);
@@ -1807,7 +1749,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
         }
         y += commits_h;
         if (stash_h > 0) {
-            const w = panel(root, 0, y, side_w, stash_h, "[5] Stash", app.focus == .stash, listScrollInfo(app, .stash));
+            const w = panel(root, 0, y, side_w, stash_h, "[6] Stash", app.focus == .stash, listScrollInfo(app, .stash));
             beginListPan(app, .stash);
             drawStash(w, app);
             endListPan(app, .stash, w.width);
@@ -1816,68 +1758,67 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
 
     // The main/diff panel, unless a side panel is full-screen (main_w == 0).
     if (main_w > 0) {
-    const main_title = if (app.staging_patch_mode)
-        "Building patch (esc back)"
-    else if (app.staging_active)
-        (if (app.staging_staged_view) "Staging - staged" else "Staging - unstaged")
-    else if (app.diff_base) |diff_ref| blk: {
-        // git's own notation carries the whole state: the order around the
-        // dots is the direction (left = the diff's "from"), and the dot count
-        // is the mode (.. full difference, ... merge-base / only the selected
-        // side's changes). Both sides show their real ref; "selected" only
-        // appears when the cursor is somewhere without a diffable ref.
-        const dots: []const u8 = if (app.diff_three_dot) "..." else "..";
-        const base = diffTitleRef(diff_ref);
-        const target: []const u8 = if (diffmode_mod.selectedRefForDiff(app)) |t| diffTitleRef(t) else "selected";
-        break :blk (if (app.diff_reverse)
-            std.fmt.bufPrint(&app.main_title_buf, "Diff [{s}{s}{s}]", .{ target, dots, base })
+        const main_title = if (app.staging_patch_mode)
+            "Building patch (esc back)"
+        else if (app.staging_active)
+            (if (app.staging_staged_view) "Staging - staged" else "Staging - unstaged")
+        else if (app.diff_base) |diff_ref| blk: {
+            // git's own notation carries the whole state: the order around the
+            // dots is the direction (left = the diff's "from"), and the dot count
+            // is the mode (.. full difference, ... merge-base / only the selected
+            // side's changes). Both sides show their real ref; "selected" only
+            // appears when the cursor is somewhere without a diffable ref.
+            const dots: []const u8 = if (app.diff_three_dot) "..." else "..";
+            const base = diffTitleRef(diff_ref);
+            const target: []const u8 = if (diffmode_mod.selectedRefForDiff(app)) |t| diffTitleRef(t) else "selected";
+            break :blk (if (app.diff_reverse)
+                std.fmt.bufPrint(&app.main_title_buf, "Diff [{s}{s}{s}]", .{ target, dots, base })
+            else
+                std.fmt.bufPrint(&app.main_title_buf, "Diff [{s}{s}{s}]", .{ base, dots, target })) catch "Diff [diffing]";
+        } else if (app.contentFocus() == .branches and app.selectedBranchRefName() != null)
+            // A selected branch/tag shows its commit graph, titled "Log".
+            "Log"
+        else if (app.focus == .main and app.contentFocus().isFilePanel() and (app.contentFocus() == .staged or app.files_tab == .files) and app.selectedFile() != null)
+            // Tabbed into a working-tree file's diff: advertise that <enter> opens
+            // the stage/unstage view (the behaviour isn't otherwise discoverable).
+            "Diff (enter to stage)"
         else
-            std.fmt.bufPrint(&app.main_title_buf, "Diff [{s}{s}{s}]", .{ base, dots, target })) catch "Diff [diffing]";
-    }
-    else if (app.contentFocus() == .branches and app.selectedBranchRefName() != null)
-        // A selected branch/tag shows its commit graph, titled "Log".
-        "Log"
-    else if (app.focus == .main and app.contentFocus() == .files and app.files_tab == .files and app.selectedFile() != null)
-        // Tabbed into a working-tree file's diff: advertise that <enter> opens
-        // the stage/unstage view (the behaviour isn't otherwise discoverable).
-        "Diff (enter to stage)"
-    else
-        "Diff";
-    // Clamp the main panel's scroll to the current content (using the previous
-    // frame's measured size) before drawing. Selecting a different item replaces
-    // the preview without touching the scroll, so a scroll left over from a
-    // longer/wider diff could otherwise skip past all of a shorter one and render
-    // the panel blank.
-    app.main_scroll = @min(app.main_scroll, app.maxMainScroll());
-    app.main_hscroll = @min(app.main_hscroll, app.maxMainHScroll());
-    if (app.staging_active and app.staging_split and !app.staging_patch_mode) {
-        // Split staging view: two panes (Unstaged | Staged) fill the main area.
-        drawStagingSplit(root, app, side_w, 0, main_w, body_h);
-    } else {
-        const scroll: ScrollInfo = .{ .len = app.mainContentLines(), .pos = app.main_scroll };
-        // In the single-pane staging view, `[`/`]` switch the unstaged/staged
-        // side, so show them as a highlighted tab strip.
-        const wrap_tag: []const u8 = if (app.wrap_diff) "\u{21A9} wrap" else "";
-        const title_shown = titleWithWrap(app, main_title, &main_title_wrap_buf);
-        const main = if (app.staging_active and !app.staging_patch_mode) blk: {
-            const staging_tabs = [_][]const u8{ "Unstaged", "Staged" };
-            break :blk tabbedPanel(root, side_w, 0, main_w, body_h, null, &staging_tabs, @as(usize, if (app.staging_staged_view) 1 else 0), wrap_tag, app.focus == .main, scroll);
-        } else if (app.diff_base != null) blk: {
-            // Diffing mode: the title carries the whole state (base..selected),
-            // so draw it in the warning colour — the same "a mode is active"
-            // signal the commit-filter indicator uses.
-            const frame = panelBorder(root, side_w, 0, main_w, body_h, app.focus == .main, scroll);
-            if (main_w >= 4 and body_h >= 3)
-                _ = drawTitleSpan(frame.raw, main_w, 2, title_shown, styles().warning);
-            break :blk frame.inner;
-        } else panel(root, side_w, 0, main_w, body_h, title_shown, app.focus == .main, scroll);
-        app.main_view_height = main.height;
-        app.main_view_width = main.width;
-        if (app.showAboutSplash()) drawAbout(main, app) else {
-            refreshOnDiffChange(vx, app);
-            drawDiff(main, app);
+            "Diff";
+        // Clamp the main panel's scroll to the current content (using the previous
+        // frame's measured size) before drawing. Selecting a different item replaces
+        // the preview without touching the scroll, so a scroll left over from a
+        // longer/wider diff could otherwise skip past all of a shorter one and render
+        // the panel blank.
+        app.main_scroll = @min(app.main_scroll, app.maxMainScroll());
+        app.main_hscroll = @min(app.main_hscroll, app.maxMainHScroll());
+        if (app.staging_active and app.staging_split and !app.staging_patch_mode) {
+            // Split staging view: two panes (Unstaged | Staged) fill the main area.
+            drawStagingSplit(root, app, side_w, 0, main_w, body_h);
+        } else {
+            const scroll: ScrollInfo = .{ .len = app.mainContentLines(), .pos = app.main_scroll };
+            // In the single-pane staging view, `[`/`]` switch the unstaged/staged
+            // side, so show them as a highlighted tab strip.
+            const wrap_tag: []const u8 = if (app.wrap_diff) "\u{21A9} wrap" else "";
+            const title_shown = titleWithWrap(app, main_title, &main_title_wrap_buf);
+            const main = if (app.staging_active and !app.staging_patch_mode) blk: {
+                const staging_tabs = [_][]const u8{ "Unstaged", "Staged" };
+                break :blk tabbedPanel(root, side_w, 0, main_w, body_h, null, &staging_tabs, @as(usize, if (app.staging_staged_view) 1 else 0), wrap_tag, app.focus == .main, scroll);
+            } else if (app.diff_base != null) blk: {
+                // Diffing mode: the title carries the whole state (base..selected),
+                // so draw it in the warning colour — the same "a mode is active"
+                // signal the commit-filter indicator uses.
+                const frame = panelBorder(root, side_w, 0, main_w, body_h, app.focus == .main, scroll);
+                if (main_w >= 4 and body_h >= 3)
+                    _ = drawTitleSpan(frame.raw, main_w, 2, title_shown, styles().warning);
+                break :blk frame.inner;
+            } else panel(root, side_w, 0, main_w, body_h, title_shown, app.focus == .main, scroll);
+            app.main_view_height = main.height;
+            app.main_view_width = main.width;
+            if (app.showAboutSplash()) drawAbout(main, app) else {
+                refreshOnDiffChange(vx, app);
+                drawDiff(main, app);
+            }
         }
-    }
     }
     // Indent the footer by one column so it lines up with the panel content
     // (just inside the left `│` border) and clears the terminal's rounded
@@ -2250,7 +2191,8 @@ const help_lines = [_][]const u8{
     "Global",
     "  q, ctrl+c      quit",
     "  R              refresh",
-    "  1-5            jump to a panel; press again to cycle that panel's tabs",
+    "  3              focus Staged files",
+    "  1-6            jump to a panel; press again to cycle that panel's tabs",
     "  h, left        focus the panel on the left",
     "  l, right       focus the panel on the right",
     "  j, down        move the selection down",
@@ -2302,8 +2244,8 @@ const help_lines = [_][]const u8{
     "                 stashes; toggle commit files into the patch.",
     "",
     "Files  (tabs: Files, Worktrees, Submodules — [ and ] switch)",
-    "  space          stage or unstage (whole dir in tree view)",
-    "  a              stage or unstage all",
+    "  space          stage (whole dir in tree view); unstage in Staged",
+    "  a              stage all; unstage all in Staged",
     "  c              commit",
     "  w              commit with --no-verify (skip hooks)",
     "  A              amend the last commit",
@@ -2317,6 +2259,7 @@ const help_lines = [_][]const u8{
     "                 asks for an optional message (empty = git's default name)",
     "  /              filter by path",
     "  ctrl+b         status filter",
+    "  alt+b          cycle status filter",
     "  `              toggle the directory tree",
     "  enter          open the hunk/line staging view (a conflicted file opens",
     "                 the per-conflict resolver: j/k between conflicts, o/t pick",
@@ -2923,7 +2866,7 @@ fn drawAiFailure(win: vaxis.Window, row: u16, col: u16, detail: ?[]const u8, sty
             var shown = d;
             var ellipsis = false;
             if (shown.len > budget) {
-                shown = d[0 .. budget -| 1];
+                shown = d[0..budget -| 1];
                 ellipsis = true;
             }
             var buf: [256]u8 = undefined;
@@ -3658,22 +3601,30 @@ fn drawStatus(win: vaxis.Window, app: *const app_mod.App) void {
     }
 }
 
-fn drawFiles(win: vaxis.Window, app: *const app_mod.App) void {
+fn drawFiles(win: vaxis.Window, app: *const app_mod.App, focus: model.Focus) void {
     if (app.data.files.len == 0) {
-        print(win, 0, 0, if (app.initial_load_pending) "Loading..." else "Working tree clean", styles().muted);
+        print(win, 0, 0, if (app.initial_load_pending) "Loading..." else if (focus == .staged) "No staged files" else "Working tree clean", styles().muted);
         return;
     }
-    if (app.tree_view) return drawFileTree(win, app);
-    const visible_count = app.visibleFileCount();
+    if (focus == .staged and app.data.stagedCount() == 0) {
+        print(win, 0, 0, "No staged files", styles().muted);
+        return;
+    }
+    if (focus == .files and app.file_display_filter == .unstaged and app.data.unstagedCount() == 0) {
+        print(win, 0, 0, "No unstaged files", styles().muted);
+        return;
+    }
+    if (app.tree_view) return drawFileTree(win, app, focus);
+    const visible_count = app.activeListLen(focus);
     if (visible_count == 0) {
-        print(win, 0, 0, "No files match filter", styles().muted);
+        print(win, 0, 0, if (focus == .staged) "No staged files" else "No files match filter", styles().muted);
         return;
     }
-    const start = app.listScroll(.files);
+    const start = app.listScroll(focus);
     var row: u16 = 0;
     var ordinal: usize = 0;
     for (app.data.files, 0..) |file, idx| {
-        if (!app.fileMatchesFilter(file)) continue;
+        if (!app.fileMatchesPanelFilter(file, focus)) continue;
         if (ordinal < start) {
             ordinal += 1;
             continue;
@@ -3682,7 +3633,7 @@ fn drawFiles(win: vaxis.Window, app: *const app_mod.App) void {
         var base = styles().normal;
         // Cursor is tracked by data index (file_index); the range is in visible-
         // ordinal space (what activeListSelected uses), so range-check `ordinal`.
-        const sel = rowSel(app, .files, ordinal, idx == app.file_index, app.focus == .files);
+        const sel = rowSel(app, focus, ordinal, idx == (if (focus == .staged) app.staged_index else app.file_index), app.focus == focus);
         applySel(&base, sel);
         if (sel != .none) fillRow(win, row, base);
         // The two short-status columns are colored independently:
@@ -3747,21 +3698,22 @@ fn drawTreeRowPrefix(win: vaxis.Window, row: u16, base: vaxis.Style, tr: filetre
     return col;
 }
 
-fn drawFileTree(win: vaxis.Window, app: *const app_mod.App) void {
-    if (app.files_tree.rows.len == 0) {
+fn drawFileTree(win: vaxis.Window, app: *const app_mod.App, focus: model.Focus) void {
+    const tree = if (focus == .staged) &app.staged_tree else &app.files_tree;
+    if (tree.rows.len == 0) {
         print(win, 0, 0, "No files match filter", styles().muted);
         return;
     }
-    const start = app.listScroll(.files);
+    const start = app.listScroll(focus);
     var row: u16 = 0;
     var i = start;
-    while (i < app.files_tree.rows.len and row < win.height) : ({
+    while (i < tree.rows.len and row < win.height) : ({
         i += 1;
         row += 1;
     }) {
-        const tr = app.files_tree.rows[i];
+        const tr = tree.rows[i];
         var base = styles().normal;
-        const sel = rowSel(app, .files, i, i == app.files_tree.cursor, app.focus == .files);
+        const sel = rowSel(app, focus, i, i == tree.cursor, app.focus == focus);
         applySel(&base, sel);
         if (sel != .none) fillRow(win, row, base);
 
@@ -5415,6 +5367,7 @@ fn hintRowsNeeded(width: u16, start_col: u16, hints: []const u8) u16 {
 const footer_contexts = [_]FooterCtx{
     .{ .focus = .status },
     .{ .focus = .files, .files_tab = .files },
+    .{ .focus = .staged },
     .{ .focus = .files, .files_tab = .worktrees },
     .{ .focus = .files, .files_tab = .submodules },
     .{ .focus = .files, .conflict = true },
@@ -5585,6 +5538,7 @@ fn footerHints(c: FooterCtx) []const u8 {
             .tags => "space checkout  n new-tag  d delete  P push  g reset  y copy  w worktree  W diff  [/] tabs" ++ global_branches,
         };
     }
+    if (c.focus == .staged) return "space unstage  a unstage all  c commit  enter hunks  ` tree" ++ global;
     if (c.focus == .files) {
         return switch (c.files_tab) {
             .files => "space stage  a all  c/w commit/no-verify  A amend  e edit  d discard  i ignore/exclude  y copy  ^f fixup-base  s stash  / filter  ` tree  enter hunks  [/] tabs" ++ global,
@@ -5593,8 +5547,8 @@ fn footerHints(c: FooterCtx) []const u8 {
         };
     }
     return switch (c.focus) {
-        .status => "1-5 panels  enter inspect  f fetch  p pull  P push" ++ global,
-        .files => unreachable,
+        .status => "1-6 panels  enter inspect  f fetch  p pull  P push" ++ global,
+        .files, .staged => unreachable,
         .branches => unreachable,
         .commits => if (c.divergence)
             "\u{2191} ahead / \u{2193} incoming  space checkout  n new-branch  c/V/C copy/paste/clear commit  y copy menu  W diff  [/] tabs" ++ global
@@ -5633,7 +5587,7 @@ fn contextHints(app: *const app_mod.App) []const u8 {
         .conflict = app.data.state != .clean,
         // `e` edits the file when the Diff panel shows a working-tree file.
         .main_file = app.focus == .main and !app.staging_active and
-            app.contentFocus() == .files and app.selectedFile() != null,
+            app.contentFocus().isFilePanel() and app.selectedFile() != null,
         .fullscreen = app.mainFullscreen(),
         .commits_copied = app.copied_commits.items.len > 0,
     });
@@ -6507,19 +6461,19 @@ test "side panel heights match the weighting" {
     const h = sidePanelHeights(body_h, .files, false, 2, 0, false);
     try std.testing.expectEqual(@as(u16, 5), h.status);
     try std.testing.expectEqual(@as(u16, 3), h.stash);
-    try std.testing.expectEqual(body_h, h.status + h.files + h.branches + h.commits + h.stash);
+    try std.testing.expectEqual(body_h, h.status + h.files + h.staged + h.branches + h.commits + h.stash);
     const lists_spread = @max(h.files, @max(h.branches, h.commits)) - @min(h.files, @min(h.branches, h.commits));
     try std.testing.expect(lists_spread <= 1);
 
     // Stash focused: it joins the weighted group and grows past the fixed 3.
     const hs = sidePanelHeights(body_h, .stash, false, 2, 0, false);
     try std.testing.expect(hs.stash > 3);
-    try std.testing.expectEqual(body_h, hs.status + hs.files + hs.branches + hs.commits + hs.stash);
+    try std.testing.expectEqual(body_h, hs.status + hs.files + hs.staged + hs.branches + hs.commits + hs.stash);
 
     // Accordion: the focused list panel is larger than the others.
     const ha = sidePanelHeights(body_h, .commits, true, 2, 0, false);
     try std.testing.expect(ha.commits > ha.files);
-    try std.testing.expectEqual(body_h, ha.status + ha.files + ha.branches + ha.commits + ha.stash);
+    try std.testing.expectEqual(body_h, ha.status + ha.files + ha.staged + ha.branches + ha.commits + ha.stash);
 
     // Each stacked filter beyond the first grows the Status panel by a row (so a
     // files+branches+commits filter shows all three lines).
@@ -6530,8 +6484,9 @@ test "side panel heights match the weighting" {
     // count, and the reclaimed rows go to the list panels. Still fills body_h.
     const hc = sidePanelHeights(body_h, .files, false, 2, 2, true);
     try std.testing.expectEqual(@as(u16, 1), hc.status);
-    try std.testing.expectEqual(body_h, hc.status + hc.files + hc.branches + hc.commits + hc.stash);
+    try std.testing.expectEqual(body_h, hc.status + hc.files + hc.staged + hc.branches + hc.commits + hc.stash);
     try std.testing.expect(hc.files > h.files); // more room than the uncollapsed layout
+
 }
 
 test "a high accordion weight keeps unfocused panels at the framed minimum" {
@@ -6545,13 +6500,13 @@ test "a high accordion weight keeps unfocused panels at the framed minimum" {
     try std.testing.expect(h.commits >= 3);
     try std.testing.expect(h.branches > h.files); // focused still dominates
     try std.testing.expect(h.branches > h.commits);
-    try std.testing.expectEqual(body_h, h.status + h.files + h.branches + h.commits + h.stash);
+    try std.testing.expectEqual(body_h, h.status + h.files + h.staged + h.branches + h.commits + h.stash);
 
     // On a column too short to frame them all, the floor is skipped rather than
     // forced (there is genuinely no room), and the heights still sum exactly.
     const tiny: u16 = 16; // status 5 + stash 3 leaves 8 for three list panels
     const ht = sidePanelHeights(tiny, .branches, true, 15, 0, false);
-    try std.testing.expectEqual(tiny, ht.status + ht.files + ht.branches + ht.commits + ht.stash);
+    try std.testing.expectEqual(tiny, ht.status + ht.files + ht.staged + ht.branches + ht.commits + ht.stash);
 }
 
 test "the accordion squashes unfocused panels on a short column" {
@@ -6566,7 +6521,7 @@ test "the accordion squashes unfocused panels on a short column" {
     try std.testing.expectEqual(@as(u16, 1), short.commits);
     try std.testing.expectEqual(@as(u16, 1), short.stash);
     try std.testing.expect(short.branches >= 8); // dominates
-    try std.testing.expectEqual(@as(u16, 20), short.status + short.files + short.branches + short.commits + short.stash);
+    try std.testing.expectEqual(@as(u16, 20), short.status + short.files + short.staged + short.branches + short.commits + short.stash);
 
     // Moderately short (21..27): unfocused list panels keep a framed 3 rows, the
     // focused one still takes the rest.
@@ -6575,7 +6530,7 @@ test "the accordion squashes unfocused panels on a short column" {
     try std.testing.expectEqual(@as(u16, 3), med.commits);
     try std.testing.expectEqual(@as(u16, 3), med.stash);
     try std.testing.expect(med.branches > med.files); // dominates
-    try std.testing.expectEqual(@as(u16, 24), med.status + med.files + med.branches + med.commits + med.stash);
+    try std.testing.expectEqual(@as(u16, 24), med.status + med.files + med.staged + med.branches + med.commits + med.stash);
 
     // The squash applies regardless of the accordion setting, so the focused
     // panel stays usable on a short terminal even without it.
@@ -6583,7 +6538,7 @@ test "the accordion squashes unfocused panels on a short column" {
     try std.testing.expectEqual(@as(u16, 1), no_acc.files);
     try std.testing.expectEqual(@as(u16, 1), no_acc.commits);
     try std.testing.expect(no_acc.branches >= 8); // focused still usable
-    try std.testing.expectEqual(@as(u16, 20), no_acc.status + no_acc.files + no_acc.branches + no_acc.commits + no_acc.stash);
+    try std.testing.expectEqual(@as(u16, 20), no_acc.status + no_acc.files + no_acc.staged + no_acc.branches + no_acc.commits + no_acc.stash);
 }
 
 test "side panel width scales with the terminal, no fixed cap" {

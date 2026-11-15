@@ -453,7 +453,7 @@ essentials:
 
 | Key | Action |
 |---|---|
-| `1`–`5` | Focus Status / Files / Branches / Commits / Stash (press again to cycle that panel's tabs) |
+| `1`–`6` | Focus Status / Files / Staged / Branches / Commits / Stash (press again to cycle that panel's tabs) |
 | `h` `l` / arrows | Move focus between side panels |
 | `j` `k` / arrows | Move selection |
 | `tab` | Focus the Diff panel (and back) |

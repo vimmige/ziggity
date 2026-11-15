@@ -29,6 +29,7 @@ pub const Action = enum {
     start_commit_filter,
     start_branch_filter,
     open_status_filter,
+    cycle_status_filter,
     start_commit,
     amend_commit,
     cherry_pick,
@@ -88,6 +89,7 @@ pub const Action = enum {
     push,
     focus_status,
     focus_files,
+    focus_staged,
     focus_branches,
     focus_commits,
     focus_stash,
@@ -200,6 +202,7 @@ pub fn isFilesContentAction(self: Action) bool {
         .amend_commit,
         .conflict_menu,
         .open_status_filter,
+        .cycle_status_filter,
         .start_file_filter,
         .toggle_tree,
         .ignore_file,
@@ -226,6 +229,7 @@ pub fn isMutating(self: Action) bool {
         .toggle_staging_split,
         .focus_status,
         .focus_files,
+        .focus_staged,
         .focus_branches,
         .focus_commits,
         .focus_stash,
@@ -244,6 +248,7 @@ pub fn isMutating(self: Action) bool {
         .start_commit_filter,
         .start_branch_filter,
         .open_status_filter,
+        .cycle_status_filter,
         .confirm,
         .backspace,
         => false,
@@ -256,6 +261,7 @@ pub fn fromNormalKey(key: vaxis.Key, keymap: config_mod.KeyMap, focus: model.Foc
     if (keymap.quit.matches(key) or keymap.quit_ctrl.matches(key)) return .quit;
     if (keymap.escape.matches(key)) return .cancel;
 
+    if (keymap.staged_panel.matches(key)) return .focus_staged;
     if (keymap.status_panel.matches(key)) return .focus_status;
     if (keymap.files_panel.matches(key)) return .focus_files;
     if (keymap.branches_panel.matches(key)) return .focus_branches;
@@ -339,11 +345,12 @@ pub fn fromNormalKey(key: vaxis.Key, keymap: config_mod.KeyMap, focus: model.Foc
     if (keymap.conflict_menu.matches(key)) return .conflict_menu;
 
     switch (focus) {
-        .files => {
+        .files, .staged => {
             if (keymap.stage_all.matches(key)) return .stage_all;
             if (keymap.edit_file.matches(key)) return .edit_file;
             if (keymap.toggle_tree.matches(key)) return .toggle_tree;
-            if (keymap.open_status_filter.matches(key)) return .open_status_filter;
+            if (focus == .files and keymap.open_status_filter.matches(key)) return .open_status_filter;
+            if (focus == .files and keymap.cycle_status_filter.matches(key)) return .cycle_status_filter;
             if (keymap.discard.matches(key)) return .discard_selected;
             if (keymap.discard_all.matches(key)) return .discard_all;
             if (keymap.stash_create.matches(key)) return .stash_menu;
@@ -422,9 +429,9 @@ test "normal key mapping handles global and focused actions" {
     try std.testing.expectEqual(Action.refresh, fromNormalKey(testKey('R'), keymap, .files).?);
     try std.testing.expectEqual(Action.focus_status, fromNormalKey(testKey('1'), keymap, .files).?);
     try std.testing.expectEqual(Action.focus_files, fromNormalKey(testKey('2'), keymap, .files).?);
-    try std.testing.expectEqual(Action.focus_branches, fromNormalKey(testKey('3'), keymap, .files).?);
-    try std.testing.expectEqual(Action.focus_commits, fromNormalKey(testKey('4'), keymap, .files).?);
-    try std.testing.expectEqual(Action.focus_stash, fromNormalKey(testKey('5'), keymap, .files).?);
+    try std.testing.expectEqual(Action.focus_branches, fromNormalKey(testKey('4'), keymap, .files).?);
+    try std.testing.expectEqual(Action.focus_commits, fromNormalKey(testKey('5'), keymap, .files).?);
+    try std.testing.expectEqual(Action.focus_stash, fromNormalKey(testKey('6'), keymap, .files).?);
     try std.testing.expectEqual(Action.stage_all, fromNormalKey(testKey('a'), keymap, .files).?);
     try std.testing.expectEqual(Action.discard_selected, fromNormalKey(testKey('d'), keymap, .files).?);
     try std.testing.expectEqual(Action.discard_all, fromNormalKey(testKey('D'), keymap, .files).?);

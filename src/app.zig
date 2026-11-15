@@ -444,7 +444,7 @@ pub fn helpSectionKeyword(focus: model.Focus, staging_active: bool) ?[]const u8 
     // The hunk/line staging view has its own section regardless of focus.
     if (staging_active) return "Staging view";
     return switch (focus) {
-        .files => "Files",
+        .files, .staged => "Files",
         .branches => "Branches",
         .commits => "Commits",
         .stash => "Stash",
@@ -908,9 +908,8 @@ const patch_menu_items = [_]MenuItem{
 
 /// Order of entries shown in the status-filter menu popup.
 pub const status_filter_options = [_]model.FileDisplayFilter{
-    .all,
-    .staged,
     .unstaged,
+    .all,
     .tracked,
     .untracked,
     .conflicted,
@@ -1158,9 +1157,11 @@ fn firstLine(text: []const u8) []const u8 {
 /// fetched. Translated into a `PreviewJob` and a cache key on the UI thread.
 const PreviewKind = union(enum) {
     file: model.FileStatus,
+    staged_file: model.FileStatus,
     /// Combined working-tree diff for everything under a directory pathspec; the
-    /// empty path is the tree root and shows every change.
+    /// empty path is the tree root.
     dir: []const u8,
+    staged_dir: []const u8,
     branch: []const u8,
     commit: []const u8,
     commit_file: struct { hash: []const u8, path: []const u8 },
@@ -3515,6 +3516,8 @@ pub const App = struct {
     file_index: usize = 0,
     tree_view: bool = false,
     files_tree: TreeState = undefined,
+    staged_tree: TreeState = undefined,
+    staged_index: usize = 0,
     branch_index: usize = 0,
     /// Set after a successful checkout so the next branches load moves the
     /// Branches selection onto the freshly checked-out (now current) branch.
@@ -3627,7 +3630,7 @@ pub const App = struct {
     conflict_undo: std.ArrayList([]u8) = .empty,
     main_view_height: u16 = 0,
     /// Panel hit-boxes captured by the renderer for mouse handling.
-    panel_rects: [6]PanelRect = undefined,
+    panel_rects: [7]PanelRect = undefined,
     panel_rect_count: usize = 0,
     // Scratch buffers for dynamically-formatted panel titles. vaxis stores each
     // cell's grapheme as a slice into the source text (it does not copy), and the
@@ -3642,7 +3645,7 @@ pub const App = struct {
     // selection only when the *selection* changes (keyboard/click/refresh), not
     // when the wheel scrolls. Indexed via `listViewIndex` (files/branches/
     // commits/stash); status and main have no entry.
-    list_views: [4]ListView = @splat(.{}),
+    list_views: [5]ListView = @splat(.{}),
     // Character-precise mouse text selection in the Diff panel. Coordinates are
     // into the rendered diff (`self.diff`): `line` is an absolute line index,
     // `col` a visible column. `anchor` is where the drag began, `head` the
@@ -3787,12 +3790,7 @@ pub const App = struct {
     /// Flushed off the UI thread with `stage_pending` so `a` is non-blocking too.
     /// An all-op supersedes per-path pending (it sets the baseline for everything).
     stage_all_pending: ?bool = null,
-    file_display_filter: model.FileDisplayFilter = .all,
-    // Paths that had a conflict while the `.conflicted` filter has been active.
-    // The filter keeps showing them once resolved (so their diff stays reviewable
-    // until the whole operation is done). Reset whenever the
-    // display filter changes; accumulated each refresh while `.conflicted`.
-    conflict_remembered: std.ArrayList([]u8) = .empty,
+    file_display_filter: model.FileDisplayFilter = .unstaged,
     commit_body_buffer: std.ArrayList(u8) = .empty,
     // An unfinalized "create commit" message (subject + body), preserved when the
     // commit dialog is cancelled and restored when it is reopened; cleared on a
@@ -4353,6 +4351,7 @@ pub const App = struct {
             .commit_graph_all = cfg.commit_graph_scope == .all,
         };
         app.files_tree = .{ .collapsed = std.BufSet.init(allocator) };
+        app.staged_tree = .{ .collapsed = std.BufSet.init(allocator) };
         app.commit_tree = .{ .collapsed = std.BufSet.init(allocator) };
         app.branch_tree = .{ .collapsed = std.BufSet.init(allocator) };
         git_moved = true;
@@ -4399,6 +4398,7 @@ pub const App = struct {
         conflicts_mod.close(self);
         self.conflict_undo.deinit(self.allocator);
         self.files_tree.deinit(self.allocator);
+        self.staged_tree.deinit(self.allocator);
         self.commit_tree.deinit(self.allocator);
         self.branch_tree.deinit(self.allocator);
         if (self.staging) |*parsed| parsed.deinit(self.allocator);
@@ -4411,8 +4411,6 @@ pub const App = struct {
         self.allocator.free(self.file_filter);
         self.allocator.free(self.branch_filter);
         self.branch_filter_buffer.deinit(self.allocator);
-        self.clearRememberedConflicts();
-        self.conflict_remembered.deinit(self.allocator);
         self.allocator.free(self.op_command);
         self.allocator.free(self.op_summary);
         self.allocator.free(self.op_output);
@@ -4512,8 +4510,10 @@ pub const App = struct {
         // Capture the tree cursor's path too (an owned copy that survives the
         // data swap) so the selection stays on the same file/dir after the
         // rebuild instead of snapping to the top row.
-        const tree_path = self.captureTreePath() catch null;
-        defer if (tree_path) |p| self.allocator.free(p);
+        const tree_paths = self.captureTreePaths() catch .{ null, null };
+        defer for (tree_paths) |path| {
+            if (path) |value| self.allocator.free(value);
+        };
         const prev_conflicts = self.conflictFileCount();
         self.data.deinit(self.allocator);
         self.data = gpa_data;
@@ -4538,7 +4538,7 @@ pub const App = struct {
             if (self.data.commits.len > 0) self.commit_index = @min(idx, self.data.commits.len - 1);
             self.select_commit_pending = null;
         }
-        if (self.tree_view) self.rebuildTree(tree_path) catch {};
+        if (self.tree_view) self.rebuildFileTrees(tree_paths) catch {};
         self.updatePreview() catch {};
         self.setMessage("ready", .{}) catch {};
         // Kick a first PR-status fetch (off-thread) now that branches are loaded.
@@ -4564,8 +4564,10 @@ pub const App = struct {
             null;
         defer if (selected_prev) |p| self.allocator.free(p);
         const selected_status: ?[2]u8 = if (self.selectedFile()) |file| file.short_status else null;
-        const tree_path = try self.captureTreePath();
-        defer if (tree_path) |p| self.allocator.free(p);
+        const tree_paths = try self.captureTreePaths();
+        defer for (tree_paths) |path| {
+            if (path) |value| self.allocator.free(value);
+        };
 
         const prev_conflicts = self.conflictFileCount();
         var files = try self.git.loadFiles();
@@ -4582,9 +4584,9 @@ pub const App = struct {
         self.restoreFileSelection(selected_path, selected_prev, selected_status);
         self.clampSelections();
         self.applyConflictAutoFilter(prev_conflicts);
-        if (self.tree_view) try self.rebuildTree(tree_path);
+        if (self.tree_view) try self.rebuildFileTrees(tree_paths);
         const content = self.contentFocus();
-        if (content == .files or content == .status) {
+        if (content.isFilePanel() or content == .status) {
             self.updatePreview() catch |err| {
                 try self.setMessage("preview failed: {s}", .{@errorName(err)});
             };
@@ -4652,6 +4654,10 @@ pub const App = struct {
         // cursor follows items by identity rather than row index across reorders.
         const sel_keys = self.captureSelections();
         defer sel_keys.deinit(a);
+        const tree_paths = self.captureTreePaths() catch .{ null, null };
+        defer for (tree_paths) |path| {
+            if (path) |value| a.free(value);
+        };
         const s = sd.scopes;
         const prev_conflicts = self.conflictFileCount();
 
@@ -4705,7 +4711,10 @@ pub const App = struct {
         self.clampSelections();
         // A merge/rebase/cherry-pick that just produced (or cleared) conflicts
         // lands here; auto-focus the Files panel on the conflicting files.
-        if (s.contains(.files)) self.applyConflictAutoFilter(prev_conflicts);
+        if (s.contains(.files)) {
+            self.applyConflictAutoFilter(prev_conflicts);
+            if (self.tree_view) self.rebuildFileTrees(tree_paths) catch {};
+        }
         if (self.select_current_branch_pending and s.contains(.branches)) {
             self.selectCurrentBranch();
             self.select_current_branch_pending = false;
@@ -4877,8 +4886,10 @@ pub const App = struct {
             null;
         defer if (selected_prev) |p| self.allocator.free(p);
         const sel_status: ?[2]u8 = if (self.selectedFile()) |file| file.short_status else null;
-        const tree_path = try self.captureTreePath();
-        defer if (tree_path) |p| self.allocator.free(p);
+        const tree_paths = try self.captureTreePaths();
+        defer for (tree_paths) |path| {
+            if (path) |value| self.allocator.free(value);
+        };
 
         const prev_conflicts = self.conflictFileCount();
         self.data.replaceStatus(self.allocator, status);
@@ -4895,7 +4906,7 @@ pub const App = struct {
         self.restoreFileSelection(selected_path, selected_prev, sel_status);
         self.clampSelections();
         self.applyConflictAutoFilter(prev_conflicts);
-        if (self.tree_view) try self.rebuildTree(tree_path);
+        if (self.tree_view) try self.rebuildFileTrees(tree_paths);
 
         // The staging view overlays the file list this refresh just reloaded. If
         // its file changed on disk (an editor save, a script), reload the open
@@ -4920,7 +4931,7 @@ pub const App = struct {
         }
 
         const content = self.contentFocus();
-        if (content == .files or content == .status) {
+        if (content.isFilePanel() or content == .status) {
             self.updatePreview() catch |err| {
                 try self.setMessage("preview failed: {s}", .{@errorName(err)});
             };
@@ -5088,7 +5099,7 @@ pub const App = struct {
         // Files panel's Files tab and a commit's / branch's file drill. It is
         // otherwise bound only under the Files focus, so handle those contexts
         // explicitly (and not the Worktrees/Submodules tabs of the Files panel).
-        const file_list_shown = (self.focus == .files and self.files_tab == .files) or
+        const file_list_shown = (self.focus.isFilePanel() and self.fileTab() == .files) or
             (self.focus == .commits and self.commitsFilesActive()) or
             (self.focus == .branches and self.branchFilesActive());
         if (self.config.keymap.toggle_tree.matches(key) and file_list_shown) {
@@ -5110,9 +5121,9 @@ pub const App = struct {
 
         // The Files panel's Worktrees / Submodules tabs add their own context
         // keys, resolved here before the file-list bindings.
-        if (self.focus == .files) {
+        if (self.focus.isFilePanel()) {
             const km = self.config.keymap;
-            switch (self.files_tab) {
+            switch (self.fileTab()) {
                 .worktrees => {
                     if (km.new_branch.matches(key)) return self.startNewWorktree();
                     if (km.open_browser.matches(key)) return self.openSelectedWorktreeInEditor();
@@ -5236,7 +5247,7 @@ pub const App = struct {
         // The Files panel's Worktrees / Submodules tabs are not a working-tree
         // file list, so the file-specific keys (stage-all, commit, discard-all,
         // tree toggle, …) don't apply there.
-        const in_files_subtab = self.focus == .files and self.files_tab != .files and actions.isFilesContentAction(action);
+        const in_files_subtab = self.focus.isFilePanel() and self.fileTab() != .files and actions.isFilesContentAction(action);
         if (in_branch_drill or in_commit_files or in_files_subtab or in_divergence) {
             action = actions.fromNormalKey(key, self.config.keymap, .status) orelse return;
         }
@@ -5246,7 +5257,7 @@ pub const App = struct {
         // stage/unstage-all (`a`) only update the model optimistically and queue a
         // coalesced batch (flushed off-thread once the worker frees up), so rapid
         // staging stays responsive even mid-op.
-        const staging_key = (action == .select or action == .stage_all) and self.focus == .files;
+        const staging_key = (action == .select or action == .stage_all) and self.focus.isFilePanel();
         if (self.foregroundBusy() and actions.isMutating(action) and !staging_key) {
             return self.setMessage("operation in progress...", .{});
         }
@@ -5328,6 +5339,7 @@ pub const App = struct {
             },
             .focus_status => try self.jumpPanel(.status),
             .focus_files => try self.jumpPanel(.files),
+            .focus_staged => try self.jumpPanel(.staged),
             .focus_branches => try self.jumpPanel(.branches),
             .focus_commits => try self.jumpPanel(.commits),
             .focus_stash => try self.jumpPanel(.stash),
@@ -5393,7 +5405,7 @@ pub const App = struct {
                 } else switch (self.focus) {
                     // Files tab: stage the file. Worktrees: point at opening
                     // ziggity there. Submodules: init/update it.
-                    .files => switch (self.files_tab) {
+                    .files, .staged => switch (self.fileTab()) {
                         .files => try staging_mod.toggleSelectedFileStaged(self),
                         .worktrees => try self.enterSelectedWorktree(),
                         .submodules => try self.updateSelectedSubmodule(),
@@ -5449,9 +5461,9 @@ pub const App = struct {
             .conflict_menu => try self.startConflictActionsMenu(),
             .stage_all => try staging_mod.toggleAllStaged(self),
             .edit_file => try self.requestEditFile(),
-            .discard_selected => if (self.focus == .files and self.files_tab == .worktrees)
+            .discard_selected => if (self.focus.isFilePanel() and self.fileTab() == .worktrees)
                 try self.removeSelectedWorktree()
-            else if (self.focus == .files and self.files_tab == .submodules)
+            else if (self.focus.isFilePanel() and self.fileTab() == .submodules)
                 try self.startRemoveSubmodule()
             else
                 try self.startDiscardMenu(),
@@ -5461,6 +5473,10 @@ pub const App = struct {
             .start_commit_filter => try self.startCommitFilterMenu(),
             .start_branch_filter => try self.startBranchFilterPrompt(),
             .open_status_filter => try self.startStatusFilterMenu(),
+            .cycle_status_filter => {
+                const index = std.mem.indexOfScalar(model.FileDisplayFilter, &status_filter_options, self.file_display_filter).?;
+                try self.setFileDisplayFilter(status_filter_options[(index + 1) % status_filter_options.len]);
+            },
             .start_commit => try commits_mod.startCommitPrompt(self, false),
             .commit_no_verify => try commits_mod.startCommitPrompt(self, true),
             .ignore_file => {
@@ -5841,7 +5857,7 @@ pub const App = struct {
                         self.diff_sel_active = false;
                         if (self.staging_active) {
                             staging_mod.clickStagingLine(self, self.diff_sel_pane, self.diff_sel_anchor_line) catch {};
-                        } else if (self.contentFocus() == .files) {
+                        } else if (self.contentFocus().isFilePanel()) {
                             try staging_mod.openStaging(self);
                         } else {
                             try self.focusPanel(.main);
@@ -5885,6 +5901,7 @@ pub const App = struct {
     fn listViewIndex(focus: model.Focus) ?usize {
         return switch (focus) {
             .files => 0,
+            .staged => 4,
             .branches => 1,
             .commits => 2,
             .stash => 3,
@@ -5910,8 +5927,8 @@ pub const App = struct {
         if (self.mode == .rebase_plan and focus == .commits)
             return if (self.rebase_plan) |p| p.len else 0;
         return switch (focus) {
-            .files => switch (self.files_tab) {
-                .files => if (self.tree_view) self.files_tree.rows.len else self.visibleFileCount(),
+            .files, .staged => switch (if (focus == .staged) FilesTab.files else self.files_tab) {
+                .files => if (self.tree_view) (if (focus == .staged) self.staged_tree.rows.len else self.files_tree.rows.len) else self.panelFileCount(focus),
                 .worktrees => self.data.worktrees.len,
                 .submodules => self.data.submodules.len,
             },
@@ -5941,8 +5958,8 @@ pub const App = struct {
         // In the interactive-rebase editor the cursor is the plan index.
         if (self.mode == .rebase_plan and focus == .commits) return self.rebase_plan_index;
         return switch (focus) {
-            .files => switch (self.files_tab) {
-                .files => if (self.tree_view) self.files_tree.cursor else self.selectedFileVisibleOrdinal(),
+            .files, .staged => switch (if (focus == .staged) FilesTab.files else self.files_tab) {
+                .files => if (self.tree_view) (if (focus == .staged) self.staged_tree.cursor else self.files_tree.cursor) else self.panelFileOrdinal(focus),
                 .worktrees => self.worktree_index,
                 .submodules => self.submodule_index,
             },
@@ -6411,15 +6428,15 @@ pub const App = struct {
         const clicked = self.listScroll(rect.focus) + rel;
 
         switch (rect.focus) {
-            .files => switch (self.files_tab) {
+            .files, .staged => switch (self.fileTab()) {
                 .files => {
                     if (self.tree_view) {
-                        if (self.files_tree.rows.len == 0) return;
-                        self.files_tree.cursor = @min(clicked, self.files_tree.rows.len - 1);
+                        if (self.fileTree().rows.len == 0) return;
+                        self.fileTree().cursor = @min(clicked, self.fileTree().rows.len - 1);
                     } else {
                         const vis = self.visibleFileCount();
                         if (vis == 0) return;
-                        if (self.fileIndexAtVisibleOrdinal(@min(clicked, vis - 1))) |idx| self.file_index = idx;
+                        if (self.fileIndexAtVisibleOrdinal(@min(clicked, vis - 1))) |idx| self.fileIndex().* = idx;
                     }
                 },
                 .worktrees => {
@@ -6579,6 +6596,18 @@ pub const App = struct {
         return self.data.commits.len > 0 and std.mem.eql(u8, hash, self.data.commits[0].hash);
     }
 
+    fn fileTab(self: *const App) FilesTab {
+        return if (self.contentFocus() == .staged) .files else self.files_tab;
+    }
+
+    pub fn fileTree(self: anytype) @TypeOf(&self.files_tree) {
+        return if (self.contentFocus() == .staged) &self.staged_tree else &self.files_tree;
+    }
+
+    pub fn fileIndex(self: anytype) @TypeOf(&self.file_index) {
+        return if (self.contentFocus() == .staged) &self.staged_index else &self.file_index;
+    }
+
     pub fn selectedFile(self: *const App) ?model.FileStatus {
         if (self.data.files.len == 0) return null;
         if (self.tree_view) {
@@ -6586,14 +6615,14 @@ pub const App = struct {
             if (row.is_dir) return null;
             return self.data.files[row.file_index];
         }
-        const idx = @min(self.file_index, self.data.files.len - 1);
+        const idx = @min(self.fileIndex().*, self.data.files.len - 1);
         if (self.fileMatchesFilter(self.data.files[idx])) return self.data.files[idx];
         if (self.firstMatchingFileIndex()) |first| return self.data.files[first];
         return null;
     }
 
     pub fn treeSelectedRow(self: *const App) ?filetree.Row {
-        return self.files_tree.selectedRow();
+        return self.fileTree().selectedRow();
     }
 
     /// Collect the visible working-tree files covered by the active range
@@ -6614,7 +6643,7 @@ pub const App = struct {
     /// when the Files-panel Files tab is in tree view and a directory is under
     /// the cursor (the `/` root has an empty path — everything). Else null.
     fn selectedDiscardDir(self: *const App) ?[]const u8 {
-        if (self.focus != .files or self.files_tab != .files or !self.tree_view) return null;
+        if (!self.focus.isFilePanel() or self.fileTab() != .files or !self.tree_view) return null;
         const row = self.treeSelectedRow() orelse return null;
         if (!row.is_dir) return null;
         return row.path;
@@ -6636,26 +6665,35 @@ pub const App = struct {
 
     /// Capture the currently-selected tree row's path (owned) so the cursor can
     /// be restored after a rebuild that replaces the underlying file data.
-    fn captureTreePath(self: *App) !?[]u8 {
-        if (!self.tree_view) return null;
-        const row = self.files_tree.selectedRow() orelse return null;
-        return try self.allocator.dupe(u8, row.path);
-    }
-
-    /// Collect the filtered working-tree files as tree entries (path + index).
-    fn fileTreeEntries(self: *App, entries: *std.ArrayList(filetree.Entry)) !void {
-        for (self.data.files, 0..) |file, idx| {
-            if (self.fileMatchesFilter(file)) try entries.append(self.allocator, .{ .path = file.path, .index = idx, .previous_path = file.previous_path });
+    fn captureTreePaths(self: *const App) ![2]?[]u8 {
+        var paths: [2]?[]u8 = .{ null, null };
+        errdefer for (paths) |path| {
+            if (path) |value| self.allocator.free(value);
+        };
+        if (!self.tree_view) return paths;
+        for ([_]*const TreeState{ &self.files_tree, &self.staged_tree }, 0..) |tree, i| {
+            if (tree.selectedRow()) |row| paths[i] = try self.allocator.dupe(u8, row.path);
         }
+        return paths;
     }
 
-    /// Rebuild the Files-panel tree rows from the filtered file list, restoring
-    /// the cursor onto `restore_path` when possible.
-    fn rebuildTree(self: *App, restore_path: ?[]const u8) !void {
+    fn rebuildPanelTree(self: *App, focus: model.Focus, restore_path: ?[]const u8) !void {
         var entries: std.ArrayList(filetree.Entry) = .empty;
         defer entries.deinit(self.allocator);
-        try self.fileTreeEntries(&entries);
-        try self.files_tree.rebuild(self.allocator, entries.items, restore_path);
+        for (self.data.files, 0..) |file, idx| {
+            if (self.fileMatchesPanelFilter(file, focus)) try entries.append(self.allocator, .{ .path = file.path, .index = idx, .previous_path = file.previous_path });
+        }
+        const tree = if (focus == .staged) &self.staged_tree else &self.files_tree;
+        try tree.rebuild(self.allocator, entries.items, restore_path);
+    }
+
+    fn rebuildFileTrees(self: *App, paths: [2]?[]const u8) !void {
+        try self.rebuildPanelTree(.files, paths[0]);
+        try self.rebuildPanelTree(.staged, paths[1]);
+    }
+
+    fn rebuildTree(self: *App, restore_path: ?[]const u8) !void {
+        try self.rebuildPanelTree(if (self.contentFocus() == .staged) .staged else .files, restore_path);
     }
 
     fn toggleTreeView(self: *App) !void {
@@ -6668,6 +6706,9 @@ pub const App = struct {
             if (self.files_tree.selectedRow()) |row| {
                 if (!row.is_dir) self.file_index = row.file_index;
             }
+            if (self.staged_tree.selectedRow()) |row| {
+                if (!row.is_dir) self.staged_index = row.file_index;
+            }
             if (self.commit_tree.selectedRow()) |row| {
                 if (!row.is_dir) self.commit_file_index = row.file_index;
             }
@@ -6675,6 +6716,7 @@ pub const App = struct {
                 if (!row.is_dir) self.branch_file_index = row.file_index;
             }
             self.files_tree.clear(self.allocator);
+            self.staged_tree.clear(self.allocator);
             self.commit_tree.clear(self.allocator);
             self.branch_tree.clear(self.allocator);
             try self.setMessage("file list", .{});
@@ -6685,13 +6727,13 @@ pub const App = struct {
 
     /// (Re)build the tree rows for every file list currently shown in tree mode,
     /// each cursor restored onto whatever it pointed at before.
-    fn rebuildActiveTrees(self: *App) !void {
+    pub fn rebuildActiveTrees(self: *App) !void {
         if (!self.tree_view) return;
-        {
-            const path = if (self.selectedFile()) |file| try self.allocator.dupe(u8, file.path) else null;
-            defer if (path) |p| self.allocator.free(p);
-            try self.rebuildTree(path);
-        }
+        const paths = try self.captureTreePaths();
+        defer for (paths) |path| {
+            if (path) |value| self.allocator.free(value);
+        };
+        try self.rebuildFileTrees(paths);
         if (self.commit_files_active) try self.rebuildCommitFilesTree(null);
         if (self.branch_files_active) try self.rebuildBranchFilesTree(null);
     }
@@ -6730,11 +6772,11 @@ pub const App = struct {
 
     /// Toggle the collapsed state of the directory under the Files-panel cursor.
     fn toggleTreeCollapse(self: *App) !void {
-        const row = self.files_tree.selectedRow() orelse return;
+        const row = self.fileTree().selectedRow() orelse return;
         if (!row.is_dir) return;
         const path = try self.allocator.dupe(u8, row.path);
         defer self.allocator.free(path);
-        _ = try self.files_tree.toggleCollapse();
+        _ = try self.fileTree().toggleCollapse();
         try self.rebuildTree(path);
         try self.updatePreview();
     }
@@ -6748,7 +6790,7 @@ pub const App = struct {
             if (!self.fileMatchesFilter(file)) continue;
             if (!filetree.underDir(file.path, dir)) continue;
             if (file.conflict) continue; // resolve conflicts individually
-            if (file.has_unstaged) any_unstaged = true;
+            if (file.has_unstaged and self.contentFocus() != .staged) any_unstaged = true;
             if (file.has_staged) any_staged = true;
         }
         if (!any_unstaged and !any_staged) {
@@ -6776,7 +6818,7 @@ pub const App = struct {
     }
 
     pub fn fileDisplayFilterActive(self: *const App) bool {
-        return self.file_display_filter != .all;
+        return self.file_display_filter != .unstaged;
     }
 
     pub fn anyFileFilterActive(self: *const App) bool {
@@ -6814,47 +6856,16 @@ pub const App = struct {
         return n;
     }
 
-    fn isRememberedConflict(self: *const App, path: []const u8) bool {
-        for (self.conflict_remembered.items) |p| {
-            if (std.mem.eql(u8, p, path)) return true;
-        }
-        return false;
-    }
-
-    fn rememberConflict(self: *App, path: []const u8) void {
-        if (self.isRememberedConflict(path)) return;
-        const dup = self.allocator.dupe(u8, path) catch return;
-        self.conflict_remembered.append(self.allocator, dup) catch self.allocator.free(dup);
-    }
-
-    fn clearRememberedConflicts(self: *App) void {
-        for (self.conflict_remembered.items) |p| self.allocator.free(p);
-        self.conflict_remembered.clearRetainingCapacity();
-    }
-
-    /// After a working-tree reload, when
-    /// conflicts newly appear, take over the Files panel with the `.conflicted`
-    /// filter (only from the default `.all`, never overriding a filter the user
-    /// picked). When the last conflict clears, revert to `.all`. While filtered
-    /// to conflicts, remember the conflicting paths so a resolved file stays
-    /// visible for review until the whole operation is done. `prev_conflicts` is
-    /// the conflict count captured before the reload replaced the file list.
+    /// Show conflicts automatically until the last one is resolved.
     fn applyConflictAutoFilter(self: *App, prev_conflicts: usize) void {
         const now = self.conflictFileCount();
         var changed = false;
-        if (now > 0 and prev_conflicts == 0 and self.file_display_filter == .all) {
+        if (now > 0 and prev_conflicts == 0 and self.file_display_filter == .unstaged) {
             self.file_display_filter = .conflicted;
-            self.clearRememberedConflicts();
             changed = true;
         } else if (now == 0 and self.file_display_filter == .conflicted) {
-            self.file_display_filter = .all;
-            self.clearRememberedConflicts();
+            self.file_display_filter = .unstaged;
             changed = true;
-        }
-        if (self.file_display_filter == .conflicted) {
-            for (self.data.files) |f| {
-                if (f.conflict) self.rememberConflict(f.path);
-            }
         }
         if (changed) {
             self.normalizeFileSelectionForFilter();
@@ -6863,14 +6874,12 @@ pub const App = struct {
     }
 
     pub fn fileMatchesFilter(self: *const App, file: model.FileStatus) bool {
-        // The `.conflicted` filter also keeps files whose conflict was just
-        // resolved (remembered while the filter is active), so their resolved
-        // diff stays visible until the merge/rebase finishes.
-        const status_ok = if (self.file_display_filter == .conflicted)
-            file.conflict or self.isRememberedConflict(file.path)
-        else
-            self.file_display_filter.matches(file);
-        if (!status_ok) return false;
+        return self.fileMatchesPanelFilter(file, self.contentFocus());
+    }
+
+    pub fn fileMatchesPanelFilter(self: *const App, file: model.FileStatus, focus: model.Focus) bool {
+        if (focus == .staged) return file.has_staged and !file.conflict;
+        if (!self.file_display_filter.matches(file)) return false;
         if (self.file_filter.len == 0) return true;
         if (textmatch.pathMatchesFilter(file.path, self.file_filter)) return true;
         if (file.previous_path) |previous| {
@@ -6880,19 +6889,27 @@ pub const App = struct {
     }
 
     pub fn visibleFileCount(self: *const App) usize {
+        return self.panelFileCount(self.contentFocus());
+    }
+
+    fn panelFileCount(self: *const App, focus: model.Focus) usize {
         var count: usize = 0;
         for (self.data.files) |file| {
-            if (self.fileMatchesFilter(file)) count += 1;
+            if (self.fileMatchesPanelFilter(file, focus)) count += 1;
         }
         return count;
     }
 
     pub fn selectedFileVisibleOrdinal(self: *const App) usize {
+        return self.panelFileOrdinal(self.contentFocus());
+    }
+
+    fn panelFileOrdinal(self: *const App, focus: model.Focus) usize {
         if (self.data.files.len == 0) return 0;
         var ordinal: usize = 0;
-        const selected_idx = @min(self.file_index, self.data.files.len - 1);
+        const selected_idx = @min((if (focus == .staged) self.staged_index else self.file_index), self.data.files.len - 1);
         for (self.data.files, 0..) |file, idx| {
-            if (!self.fileMatchesFilter(file)) continue;
+            if (!self.fileMatchesPanelFilter(file, focus)) continue;
             if (idx == selected_idx) return ordinal;
             ordinal += 1;
         }
@@ -7704,6 +7721,8 @@ pub const App = struct {
 
         self.files_tree.deinit(a);
         self.files_tree = .{ .collapsed = std.BufSet.init(a) };
+        self.staged_tree.deinit(a);
+        self.staged_tree = .{ .collapsed = std.BufSet.init(a) };
 
         staging_mod.clearStagePending(self);
         if (self.staging) |*parsed| parsed.deinit(a);
@@ -7747,8 +7766,7 @@ pub const App = struct {
 
         a.free(self.file_filter);
         self.file_filter = a.dupe(u8, "") catch &.{};
-        self.file_display_filter = .all;
-        self.clearRememberedConflicts();
+        self.file_display_filter = .unstaged;
         self.file_filter_buffer.clearRetainingCapacity();
 
         a.free(self.commit_preserved_subject);
@@ -7769,6 +7787,7 @@ pub const App = struct {
         self.clearLockRecovery();
 
         self.file_index = 0;
+        self.staged_index = 0;
         self.branch_index = 0;
         self.remote_index = 0;
         self.tag_index = 0;
@@ -7976,7 +7995,7 @@ pub const App = struct {
         // panel — so you can tab to read the diff, then stage from there. Over
         // anything else it does nothing (the diff is already shown).
         if (self.focus == .main) {
-            if (!self.staging_active and self.main_origin == .files and self.files_tab == .files) {
+            if (!self.staging_active and self.main_origin.isFilePanel() and self.fileTab() == .files) {
                 if (self.tree_view) {
                     if (self.treeSelectedRow()) |row| {
                         if (row.is_dir) return; // a folder's combined diff has nothing to stage
@@ -8017,11 +8036,11 @@ pub const App = struct {
             }
             return patch_mod.openPatchLineView(self);
         }
-        if (self.focus == .files) {
+        if (self.focus.isFilePanel()) {
             // The Worktrees / Submodules tabs aren't a working-tree file list:
             // <enter> switches the whole app into the selected worktree/submodule.
-            if (self.files_tab == .worktrees) return self.enterSelectedWorktree();
-            if (self.files_tab == .submodules) return self.enterSelectedSubmodule();
+            if (self.fileTab() == .worktrees) return self.enterSelectedWorktree();
+            if (self.fileTab() == .submodules) return self.enterSelectedSubmodule();
             // In tree view, <enter> on a directory collapses/expands it.
             if (self.tree_view) {
                 if (self.treeSelectedRow()) |row| {
@@ -8046,7 +8065,7 @@ pub const App = struct {
         };
     }
 
-    /// A panel number key (1-5): focus the panel, or — when it is already the
+    /// A panel number key (1-6): focus the panel, or — when it is already the
     /// focused panel and `switch_tabs_with_panel_keys` is on — advance to its
     /// next tab, so the key walks the tabs the way `]` does. The same key still
     /// jumps to the panel from anywhere else. (Issue #6.)
@@ -8063,12 +8082,12 @@ pub const App = struct {
         switch (self.focus) {
             .files => {
                 self.files_tab = switch (direction) {
-                    .next => switch (self.files_tab) {
+                    .next => switch (self.fileTab()) {
                         .files => .worktrees,
                         .worktrees => .submodules,
                         .submodules => .files,
                     },
-                    .prev => switch (self.files_tab) {
+                    .prev => switch (self.fileTab()) {
                         .files => .submodules,
                         .worktrees => .files,
                         .submodules => .worktrees,
@@ -8370,7 +8389,8 @@ pub const App = struct {
         if (self.focus == .main) return self.leaveMain();
         self.focus = switch (self.focus) {
             .status => .files,
-            .files => .branches,
+            .files => .staged,
+            .staged => .branches,
             .branches => .commits,
             .commits => .stash,
             .stash => .status,
@@ -8385,7 +8405,8 @@ pub const App = struct {
         self.focus = switch (self.focus) {
             .status => .stash,
             .files => .status,
-            .branches => .files,
+            .staged => .files,
+            .branches => .staged,
             .commits => .branches,
             .stash => .commits,
             .main => unreachable,
@@ -8421,7 +8442,7 @@ pub const App = struct {
     fn moveSelection(self: *App, panel: model.Focus, down: bool) void {
         switch (panel) {
             .status, .main => {},
-            .files => switch (self.files_tab) {
+            .files, .staged => switch (self.fileTab()) {
                 .files => if (self.tree_view) self.moveTreeCursor(if (down) 1 else -1) else (if (down) self.moveFileDown() else self.moveFileUp()),
                 .worktrees => self.worktree_index = step(self.worktree_index, down, self.data.worktrees.len),
                 .submodules => self.submodule_index = step(self.submodule_index, down, self.data.submodules.len),
@@ -8644,7 +8665,7 @@ pub const App = struct {
         if (self.staging_active) return self.staging_path.len > 0;
         if (self.reviewCommitFile() != null) return true;
         if (self.diff_base != null) return false;
-        if (self.contentFocus() != .files) return false;
+        if (!self.contentFocus().isFilePanel()) return false;
         const file = self.selectedFile() orelse return false;
         return file.tracked and (file.has_unstaged or file.has_staged);
     }
@@ -8707,7 +8728,7 @@ pub const App = struct {
             return self.git.diffForCommitFile(cf.hash, cf.path, whole_context) catch null;
         }
         if (self.diff_base != null) return null;
-        if (self.contentFocus() != .files) return null;
+        if (!self.contentFocus().isFilePanel()) return null;
         const file = self.selectedFile() orelse return null;
         if (!file.tracked) return null;
         // Mirror the Diff panel's file preview: the side(s) that have changes,
@@ -8773,7 +8794,7 @@ pub const App = struct {
     pub fn reviewDiscardOffered(self: *const App) bool {
         if (self.staging_active) return true;
         if (self.diff_base != null) return false; // diffing mode: a committed ref diff
-        if (self.contentFocus() != .files) return false;
+        if (!self.contentFocus().isFilePanel()) return false;
         const file = self.selectedFile() orelse return false;
         return file.tracked and file.has_unstaged;
     }
@@ -8788,7 +8809,7 @@ pub const App = struct {
         self.clearReviewSelection(); // the diff reloads, so a selection would be stale
         if (!self.staging_active) {
             // A worktree file only (not a commit/ref diff), unstaged, not partial.
-            if (self.contentFocus() != .files) return self.setMessage("discarding works on a working-tree file", .{});
+            if (!self.contentFocus().isFilePanel()) return self.setMessage("discarding works on a working-tree file", .{});
             const file = self.selectedFile() orelse return;
             if (!file.tracked or !file.has_unstaged) return self.setMessage("no unstaged changes to discard here", .{});
             if (file.has_staged) return self.setMessage("file is partially staged; discard from the staging view", .{});
@@ -9348,7 +9369,7 @@ pub const App = struct {
         if (self.staging_active) return true; // staging view + patch line view
         if (self.inCommitFilesView()) return true;
         // The Diff panel showing the selected working-tree file's diff.
-        if (self.focus == .main and self.contentFocus() == .files and self.files_tab == .files and self.selectedFile() != null) return true;
+        if (self.focus == .main and self.contentFocus().isFilePanel() and self.fileTab() == .files and self.selectedFile() != null) return true;
         return false;
     }
 
@@ -9366,7 +9387,7 @@ pub const App = struct {
                             self.commit_files;
                         var i = bnd.lo;
                         while (i <= bnd.hi and i < files.len) : (i += 1) try paths.append(self.allocator, files[i].path);
-                    } else if (self.focus == .files and self.files_tab == .files) {
+                    } else if (self.focus.isFilePanel() and self.fileTab() == .files) {
                         var ranged: std.ArrayList(model.FileStatus) = .empty;
                         defer ranged.deinit(self.allocator);
                         try self.collectRangeFiles(&ranged);
@@ -9389,7 +9410,7 @@ pub const App = struct {
                 try self.setMessage("no file selected", .{});
                 return;
             }
-            if (self.tree_view and self.focus == .files) {
+            if (self.tree_view and self.focus.isFilePanel()) {
                 if (self.treeSelectedRow()) |row| {
                     if (row.is_dir) {
                         try self.setMessage("select a file to edit (not a directory)", .{});
@@ -9517,7 +9538,7 @@ pub const App = struct {
                 break :blk if (self.selectedCommit()) |commit| commit.short_hash else "";
             } else self.selectedBranchRefName() orelse "",
             .stash => if (self.selectedStash()) |entry| entry.selector else "",
-            .status, .files, .main => "",
+            .status, .files, .staged, .main => "",
         };
         if (text.len == 0) {
             try self.setMessage("nothing to copy here", .{});
@@ -11953,9 +11974,7 @@ pub const App = struct {
             return self.setFileDisplayFilter(status_filter_options[self.status_filter_index]);
         }
         // Letter shortcuts for quick filters.
-        if (key.matches('r', .{})) return self.setFileDisplayFilter(.all);
-        if (key.matches('s', .{})) return self.setFileDisplayFilter(.staged);
-        if (key.matches('u', .{})) return self.setFileDisplayFilter(.unstaged);
+        if (key.matches('r', .{})) return self.setFileDisplayFilter(.unstaged);
         if (key.matches('t', .{})) return self.setFileDisplayFilter(.tracked);
         if (key.matches('T', .{})) return self.setFileDisplayFilter(.untracked);
         if (key.matches('c', .{})) return self.setFileDisplayFilter(.conflicted);
@@ -12240,29 +12259,32 @@ pub const App = struct {
 
         switch (self.contentFocus()) {
             .status => return self.setCheapPreview(try self.statusPreview()),
-            .files, .main => {
+            .files, .staged, .main => {
                 // The Files panel's Worktrees / Submodules tabs show an info card
                 // for the selected entry rather than a diff.
-                if (self.files_tab == .worktrees) {
+                if (self.fileTab() == .worktrees) {
                     if (self.selectedWorktree()) |wt|
                         return self.setCheapPreview(try std.fmt.allocPrint(self.allocator, "Worktree{s}\nPath:   {s}\nBranch: {s}\n", .{ if (wt.is_current) " (current)" else "", wt.path, wt.branch }));
                     return self.setCheapPreview(try self.allocator.dupe(u8, "No worktrees.\n"));
                 }
-                if (self.files_tab == .submodules) {
+                if (self.fileTab() == .submodules) {
                     if (self.selectedSubmodule()) |sm|
                         return self.setCheapPreview(try std.fmt.allocPrint(self.allocator, "Submodule ({s})\nPath: {s}\nSHA:  {s}\n\nspace to init/update.\n", .{ sm.stateLabel(), sm.path, sm.sha }));
                     return self.setCheapPreview(try self.allocator.dupe(u8, "No submodules.\n"));
                 }
                 if (self.tree_view) {
-                    if (self.files_tree.selectedRow()) |row| {
+                    if (self.fileTree().selectedRow()) |row| {
                         // A directory (or the root) shows the combined diff of
                         // every file beneath it.
-                        if (row.is_dir) return self.requestGitPreview(.{ .dir = row.path });
+                        if (row.is_dir) return self.requestGitPreview(if (self.contentFocus() == .staged) .{ .staged_dir = row.path } else .{ .dir = row.path });
                     }
                 }
-                if (self.selectedFile()) |file| return self.requestGitPreview(.{ .file = file });
+                if (self.selectedFile()) |file| {
+                    return self.requestGitPreview(if (self.contentFocus() == .staged) .{ .staged_file = file } else .{ .file = file });
+                }
+                if (self.contentFocus() == .staged) return self.setCheapPreview(try self.allocator.dupe(u8, "No staged files.\n"));
                 if (self.anyFileFilterActive() and self.data.files.len > 0) return self.setCheapPreview(try self.allocator.dupe(u8, "No files match the active filter.\n"));
-                return self.setCheapPreview(try self.allocator.dupe(u8, "Working tree clean.\n"));
+                return self.setCheapPreview(try self.allocator.dupe(u8, if (self.file_display_filter == .unstaged) "No unstaged files.\n" else "Working tree clean.\n"));
             },
             .branches => {
                 // Sub-commits drill: show the selected commit's diff, or (one
@@ -12378,14 +12400,16 @@ pub const App = struct {
     fn previewKey(self: *App, gpa: std.mem.Allocator, kind: PreviewKind) ![]u8 {
         const ctx = self.config.diff_context;
         return switch (kind) {
-            .file => |f| std.fmt.allocPrint(gpa, "f:{d}:{c}{c}{c}:{s}", .{
+            .file, .staged_file => |f| std.fmt.allocPrint(gpa, "f:{d}:{c}:{c}{c}{c}:{s}", .{
                 ctx,
+                @as(u8, if (kind == .staged_file) 'S' else if (self.file_display_filter == .unstaged) 'U' else 'A'),
                 @as(u8, if (f.tracked) 'T' else 'u'),
                 @as(u8, if (f.has_staged) 'S' else '_'),
                 @as(u8, if (f.has_unstaged) 'U' else '_'),
                 f.path,
             }),
-            .dir => |p| std.fmt.allocPrint(gpa, "fd:{d}:{s}", .{ ctx, p }),
+            .dir => |p| std.fmt.allocPrint(gpa, "fd:{d}:{c}:{s}", .{ ctx, @as(u8, if (self.file_display_filter == .unstaged) 'U' else 'A'), p }),
+            .staged_dir => |p| std.fmt.allocPrint(gpa, "f:staged-dir:{d}:{s}", .{ ctx, p }),
             .branch => |name| std.fmt.allocPrint(gpa, "b:{s}", .{name}),
             .commit => |hash| std.fmt.allocPrint(gpa, "c:{d}:{s}", .{ ctx, hash }),
             .commit_file => |cf| std.fmt.allocPrint(gpa, "cf:{d}:{s}:{s}", .{ ctx, cf.hash, cf.path }),
@@ -12452,7 +12476,7 @@ pub const App = struct {
         var empty_msg: []const u8 = "No preview available.\n";
 
         switch (kind) {
-            .file => |f| {
+            .file, .staged_file => |f| {
                 empty_msg = "No diff for selected file.\n";
                 if (!f.tracked and !f.has_staged) {
                     // Untracked and not staged: show the whole file via --no-index.
@@ -12462,33 +12486,32 @@ pub const App = struct {
                         .keep_on_error = true,
                     });
                 } else {
-                    // Query both sides regardless of the optimistic staged/unstaged
-                    // flags — after a stage toggle those flags can momentarily run
-                    // ahead of git, so gating on them would query the wrong side and
-                    // show a spurious "No diff". The worker drops whichever side is
-                    // empty, so the panel always reflects real git state.
+                    const staged = kind == .staged_file;
                     try sections.append(page_alloc, .{
-                        .argv = try fileDiffArgv(false, ctx_arg, f.path, f.previous_path),
-                        .label = "Unstaged\n\n",
+                        .argv = try fileDiffArgv(staged, ctx_arg, f.path, f.previous_path),
+                        .label = if (staged) "Staged\n\n" else "Unstaged\n\n",
                     });
+                    if (kind == .file and self.file_display_filter != .unstaged) {
+                        try sections.append(page_alloc, .{
+                            .argv = try fileDiffArgv(true, ctx_arg, f.path, f.previous_path),
+                            .label = "Staged\n\n",
+                        });
+                    }
+                }
+            },
+            .dir, .staged_dir => |p| {
+                empty_msg = if (kind == .staged_dir) "No staged changes under this directory.\n" else if (self.file_display_filter == .unstaged) "No unstaged changes under this directory.\n" else "No changes under this directory.\n";
+                const staged = kind == .staged_dir;
+                try sections.append(page_alloc, .{
+                    .argv = try dirDiffArgv(staged, ctx_arg, p),
+                    .label = if (staged) "Staged\n\n" else "Unstaged\n\n",
+                });
+                if (kind == .dir and self.file_display_filter != .unstaged) {
                     try sections.append(page_alloc, .{
-                        .argv = try fileDiffArgv(true, ctx_arg, f.path, f.previous_path),
+                        .argv = try dirDiffArgv(true, ctx_arg, p),
                         .label = "Staged\n\n",
                     });
                 }
-            },
-            .dir => |p| {
-                empty_msg = if (p.len == 0) "Working tree clean.\n" else "No changes under this directory.\n";
-                // Both sides, like the single-file view; the worker drops an
-                // empty side. The empty path covers the whole working tree.
-                try sections.append(page_alloc, .{
-                    .argv = try dirDiffArgv(false, ctx_arg, p),
-                    .label = "Unstaged\n\n",
-                });
-                try sections.append(page_alloc, .{
-                    .argv = try dirDiffArgv(true, ctx_arg, p),
-                    .label = "Staged\n\n",
-                });
             },
             .branch => |name| {
                 // Show the branch's commit graph in the main view
@@ -13330,8 +13353,20 @@ pub const App = struct {
     }
 
     pub fn clampSelections(self: *App) void {
-        if (self.data.files.len == 0) self.file_index = 0 else self.file_index = @min(self.file_index, self.data.files.len - 1);
+        if (self.data.files.len == 0) self.fileIndex().* = 0 else self.fileIndex().* = @min(self.fileIndex().*, self.data.files.len - 1);
         self.normalizeFileSelectionForFilter();
+        inline for (.{ model.Focus.files, model.Focus.staged }) |focus| {
+            const index = if (focus == .staged) &self.staged_index else &self.file_index;
+            index.* = @min(index.*, self.data.files.len -| 1);
+            if (self.data.files.len > 0 and !self.fileMatchesPanelFilter(self.data.files[index.*], focus)) {
+                for (self.data.files, 0..) |file, i| {
+                    if (self.fileMatchesPanelFilter(file, focus)) {
+                        index.* = i;
+                        break;
+                    }
+                }
+            }
+        }
         const vbc = self.visibleBranchCount();
         if (vbc == 0) self.branch_index = 0 else self.branch_index = @min(self.branch_index, vbc - 1);
         if (self.data.remote_branches.len == 0) self.remote_index = 0 else self.remote_index = @min(self.remote_index, self.data.remote_branches.len - 1);
@@ -13713,7 +13748,7 @@ pub const App = struct {
                 if (std.mem.eql(u8, file.path, sel) and
                     file.short_status[0] == st[0] and file.short_status[1] == st[1])
                 {
-                    self.file_index = idx;
+                    self.fileIndex().* = idx;
                     return;
                 }
             }
@@ -13721,7 +13756,7 @@ pub const App = struct {
         // Exact path match: the common case, and unambiguous when the path is unique.
         for (self.data.files, 0..) |file, idx| {
             if (std.mem.eql(u8, file.path, sel)) {
-                self.file_index = idx;
+                self.fileIndex().* = idx;
                 return;
             }
         }
@@ -13731,12 +13766,12 @@ pub const App = struct {
         for (self.data.files, 0..) |file, idx| {
             const fp = file.previous_path;
             if (fp != null and std.mem.eql(u8, fp.?, sel)) {
-                self.file_index = idx;
+                self.fileIndex().* = idx;
                 return;
             }
             if (prev) |sp| {
                 if (std.mem.eql(u8, file.path, sp) or (fp != null and std.mem.eql(u8, fp.?, sp))) {
-                    self.file_index = idx;
+                    self.fileIndex().* = idx;
                     return;
                 }
             }
@@ -13848,7 +13883,7 @@ pub const App = struct {
         const next_filter = try self.allocator.dupe(u8, filter);
         self.allocator.free(self.file_filter);
         self.file_filter = next_filter;
-        self.file_index = self.firstMatchingFileIndex() orelse 0;
+        self.fileIndex().* = self.firstMatchingFileIndex() orelse 0;
         if (self.tree_view) try self.rebuildTree(null);
         self.resetMainView();
         try self.updatePreview();
@@ -13857,12 +13892,11 @@ pub const App = struct {
     fn setFileDisplayFilter(self: *App, filter: model.FileDisplayFilter) !void {
         self.mode = .normal;
         self.file_display_filter = filter;
-        self.clearRememberedConflicts(); // a filter change resets the remembered set
-        self.file_index = self.firstMatchingFileIndex() orelse 0;
+        self.fileIndex().* = self.firstMatchingFileIndex() orelse 0;
         if (self.tree_view) try self.rebuildTree(null);
         self.resetMainView();
         try self.updatePreview();
-        if (filter == .all) {
+        if (filter == .unstaged) {
             try self.setMessage("file status filter cleared", .{});
         } else {
             try self.setMessage("showing {s} files ({d}/{d})", .{ filter.label(), self.visibleFileCount(), self.data.files.len });
@@ -13870,17 +13904,17 @@ pub const App = struct {
     }
 
     fn moveTreeCursor(self: *App, delta: i8) void {
-        self.files_tree.move(delta);
+        self.fileTree().move(delta);
     }
 
     fn moveFileUp(self: *App) void {
         if (self.data.files.len == 0) return;
         self.normalizeFileSelectionForFilter();
-        var idx = @min(self.file_index, self.data.files.len - 1);
+        var idx = @min(self.fileIndex().*, self.data.files.len - 1);
         while (idx > 0) {
             idx -= 1;
             if (self.fileMatchesFilter(self.data.files[idx])) {
-                self.file_index = idx;
+                self.fileIndex().* = idx;
                 return;
             }
         }
@@ -13889,10 +13923,10 @@ pub const App = struct {
     fn moveFileDown(self: *App) void {
         if (self.data.files.len == 0) return;
         self.normalizeFileSelectionForFilter();
-        var idx = @min(self.file_index, self.data.files.len - 1) + 1;
+        var idx = @min(self.fileIndex().*, self.data.files.len - 1) + 1;
         while (idx < self.data.files.len) : (idx += 1) {
             if (self.fileMatchesFilter(self.data.files[idx])) {
-                self.file_index = idx;
+                self.fileIndex().* = idx;
                 return;
             }
         }
@@ -13900,12 +13934,12 @@ pub const App = struct {
 
     fn normalizeFileSelectionForFilter(self: *App) void {
         if (self.data.files.len == 0) {
-            self.file_index = 0;
+            self.fileIndex().* = 0;
             return;
         }
-        self.file_index = @min(self.file_index, self.data.files.len - 1);
-        if (self.fileMatchesFilter(self.data.files[self.file_index])) return;
-        self.file_index = self.firstMatchingFileIndex() orelse 0;
+        self.fileIndex().* = @min(self.fileIndex().*, self.data.files.len - 1);
+        if (self.fileMatchesFilter(self.data.files[self.fileIndex().*])) return;
+        self.fileIndex().* = self.firstMatchingFileIndex() orelse 0;
     }
 
     fn firstMatchingFileIndex(self: *const App) ?usize {
@@ -13916,6 +13950,7 @@ pub const App = struct {
     }
 
     pub fn visibleUnstagedCount(self: *const App) usize {
+        if (self.contentFocus() == .staged) return 0;
         var count: usize = 0;
         for (self.data.files) |file| {
             if (self.fileMatchesFilter(file) and file.has_unstaged) count += 1;
@@ -16172,16 +16207,25 @@ test "optimistic staging flips file state in the model immediately" {
     const allocator = std.testing.allocator;
     var files = [_]model.FileStatus{
         .{ .path = @constCast("a.zig"), .short_status = .{ ' ', 'M' }, .has_staged = false, .has_unstaged = true, .tracked = true, .added = false, .deleted = false, .conflict = false },
-        .{ .path = @constCast("b.zig"), .short_status = .{ '?', '?' }, .has_staged = false, .has_unstaged = false, .tracked = false, .added = true, .deleted = false, .conflict = false },
+        .{ .path = @constCast("b.zig"), .short_status = .{ '?', '?' }, .has_staged = false, .has_unstaged = true, .tracked = false, .added = true, .deleted = false, .conflict = false },
     };
     var app = try testApp(allocator, &files);
     defer deinitTestApp(&app);
+
+    try std.testing.expectEqual(@as(usize, 2), app.panelFileCount(.files));
+    try std.testing.expectEqual(@as(usize, 0), app.panelFileCount(.staged));
 
     // Stage only a.zig: it becomes staged-modified; b.zig is untouched.
     staging_mod.applyOptimisticStage(&app, true, &[_][]const u8{"a.zig"});
     try std.testing.expectEqual([2]u8{ 'M', ' ' }, app.data.files[0].short_status);
     try std.testing.expect(app.data.files[0].has_staged and !app.data.files[0].has_unstaged);
     try std.testing.expectEqual([2]u8{ '?', '?' }, app.data.files[1].short_status);
+    try std.testing.expectEqual(@as(usize, 1), app.panelFileCount(.files));
+    try std.testing.expectEqual(@as(usize, 1), app.panelFileCount(.staged));
+    app.file_display_filter = .all;
+    try std.testing.expectEqual(@as(usize, 2), app.panelFileCount(.files));
+    try std.testing.expectEqual(@as(usize, 1), app.panelFileCount(.staged));
+    app.file_display_filter = .unstaged;
 
     // Stage all (null = every file) stages the untracked b.zig too; a.zig (now
     // "M ") has no further transition and is left as-is.
@@ -16193,6 +16237,34 @@ test "optimistic staging flips file state in the model immediately" {
     staging_mod.applyOptimisticStage(&app, false, null);
     try std.testing.expectEqual([2]u8{ ' ', 'M' }, app.data.files[0].short_status);
     try std.testing.expectEqual([2]u8{ '?', '?' }, app.data.files[1].short_status);
+    try std.testing.expectEqual(@as(usize, 2), app.panelFileCount(.files));
+    try std.testing.expectEqual(@as(usize, 0), app.panelFileCount(.staged));
+
+    // Partially staged changes appear in both panels, with separate previews.
+    model.setStatusFields(&files[0], .{ 'M', 'M' });
+    try std.testing.expect(app.fileMatchesPanelFilter(files[0], .files));
+    try std.testing.expect(app.fileMatchesPanelFilter(files[0], .staged));
+    const kinds = [_]PreviewKind{ .{ .file = files[0] }, .{ .staged_file = files[0] }, .{ .dir = "" }, .{ .staged_dir = "" } };
+    for (kinds, 0..) |kind, i| {
+        const key = try app.previewKey(page_alloc, kind);
+        const job = try app.buildPreviewJob(kind, key);
+        defer job.deinit(page_alloc);
+        try std.testing.expectEqual(@as(usize, 1), job.sections.len);
+        const staged = i % 2 == 1;
+        var cached = false;
+        for (job.sections[0].argv) |arg| {
+            if (std.mem.eql(u8, arg, "--staged")) cached = true;
+        }
+        try std.testing.expectEqual(staged, cached);
+        try std.testing.expectEqualStrings(if (staged) "Staged\n\n" else "Unstaged\n\n", job.sections[0].label);
+        app.file_display_filter = .all;
+        const all_key = try app.previewKey(page_alloc, kind);
+        const all_job = try app.buildPreviewJob(kind, all_key);
+        defer all_job.deinit(page_alloc);
+        try std.testing.expectEqual(@as(usize, if (staged) 1 else 2), all_job.sections.len);
+        try std.testing.expectEqual(staged, std.mem.eql(u8, key, all_key));
+        app.file_display_filter = .unstaged;
+    }
 }
 
 test "navigating to another item resets the diff scroll so it can't render blank" {
@@ -17036,6 +17108,7 @@ test "mouse wheel scrolls the panel under the cursor without changing focus" {
     app.data.commits = &commits;
 
     app.panel_rects = .{
+        .{ .focus = .staged, .x = 0, .y = 0, .w = 0, .h = 0 },
         .{ .focus = .status, .x = 0, .y = 0, .w = 20, .h = 6 },
         .{ .focus = .files, .x = 0, .y = 6, .w = 20, .h = 5 },
         .{ .focus = .branches, .x = 0, .y = 11, .w = 20, .h = 5 },
@@ -17043,7 +17116,7 @@ test "mouse wheel scrolls the panel under the cursor without changing focus" {
         .{ .focus = .stash, .x = 0, .y = 21, .w = 20, .h = 4 },
         .{ .focus = .main, .x = 20, .y = 0, .w = 40, .h = 25 },
     };
-    app.panel_rect_count = 6;
+    app.panel_rect_count = 7;
     app.focus = .commits;
     app.commit_index = 0;
     app.main_scroll = 0;
@@ -17170,6 +17243,7 @@ test "clicking the diff panel opens staging only when it shows a working-tree fi
     defer deinitTestApp(&app);
 
     app.panel_rects = .{
+        .{ .focus = .staged, .x = 0, .y = 0, .w = 0, .h = 0 },
         .{ .focus = .status, .x = 0, .y = 0, .w = 20, .h = 6 },
         .{ .focus = .files, .x = 0, .y = 6, .w = 20, .h = 5 },
         .{ .focus = .branches, .x = 0, .y = 11, .w = 20, .h = 5 },
@@ -17177,7 +17251,7 @@ test "clicking the diff panel opens staging only when it shows a working-tree fi
         .{ .focus = .stash, .x = 0, .y = 21, .w = 20, .h = 4 },
         .{ .focus = .main, .x = 20, .y = 0, .w = 40, .h = 25 },
     };
-    app.panel_rect_count = 6;
+    app.panel_rect_count = 7;
     app.allocator.free(app.diff);
     app.diff = try app.allocator.dupe(u8, "diff --git a/x b/x\n+y\n");
 
@@ -17694,7 +17768,7 @@ test "footer message (the log line) is mouse-selectable and copies" {
     try std.testing.expectEqualStrings("committed", app.clipboard_request.?);
 }
 
-test "Files cursor does not jump across rename stage/unstage transitions" {
+test "file selection restoration follows rename stage/unstage transitions" {
     const allocator = std.testing.allocator;
     const Case = struct {
         before: []const u8,
@@ -17740,7 +17814,8 @@ test "Files cursor does not jump across rename stage/unstage transitions" {
         var found = false;
         for (app.data.files, 0..) |file, idx| {
             if (std.mem.eql(u8, file.path, c.target)) {
-                app.file_index = idx;
+                app.focus = if (file.has_unstaged) .files else .staged;
+                app.fileIndex().* = idx;
                 found = true;
                 break;
             }
@@ -17759,7 +17834,13 @@ test "Files cursor does not jump across rename stage/unstage transitions" {
         app.applyFileSort();
         app.restoreFileSelection(sel, prev, sel_status);
 
-        try std.testing.expectEqualStrings(c.expect, app.selectedFile().?.path);
+        const restored = app.data.files[app.fileIndex().*];
+        try std.testing.expectEqualStrings(c.expect, restored.path);
+        if (app.fileMatchesFilter(restored)) {
+            try std.testing.expectEqualStrings(c.expect, app.selectedFile().?.path);
+        } else if (app.selectedFile()) |next| {
+            try std.testing.expect(app.fileMatchesFilter(next));
+        }
 
         model.deinitFileStatuses(allocator, app.data.files);
         app.data.files = &.{};
@@ -17773,7 +17854,7 @@ test "restoreFileSelection disambiguates a path that appears twice by status" {
     const dup = "res/drawable/big.xml";
     var files = [_]model.FileStatus{
         .{ .path = @constCast(dup), .short_status = .{ 'D', ' ' }, .has_staged = true, .has_unstaged = false, .tracked = true, .added = false, .deleted = true, .conflict = false },
-        .{ .path = @constCast(dup), .short_status = .{ '?', '?' }, .has_staged = false, .has_unstaged = false, .tracked = false, .added = true, .deleted = false, .conflict = false },
+        .{ .path = @constCast(dup), .short_status = .{ '?', '?' }, .has_staged = false, .has_unstaged = true, .tracked = false, .added = true, .deleted = false, .conflict = false },
     };
     var app = try testApp(allocator, &files);
     defer deinitTestApp(&app);
@@ -17813,7 +17894,7 @@ test "tree view cursor follows a file merged into a rename (no jump to root)" {
     try std.testing.expectEqualStrings("new.zig", tree.selectedRow().?.path);
 }
 
-test "merge conflicts auto-filter the Files panel, remember resolved, then revert" {
+test "merge conflicts auto-filter the Files panel until resolved" {
     const allocator = std.testing.allocator;
     var no_files = [_]model.FileStatus{};
     var app = try testApp(allocator, &no_files);
@@ -17823,7 +17904,7 @@ test "merge conflicts auto-filter the Files panel, remember resolved, then rever
         app.data.files = &.{};
     }
 
-    try std.testing.expectEqual(model.FileDisplayFilter.all, app.file_display_filter);
+    try std.testing.expectEqual(model.FileDisplayFilter.unstaged, app.file_display_filter);
 
     // A conflict appears (a.zig is UU). With no prior conflicts and the default
     // filter, the panel takes over and shows conflicts only.
@@ -17833,23 +17914,23 @@ test "merge conflicts auto-filter the Files panel, remember resolved, then rever
     try std.testing.expectEqual(@as(usize, 1), app.visibleFileCount()); // only a.zig
 
     // a.zig is resolved (now staged) while b.zig becomes conflicted. The filter
-    // stays, and the just-resolved a.zig remains visible for review (remembered).
+    // stays, and the just-resolved a.zig moves to the Staged panel.
     const prev1 = app.conflictFileCount();
     model.deinitFileStatuses(allocator, app.data.files);
     app.data.files = try git_mod.parseStatus(allocator, "M  a.zig\x00UU b.zig\x00M  c.zig\x00");
     app.applyConflictAutoFilter(prev1);
     try std.testing.expectEqual(model.FileDisplayFilter.conflicted, app.file_display_filter);
-    try std.testing.expect(app.isRememberedConflict("a.zig"));
-    try std.testing.expectEqual(@as(usize, 2), app.visibleFileCount()); // a (resolved) + b (conflict)
+    try std.testing.expectEqual(@as(usize, 1), app.visibleFileCount()); // b (conflict)
+    try std.testing.expectEqual(@as(usize, 2), app.panelFileCount(.staged)); // a + c
 
-    // Every conflict resolved: revert to the normal all-files view and forget.
+    // Every conflict resolved: Files is empty; resolved changes are staged.
     const prev2 = app.conflictFileCount();
     model.deinitFileStatuses(allocator, app.data.files);
     app.data.files = try git_mod.parseStatus(allocator, "M  a.zig\x00M  b.zig\x00M  c.zig\x00");
     app.applyConflictAutoFilter(prev2);
-    try std.testing.expectEqual(model.FileDisplayFilter.all, app.file_display_filter);
-    try std.testing.expectEqual(@as(usize, 3), app.visibleFileCount());
-    try std.testing.expect(!app.isRememberedConflict("a.zig"));
+    try std.testing.expectEqual(model.FileDisplayFilter.unstaged, app.file_display_filter);
+    try std.testing.expectEqual(@as(usize, 0), app.visibleFileCount());
+    try std.testing.expectEqual(@as(usize, 3), app.panelFileCount(.staged));
 }
 
 test "merge conflicts do not hijack a filter the user chose" {
@@ -17862,11 +17943,11 @@ test "merge conflicts do not hijack a filter the user chose" {
         app.data.files = &.{};
     }
 
-    // The user explicitly filtered to staged; a conflict must not take over.
-    app.file_display_filter = .staged;
+    // The user explicitly filtered to tracked; a conflict must not take over.
+    app.file_display_filter = .tracked;
     app.data.files = try git_mod.parseStatus(allocator, "UU a.zig\x00M  c.zig\x00");
     app.applyConflictAutoFilter(0);
-    try std.testing.expectEqual(model.FileDisplayFilter.staged, app.file_display_filter);
+    try std.testing.expectEqual(model.FileDisplayFilter.tracked, app.file_display_filter);
 }
 
 test "escape clears active file filter before quitting" {
@@ -19496,6 +19577,7 @@ fn testApp(allocator: std.mem.Allocator, files: []model.FileStatus) !App {
         .file_filter = try allocator.dupe(u8, ""),
         .data = .{ .files = files },
         .files_tree = .{ .collapsed = std.BufSet.init(allocator) },
+        .staged_tree = .{ .collapsed = std.BufSet.init(allocator) },
         .commit_tree = .{ .collapsed = std.BufSet.init(allocator) },
         .branch_tree = .{ .collapsed = std.BufSet.init(allocator) },
     };
@@ -19511,8 +19593,6 @@ fn deinitTestApp(app: *App) void {
     app.allocator.free(app.file_filter);
     app.allocator.free(app.branch_filter);
     app.branch_filter_buffer.deinit(app.allocator);
-    app.clearRememberedConflicts();
-    app.conflict_remembered.deinit(app.allocator);
     app.allocator.free(app.op_command);
     app.allocator.free(app.op_summary);
     app.allocator.free(app.op_output);
@@ -19567,6 +19647,7 @@ fn deinitTestApp(app: *App) void {
     app.allocator.free(app.staging_other_diff);
     app.allocator.free(app.staging_path);
     app.files_tree.deinit(app.allocator);
+    app.staged_tree.deinit(app.allocator);
     app.commit_tree.deinit(app.allocator);
     app.branch_tree.deinit(app.allocator);
     app.preview_cache.deinit(app.allocator);
@@ -19961,6 +20042,22 @@ test "file tree builds rows, selects files, and collapses directories" {
     try std.testing.expectEqual(@as(usize, 2), app.files_tree.cursor);
     app.moveTreeCursor(1); // clamps at the last row
     try std.testing.expectEqual(@as(usize, 2), app.files_tree.cursor);
+    app.files_tree.collapsed.remove("src");
+    try app.rebuildActiveTrees();
+
+    files[1].has_staged = true;
+    files[1].short_status = .{ 'M', 'M' };
+    try app.rebuildActiveTrees();
+    try app.handleKey(.{ .codepoint = '3' });
+    try std.testing.expectEqual(model.Focus.staged, app.focus);
+    try std.testing.expectEqual(@as(usize, 3), app.activeListLen(.staged));
+    app.staged_tree.cursor = 2;
+    try std.testing.expectEqualStrings("src/app.zig", app.selectedFile().?.path);
+    try app.handleKey(.{ .codepoint = ' ' });
+    try std.testing.expect(!files[1].has_staged);
+    try std.testing.expect(files[1].has_unstaged);
+    try std.testing.expectEqual(@as(usize, 1), app.staged_tree.rows.len);
+    try std.testing.expectEqual(@as(usize, 6), app.files_tree.rows.len);
 }
 
 test "commit-files drill tree resolves directory vs file selection" {
@@ -20096,16 +20193,14 @@ test "collectDirFiles scopes a folder discard to files under it" {
     var app = try testApp(allocator, &files);
     defer deinitTestApp(&app);
 
-    // "all": every changed file directly under sub/ — not the conflicted one
-    // (resolved individually), not the sibling "subterranean.txt", not top.txt.
+    // Files excludes staged-only changes, conflicts, and sibling directories.
     var all: std.ArrayList(model.FileStatus) = .empty;
     defer all.deinit(allocator);
     try app.collectDirFiles("sub", false, &all);
-    try std.testing.expectEqual(@as(usize, 2), all.items.len);
+    try std.testing.expectEqual(@as(usize, 1), all.items.len);
     try std.testing.expectEqualStrings("sub/a.txt", all.items[0].path);
-    try std.testing.expectEqualStrings("sub/b.txt", all.items[1].path);
 
-    // "unstaged only": drops sub/b.txt (staged only).
+    // "unstaged only" covers the same Files-panel entries.
     var unstaged: std.ArrayList(model.FileStatus) = .empty;
     defer unstaged.deinit(allocator);
     try app.collectDirFiles("sub", true, &unstaged);
@@ -20116,7 +20211,7 @@ test "collectDirFiles scopes a folder discard to files under it" {
     var root: std.ArrayList(model.FileStatus) = .empty;
     defer root.deinit(allocator);
     try app.collectDirFiles("", false, &root);
-    try std.testing.expectEqual(@as(usize, 4), root.items.len);
+    try std.testing.expectEqual(@as(usize, 3), root.items.len);
 }
 
 test "appendPadded right-pads to width and leaves longer strings intact" {

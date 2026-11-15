@@ -35,8 +35,8 @@ rather than as a line-by-line port.
 - Add file filtering/search. Implemented: lazygit-style live files-panel path
   filtering with `/`, whitespace-separated substring terms, and smart case.
 - Add fuzzy filter mode and filter history.
-- Add staged/unstaged/tracked/untracked file status filters. Implemented:
-  compact lazygit-style status filter menu with `<ctrl+b>` and `s/u/t/T/r`.
+- Add file status filters. Implemented: unstaged/all/tracked/untracked/conflicted menu
+  with `<ctrl+b>` and `t/T/c/r`; staged changes have their own panel.
 - Add file tree grouping.
 - Add patch/hunk/line staging in the diff view.
 

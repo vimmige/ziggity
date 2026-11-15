@@ -187,7 +187,7 @@ The animation itself is in the [README](../README.md).
 
 ### Working tree & staging
 
-- Files panel from `git status --porcelain -z`; stage or unstage a file
+- Files and Staged panels from `git status --porcelain -z`; stage or unstage a file
   (`space`) or everything (`a`).
 - Staging by hunk and line: `enter` opens a staging view to stage or unstage
   single lines (`v` for a range) or whole hunks (`tab` switches the unstaged
@@ -200,7 +200,9 @@ The animation itself is in the [README](../README.md).
   beneath it; in the Files panel `space` stages the whole folder. Set
   `show_file_tree = true` to start in tree mode on every launch.
 - Live fuzzy path filtering (smart case subsequence) with recent filter
-  recall, plus a status filter (staged, unstaged, tracked, untracked).
+  recall, plus a status filter (unstaged, all, tracked, untracked, conflicted).
+  Files defaults to unstaged/untracked changes; `all` also shows staged changes.
+  Staged always shows staged changes.
 - Discard a file, or a whole folder in tree view (`d` on a directory), via a
   menu (all, or unstaged only), or discard everything (`D`, confirmed). Ignore
   or exclude a file (`i`): a menu adds it to the shared, committed `.gitignore`

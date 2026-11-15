@@ -8,7 +8,7 @@ the written reference. Every binding is remappable, see
 
 | Key | Action |
 |---|---|
-| `1`–`5` | Focus Status / Files / Branches / Commits / Stash (press again to cycle that panel's tabs) |
+| `1`–`6` | Focus Status / Files / Staged / Branches / Commits / Stash (press again to cycle that panel's tabs) |
 | `h` `l` / arrows | Move focus between side panels |
 | `j` `k` / arrows | Move selection |
 | `tab` | Focus the Diff panel (and back) |
@@ -55,7 +55,13 @@ the written reference. Every binding is remappable, see
   under the cursor; `space` stages a whole directory (Files) or adds it to
   the custom patch (commit files); the `/` root nests everything and diffs
   all changes when selected
+- Files defaults to unstaged and untracked changes; Staged shows staged changes.
+  Partially staged files appear in both, each previewing its own changes.
+  Choose `all` in the status filter to list all changed files and preview both sides.
+- `3`: focus Staged, a separate list of all staged files. `space` unstages the
+  selection, `a` unstages all, and `enter` opens the staged side of the staging view.
 - `ctrl+b`: files status filter menu
+- `alt+b`: cycle files status filter: unstaged → all → tracked → untracked → conflicted → unstaged
 - `j` / `k` or arrows: move selection · `h` / `l` or arrows: cycle side
   panels
 - `H` / `L`: scroll the focused panel left and right (diff, or a list wider
@@ -83,8 +89,8 @@ the written reference. Every binding is remappable, see
   whole terminal. `esc` is deliberately left out of this, so it keeps its
   single meaning of stepping back out of drilled-in panels and selections. The
   current mode shows as a `[half]`/`[full]` badge in the footer
-- `1`–`5`: focus status / files / branches / commits / stash; pressing the
-  number of the already-focused panel cycles its tabs (so `3` walks
+- `1`–`6`: focus status / files / staged / branches / commits / stash; pressing the
+  number of the already-focused panel cycles its tabs (so `4` walks
   Local/Remotes/Tags), the same way `]` does. Turn this off with
   `switch_tabs_with_panel_keys = false`.
 - `[` / `]`: switch panel tabs (Files/Worktrees/Submodules ·
@@ -96,7 +102,7 @@ the written reference. Every binding is remappable, see
   the line(s) or hunk, `d` discard the line(s) or hunk instead, `[` and `]`
   switch side, `\` split view, `|` side-by-side review of the active side, `c`
   and `A` commit or amend, `esc` back
-- `space`: stage or unstage a file · checkout a branch · apply a stash (by
+- `space`: stage in Files, unstage in Staged · checkout a branch · apply a stash (by
   focus)
 - `e`: open the file under view in your editor (Files, a commit's files, the
   staging or patch view, or a working tree file's diff; see
@@ -151,7 +157,7 @@ the written reference. Every binding is remappable, see
 - `/` (Commits): filter the log · `b` (Commits): bisect menu
 - `ctrl+p`: custom patch menu; `space` in a commit's files adds a file to the
   patch
-- `a`: stage all (or unstage all) · `s` (Files): stash menu
+- `a`: stage all in Files, unstage all in Staged · `s` (Files): stash menu
 - `d` / `D`: discard menu for the file / discard all (confirmed)
 - `c` · `w` (Files): commit · commit `--no-verify`
 - `ctrl+g` (commit dialog): generate (or regenerate) the focused field, subject or
@@ -199,8 +205,8 @@ the written reference. Every binding is remappable, see
 
 The Branches, Files and Commits panels each have tabs (`[` and `]` switch
 them). You can also walk those tabs with the panel's own number key: press it
-once to focus the panel, then press it again to move to the next tab. So `3`
-goes Branches, then Local, Remotes, Tags; `4` goes Commits, then Reflog and
+once to focus the panel, then press it again to move to the next tab. So `4`
+goes Branches, then Local, Remotes, Tags; `5` goes Commits, then Reflog and
 Divergence; `2` walks Files, Worktrees and Submodules. The key still jumps
 straight to the panel from anywhere else, so nothing is lost. It is on by
 default and can be turned off with `switch_tabs_with_panel_keys = false`.
@@ -209,4 +215,4 @@ default and can be turned off with `switch_tabs_with_panel_keys = false`.
   <img src="assets/ziggity-tabs.gif" alt="Pressing a panel number key repeatedly cycles its tabs" width="900">
 </p>
 
-<p align="center"><i>Pressing 3 repeatedly walks Local, Remotes and Tags; 4 walks Commits, Reflog and Divergence.</i></p>
+<p align="center"><i>Pressing 4 repeatedly walks Local, Remotes and Tags; 5 walks Commits, Reflog and Divergence.</i></p>

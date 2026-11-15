@@ -24,8 +24,8 @@ pub fn openStaging(app: *App) !void {
     const path = try app.allocator.dupe(u8, file.path);
     clearStaging(app);
     app.staging_path = path;
-    app.staging_staged_view = false;
-    app.main_origin = .files;
+    app.staging_staged_view = app.contentFocus() == .staged;
+    app.main_origin = app.contentFocus();
     app.focus = .main;
     app.staging_active = true;
     // The layout is fully decided by the config each time a file opens; `\`
@@ -465,7 +465,7 @@ pub fn discardStagingSelection(app: *App) !void {
 pub fn closeStaging(app: *App) !void {
     if (app.staging_patch_mode) return patch_mod.closePatchLineView(app);
     clearStaging(app);
-    app.focus = .files;
+    app.focus = app.main_origin;
     app.resetMainView();
     try app.updatePreview();
 }
@@ -516,7 +516,7 @@ fn toggleRangeStaged(app: *App) !void {
         defer ord += 1;
         if (ord >= b.lo and ord <= b.hi and !file.conflict) {
             try paths.append(app.allocator, file.path);
-            if (file.has_unstaged) any_unstaged = true;
+            if (file.has_unstaged and app.contentFocus() != .staged) any_unstaged = true;
         }
     }
     for (paths.items) |p| try queueStageOp(app, p, any_unstaged);
@@ -548,9 +548,10 @@ pub fn applyOptimisticStage(app: *App, stage: bool, paths: ?[]const []const u8) 
             model.optimisticUnstage(file.short_status);
         if (new_status) |ns| model.setStatusFields(file, ns);
     }
-    // A display filter (e.g. "unstaged only") may now hide a just-staged file;
+    // Staging moves files between panels;
     // keep the selection index in range until the refresh re-anchors by path.
     app.clampSelections();
+    app.rebuildActiveTrees() catch {};
 }
 
 pub fn toggleFileStaged(app: *App) !void {
@@ -559,6 +560,7 @@ pub fn toggleFileStaged(app: *App) !void {
         return;
     };
     if (file.conflict) return app.startConflictResolveMenu();
+    if (app.contentFocus() == .staged and file.has_staged) return queueStageOp(app, file.path, false);
     if (file.has_unstaged) return queueStageOp(app, file.path, true);
     if (file.has_staged) return queueStageOp(app, file.path, false);
     try app.setMessage("file has no staged or unstaged changes", .{});

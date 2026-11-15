@@ -60,6 +60,7 @@ pub const KeyMap = struct {
     stage_all: Binding = .{ .codepoint = 'a' },
     edit_file: Binding = .{ .codepoint = 'e' },
     file_filter: Binding = .{ .codepoint = '/' },
+    staged_panel: Binding = .{ .codepoint = '3' },
     toggle_tree: Binding = .{ .codepoint = '`' },
     staging_split: Binding = .{ .codepoint = '\\' },
     // Open the full-screen side-by-side review of the current diff.
@@ -70,6 +71,7 @@ pub const KeyMap = struct {
     screen_mode_next: Binding = .{ .codepoint = '+' },
     screen_mode_prev: Binding = .{ .codepoint = '_' },
     open_status_filter: Binding = .{ .codepoint = 'b', .ctrl = true },
+    cycle_status_filter: Binding = .{ .codepoint = 'b', .alt = true },
     discard: Binding = .{ .codepoint = 'd' },
     discard_all: Binding = .{ .codepoint = 'D' },
     commit: Binding = .{ .codepoint = 'c' },
@@ -145,9 +147,9 @@ pub const KeyMap = struct {
     stash_create_patch: Binding = .{ .codepoint = 'w' },
     status_panel: Binding = .{ .codepoint = '1' },
     files_panel: Binding = .{ .codepoint = '2' },
-    branches_panel: Binding = .{ .codepoint = '3' },
-    commits_panel: Binding = .{ .codepoint = '4' },
-    stash_panel: Binding = .{ .codepoint = '5' },
+    branches_panel: Binding = .{ .codepoint = '4' },
+    commits_panel: Binding = .{ .codepoint = '5' },
+    stash_panel: Binding = .{ .codepoint = '6' },
     prev_tab: Binding = .{ .codepoint = '[' },
     next_tab: Binding = .{ .codepoint = ']' },
 };
@@ -320,8 +322,8 @@ pub const Config = struct {
     /// toggles it at runtime for the session. When off, long lines truncate and
     /// `H`/`L` pan horizontally.
     wrap_diff: bool = false,
-    /// Pressing a panel's number key (1-5) while that panel is already focused
-    /// cycles to its next tab, so `3` walks Local -> Remotes -> Tags, `4` walks
+    /// Pressing a panel's number key (1-6) while that panel is already focused
+    /// cycles to its next tab, so `4` walks Local -> Remotes -> Tags, `5` walks
     /// Commits -> Reflog -> Divergence, and `2` walks Files -> Worktrees ->
     /// Submodules — the same keys still jump to the panel from elsewhere. Disable
     /// to make a number key only ever focus its panel.

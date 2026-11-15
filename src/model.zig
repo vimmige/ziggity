@@ -159,6 +159,7 @@ pub const RepoState = enum {
 pub const Focus = enum {
     status,
     files,
+    staged,
     branches,
     commits,
     stash,
@@ -168,11 +169,16 @@ pub const Focus = enum {
         return switch (self) {
             .status => "Status",
             .files => "Files",
+            .staged => "Staged",
             .branches => "Branches",
             .commits => "Commits",
             .stash => "Stash",
             .main => "Diff",
         };
+    }
+
+    pub fn isFilePanel(self: Focus) bool {
+        return self == .files or self == .staged;
     }
 
     /// True for the left-column list panels that participate in block
@@ -206,18 +212,16 @@ pub const FileStatus = struct {
 };
 
 pub const FileDisplayFilter = enum {
-    all,
-    staged,
     unstaged,
+    all,
     tracked,
     untracked,
     conflicted,
 
     pub fn label(self: FileDisplayFilter) []const u8 {
         return switch (self) {
-            .all => "all",
-            .staged => "staged",
             .unstaged => "unstaged",
+            .all => "all",
             .tracked => "tracked",
             .untracked => "untracked",
             .conflicted => "conflicted",
@@ -226,9 +230,8 @@ pub const FileDisplayFilter = enum {
 
     pub fn matches(self: FileDisplayFilter, file: FileStatus) bool {
         return switch (self) {
+            .unstaged => file.has_unstaged or file.conflict,
             .all => true,
-            .staged => file.has_staged,
-            .unstaged => file.has_unstaged,
             .tracked => file.tracked or file.has_staged,
             .untracked => !(file.tracked or file.has_staged),
             .conflicted => file.conflict,
@@ -925,7 +928,9 @@ test "file display filter follows status filter semantics" {
     };
 
     try std.testing.expect(FileDisplayFilter.unstaged.matches(unstaged));
-    try std.testing.expect(!FileDisplayFilter.staged.matches(unstaged));
+    try std.testing.expect(FileDisplayFilter.unstaged.matches(untracked));
+    try std.testing.expect(!FileDisplayFilter.unstaged.matches(staged_untracked));
+    try std.testing.expect(FileDisplayFilter.all.matches(staged_untracked));
     try std.testing.expect(FileDisplayFilter.tracked.matches(staged_untracked));
     try std.testing.expect(!FileDisplayFilter.untracked.matches(staged_untracked));
     try std.testing.expect(FileDisplayFilter.untracked.matches(untracked));
