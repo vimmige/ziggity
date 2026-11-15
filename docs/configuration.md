@@ -263,10 +263,11 @@ key.range_select = v
 key.paste_commits = V
 key.select_branch_commits = *
 key.toggle_tree = `
+key.toggle_tree_all = ~
 key.staged_panel = 3
 key.toggle_fullscreen = z
 key.screen_mode_next = +
-key.screen_mode_prev = _
+key.screen_mode_prev = -
 key.conflict_menu = m
 key.command_log = @
 

@@ -60,6 +60,7 @@ pub const KeyMap = struct {
     stage_all: Binding = .{ .codepoint = 'a' },
     edit_file: Binding = .{ .codepoint = 'e' },
     file_filter: Binding = .{ .codepoint = '/' },
+    toggle_tree_all: Binding = .{ .codepoint = '~' },
     staged_panel: Binding = .{ .codepoint = '3' },
     toggle_tree: Binding = .{ .codepoint = '`' },
     staging_split: Binding = .{ .codepoint = '\\' },
@@ -69,7 +70,7 @@ pub const KeyMap = struct {
     // Screen-mode cycle for the focused panel: normal -> half
     // (enlarged) -> full (fills the terminal), and back.
     screen_mode_next: Binding = .{ .codepoint = '+' },
-    screen_mode_prev: Binding = .{ .codepoint = '_' },
+    screen_mode_prev: Binding = .{ .codepoint = '-' },
     open_status_filter: Binding = .{ .codepoint = 'b', .ctrl = true },
     cycle_status_filter: Binding = .{ .codepoint = 'b', .alt = true },
     discard: Binding = .{ .codepoint = 'd' },

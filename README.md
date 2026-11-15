@@ -459,7 +459,7 @@ essentials:
 | `tab` | Focus the Diff panel (and back) |
 | `z` | Maximize the Diff panel to full screen (`z` or `esc` to exit) |
 | `\|` | Open the full-screen side-by-side review of the diff |
-| `+` `_` | Cycle the focused side panel's size: normal, half, full |
+| `+` `-` | Cycle the focused side panel's size: collapsed, single, normal, half, full |
 | `[` `]` | Switch the focused panel's tabs (or staging side) |
 | `enter` / `esc` | Inspect in the main panel / step back |
 | `space` | Stage file · checkout branch · apply stash (by focus) |

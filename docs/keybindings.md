@@ -14,7 +14,8 @@ the written reference. Every binding is remappable, see
 | `tab` | Focus the Diff panel (and back) |
 | `z` | Maximize the Diff panel to full screen (`z` or `esc` to exit) |
 | `\|` | Open the full-screen side-by-side review of the diff |
-| `+` `_` | Cycle the focused side panel's size: normal, half, full |
+| `~` | Collapse folders below root, or expand the whole file tree |
+| `+` `-` | Cycle the focused side panel's size: collapsed, single, normal, half, full |
 | `[` `]` | Switch the focused panel's tabs (or staging side) |
 | `enter` / `esc` | Inspect in the main panel / step back |
 | `space` | Stage file · checkout branch · apply stash (by focus) |
@@ -55,6 +56,9 @@ the written reference. Every binding is remappable, see
   under the cursor; `space` stages a whole directory (Files) or adds it to
   the custom patch (commit files); the `/` root nests everything and diffs
   all changes when selected
+- `~`: collapse folders directly below root, or expand every directory. Root
+  stays open, keeping its files and folders visible. Works in Files,
+  Staged, and commit/branch file lists; enables tree view when needed.
 - Files defaults to unstaged and untracked changes; Staged shows staged changes.
   Partially staged files appear in both, each previewing its own changes.
   Choose `all` in the status filter to list all changed files and preview both sides.
@@ -71,7 +75,7 @@ the written reference. Every binding is remappable, see
   title and footer show the hint)
 - `z`: maximize the Diff panel to full screen; the side panels hide and the
   diff fills the terminal; press `z` again or `esc` to restore the layout. The
-  main panel is a special case handled only by `z`, never by `+`/`_`
+  main panel is a special case handled only by `z`, never by `+`/`-`
 - `|`: open the full-screen side-by-side review of the current diff (old file
   left, new file right, lines aligned, file line numbers down each side, changed
   words emphasized). Inside it `j`/`k` (or `PageUp`/`PageDown`, `Home`/`End`)
@@ -83,12 +87,13 @@ the written reference. Every binding is remappable, see
   boxed hunk), `^w` soft-wraps both columns kept line for line, `H`/`L` pan, and
   `esc` returns. A terminal too narrow for two columns falls back to the unified view (see
   [configuration.md](configuration.md#side-by-side-review-))
-- `+` / `_`: cycle the focused **side** panel's screen mode. `+` grows it
-  (normal to half to full), `_` shrinks it back. In half the focused side panel
-  takes about half the column with the rest still visible; in full it fills the
+- `+` / `-`: cycle the focused **side** panel's screen mode. `+` grows it
+  (collapsed to single to normal to half to full), `-` shrinks it back. Collapsed panels
+  keep only their header; single shows one content row. Other panels share the
+  freed space. In half the focused side panel takes about half the column with the rest still visible; in full it fills the
   whole terminal. `esc` is deliberately left out of this, so it keeps its
   single meaning of stepping back out of drilled-in panels and selections. The
-  current mode shows as a `[half]`/`[full]` badge in the footer
+  current mode shows as a `[collapsed]`, `[single]`, `[half]`, or `[full]` badge in the footer
 - `1`–`6`: focus status / files / staged / branches / commits / stash; pressing the
   number of the already-focused panel cycles its tabs (so `4` walks
   Local/Remotes/Tags), the same way `]` does. Turn this off with

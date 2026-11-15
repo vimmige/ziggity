@@ -1,39 +1,44 @@
 const std = @import("std");
+/// Allocations shared with worker threads (preview, worktree, mutation jobs)
+/// use the page allocator, which is thread-safe and independent of the main gpa
+/// (mirrors the network async path in tui.zig). Job specs and results live here.
+const page_alloc = std.heap.page_allocator;
+
 const vaxis = @import("vaxis");
 
 const actions = @import("actions.zig");
-const branches_mod = @import("branches.zig");
-const stash_mod = @import("stash.zig");
-const commits_mod = @import("commits.zig");
-const commitops_mod = @import("commitops.zig");
-const rebaseplan_mod = @import("rebaseplan.zig");
-const conflicts_mod = @import("conflicts.zig");
-const fixupbase_mod = @import("fixupbase.zig");
-const commitgraph_mod = @import("commitgraph.zig");
-const graphlanes_mod = @import("graphlanes.zig");
 const aiauthor_mod = @import("aiauthor.zig");
+const branches_mod = @import("branches.zig");
+const commitgraph_mod = @import("commitgraph.zig");
+const commitops_mod = @import("commitops.zig");
+const commits_mod = @import("commits.zig");
 const config_mod = @import("config.zig");
-const diffmode_mod = @import("diffmode.zig");
+const conflicts_mod = @import("conflicts.zig");
 const credentials_mod = @import("credentials.zig");
 const diff_mod = @import("diff.zig");
-const sidebyside = @import("sidebyside.zig");
+const diffmode_mod = @import("diffmode.zig");
+const diffwrap = @import("diffwrap.zig");
 const drills_mod = @import("drills.zig");
 const editor_mod = @import("editor.zig");
 const filetree = @import("filetree.zig");
+const fixupbase_mod = @import("fixupbase.zig");
 const git_mod = @import("git.zig");
+const graphlanes_mod = @import("graphlanes.zig");
 const model = @import("model.zig");
 const patch_mod = @import("patch.zig");
 const prstatus = @import("prstatus.zig");
+const rebaseplan_mod = @import("rebaseplan.zig");
 const recentrepos = @import("recentrepos.zig");
-const diffwrap = @import("diffwrap.zig");
+const sidebyside = @import("sidebyside.zig");
 const staging_mod = @import("staging.zig");
+const stash_mod = @import("stash.zig");
 const textmatch = @import("textmatch.zig");
 
-/// Screen mode of the focused SIDE panel: the standard layout, the panel
-/// enlarged (half), or the panel filling the terminal (full). Cycled by `+`/`_`
+/// Size of each side panel, from a collapsed title to fullscreen. Cycled by `+`/`-`
 /// only (`esc` is left out of it). The main panel is a separate special case
 /// (`z`/`esc` fullscreen) and is never affected by this.
-pub const ScreenMode = enum { normal, half, full };
+pub const ScreenMode = enum { collapsed, single, normal, half, full };
+pub const PanelScreenModes = std.EnumArray(model.Focus, ScreenMode);
 
 pub const Mode = enum {
     normal,
@@ -914,11 +919,6 @@ pub const status_filter_options = [_]model.FileDisplayFilter{
     .untracked,
     .conflicted,
 };
-
-/// Allocations shared with worker threads (preview, worktree, mutation jobs)
-/// use the page allocator, which is thread-safe and independent of the main gpa
-/// (mirrors the network async path in tui.zig). Job specs and results live here.
-const page_alloc = std.heap.page_allocator;
 
 /// One `git` invocation contributing a labeled section to a preview. `argv` is
 /// the argument vector after "git" (the worker prepends it). Every string is
@@ -3025,8 +3025,7 @@ test "review wrap toggle keeps the selected hunk header pinned to the top" {
     a.free(app.diff);
     // Three hunks; the middle one has a long line so wrapping changes the row
     // count. Headers sit at diff lines 1, 4 and 7.
-    app.diff = try a.dupe(u8,
-        "diff --git a/x b/x\n" ++
+    app.diff = try a.dupe(u8, "diff --git a/x b/x\n" ++
         "@@ -1,1 +1,1 @@\n-a\n+b\n" ++
         "@@ -20,1 +20,1 @@\n" ++
         "-the quick brown fox jumps over the lazy dog and then keeps on running far away\n" ++
@@ -3068,8 +3067,7 @@ test "review mouse click selects the hunk, including its bottom separator row" {
     defer deinitTestApp(&app);
 
     a.free(app.diff);
-    app.diff = try a.dupe(u8,
-        "diff --git a/x b/x\n" ++
+    app.diff = try a.dupe(u8, "diff --git a/x b/x\n" ++
         "@@ -1,1 +1,1 @@\n-a\n+b\n" ++
         "@@ -10,1 +10,1 @@\n-c\n+d\n");
     app.main_view_width = 120;
@@ -3518,6 +3516,7 @@ pub const App = struct {
     files_tree: TreeState = undefined,
     staged_tree: TreeState = undefined,
     staged_index: usize = 0,
+    panel_modes: PanelScreenModes = .initFill(.normal),
     branch_index: usize = 0,
     /// Set after a successful checkout so the next branches load moves the
     /// Branches selection onto the freshly checked-out (now current) branch.
@@ -3654,7 +3653,7 @@ pub const App = struct {
     diff_sel_dragged: bool = false,
     // Full-screen the Diff/main panel: the side panels hide and the main panel
     // fills the terminal. Its own special case, toggled by `z` and exited by `z`
-    // or `esc` (the `+`/`_` screen-mode cycle never touches the main panel).
+    // or `esc` (the `+`/`-` screen-mode cycle never touches the main panel).
     diff_fullscreen: bool = false,
     // The hunk the side-by-side review's cursor is on (index into the preview's
     // hunks). `J`/`K` move it and it is highlighted. Reset to 0 when the shown
@@ -3685,11 +3684,6 @@ pub const App = struct {
     review_sel_anchor_col: usize = 0,
     review_sel_head_row: usize = 0,
     review_sel_head_col: usize = 0,
-    // Screen mode of the focused SIDE panel (`+`/`_` cycle): `normal`,
-    // `half` (the focused side panel is enlarged), or `full` (it fills the
-    // terminal, others hidden). Only meaningful while a side panel is focused;
-    // `+`/`_` are no-ops on the main panel, and `esc` never touches it.
-    screen_mode: ScreenMode = .normal,
     // Whether a non-empty selection was visible when the current click began —
     // so clicking to deselect just clears it, without also focusing the panel.
     diff_sel_had_span: bool = false,
@@ -5106,6 +5100,24 @@ pub const App = struct {
             return self.toggleTreeView();
         }
 
+        if (self.config.keymap.toggle_tree_all.matches(key) and file_list_shown) {
+            if (!self.tree_view) try self.toggleTreeView();
+            const tree = if (self.focus == .commits) &self.commit_tree else if (self.focus == .branches) &self.branch_tree else self.fileTree();
+            if (tree.collapsed.count() > 0) {
+                tree.collapsed.deinit();
+                tree.collapsed = std.BufSet.init(self.allocator);
+            } else {
+                for (tree.rows) |row| {
+                    if (row.is_dir and row.depth == 1) {
+                        try tree.collapsed.insert(row.path);
+                    }
+                }
+            }
+            try self.rebuildActiveTrees();
+            self.resetMainView();
+            return self.updatePreview();
+        }
+
         // In a commit's / branch's file list, the copy-file key yanks the selected
         // file's path (like the Files panel), overriding the Commits copy menu that
         // `y` maps to there (issue #39).
@@ -5274,7 +5286,7 @@ pub const App = struct {
                     self.diff_fullscreen = false; // esc shrinks the maximised diff back
                     return;
                 }
-                // Note: `esc` intentionally does NOT change the `+`/`_` screen
+                // Note: `esc` intentionally does NOT change the `+`/`-` screen
                 // mode of the side panels — that stays overloaded enough already
                 // (drilling out of panels, clearing filters). Only the main
                 // panel's fullscreen (above) responds to `esc`.
@@ -5987,10 +5999,10 @@ pub const App = struct {
     /// A signature of which list is currently active (focus + tab + drill +
     /// tree), so a range selection can detect when it no longer applies.
     fn activeListKey(self: *const App) u64 {
-        var k: u64 = @intFromEnum(self.focus);
-        k = k * 8 + @intFromEnum(self.files_tab);
-        k = k * 8 + @intFromEnum(self.branches_tab);
-        k = k * 4 + @intFromEnum(self.commits_tab);
+        var k: u64 = @backingInt(self.focus);
+        k = k * 8 + @backingInt(self.files_tab);
+        k = k * 8 + @backingInt(self.branches_tab);
+        k = k * 4 + @backingInt(self.commits_tab);
         k = k * 2 + @intFromBool(self.branch_commits_active);
         k = k * 2 + @intFromBool(self.branchFilesActive());
         k = k * 2 + @intFromBool(self.commitsFilesActive());
@@ -8317,7 +8329,7 @@ pub const App = struct {
     }
 
     /// The main/diff panel fills the terminal (side column hidden). Its own
-    /// special case, driven by `z` (not the `+`/`_` screen-mode cycle).
+    /// special case, driven by `z` (not the `+`/`-` screen-mode cycle).
     pub fn mainFullscreen(self: *const App) bool {
         return self.diff_fullscreen;
     }
@@ -8325,14 +8337,14 @@ pub const App = struct {
     /// A focused side panel fills the terminal (main + the other side panels
     /// hidden): screen mode `full` while a side panel is focused.
     pub fn sidePanelFullscreen(self: *const App) bool {
-        return !self.diff_fullscreen and self.screen_mode == .full and self.focus != .main;
+        return !self.diff_fullscreen and self.panel_modes.get(self.focus) == .full and self.focus != .main;
     }
 
     /// The focused side panel is enlarged (accordion): the config option
     /// `expand_focused_side_panel`, or half screen mode while a side panel is
     /// focused.
     pub fn accordionActive(self: *const App) bool {
-        return self.config.expand_focused_side_panel or (self.screen_mode == .half and self.focus != .main);
+        return self.config.expand_focused_side_panel or (self.panel_modes.get(self.focus) == .half and self.focus != .main);
     }
 
     /// Whether the Status panel should render as a single title bar instead of
@@ -8349,16 +8361,16 @@ pub const App = struct {
         return true;
     }
 
-    /// Whether the `+`/`_` screen mode is actively shaping the layout (a side
-    /// panel is focused and enlarged) — drives the footer badge.
+    /// Whether the `+`/`-` screen mode is actively shaping the layout (a side
+    /// panel is focused with a non-default size) — drives the footer badge.
     pub fn screenModeActive(self: *const App) bool {
-        return self.screen_mode != .normal and self.focus != .main;
+        return self.panel_modes.get(self.focus) != .normal and self.focus != .main;
     }
 
     /// Toggle the Diff/main panel between full-screen (side panels hidden, main
     /// fills the terminal) and the normal layout. Entering it focuses the main
     /// panel so there's something to read/scroll. Its own state, exited by `z`
-    /// or `esc`; the `+`/`_` cycle never touches the main panel.
+    /// or `esc`; the `+`/`-` cycle never touches the main panel.
     fn toggleDiffFullscreen(self: *App) !void {
         if (self.diff_fullscreen) {
             self.diff_fullscreen = false;
@@ -8368,20 +8380,25 @@ pub const App = struct {
         }
     }
 
-    /// Cycle the focused SIDE panel's screen mode (`+`/`_`): forward
-    /// steps normal -> half -> full, backward steps full -> half -> normal,
+    /// Cycle the focused SIDE panel's screen mode (`+`/`-`): forward
+    /// steps collapsed -> single -> normal -> half -> full, backward reverses those steps,
     /// clamped at each end. The main panel is a special case (`z`) and is never
     /// affected, so this is a no-op while the main panel is focused.
     fn cycleScreenMode(self: *App, forward: bool) void {
         if (self.focus == .main) return;
-        self.screen_mode = if (forward) switch (self.screen_mode) {
+        const mode = self.panel_modes.getPtr(self.focus);
+        mode.* = if (forward) switch (mode.*) {
+            .collapsed => .single,
+            .single => .normal,
             .normal => .half,
             .half => .full,
             .full => .full,
-        } else switch (self.screen_mode) {
+        } else switch (mode.*) {
             .full => .half,
             .half => .normal,
-            .normal => .normal,
+            .normal => .single,
+            .single => .collapsed,
+            .collapsed => .collapsed,
         };
     }
 
@@ -10438,19 +10455,19 @@ pub const App = struct {
     }
 
     fn promptDraft(self: *const App, kind: TextPromptKind) []const u8 {
-        return self.prompt_drafts[@intFromEnum(kind)];
+        return self.prompt_drafts[@backingInt(kind)];
     }
 
     fn savePromptDraft(self: *App, kind: TextPromptKind) void {
         const text = std.mem.trim(u8, self.input_buffer.items, " \t\r\n");
         const dup = self.allocator.dupe(u8, text) catch return;
-        self.allocator.free(self.prompt_drafts[@intFromEnum(kind)]);
-        self.prompt_drafts[@intFromEnum(kind)] = dup;
+        self.allocator.free(self.prompt_drafts[@backingInt(kind)]);
+        self.prompt_drafts[@backingInt(kind)] = dup;
     }
 
     fn clearPromptDraft(self: *App, kind: TextPromptKind) void {
-        self.allocator.free(self.prompt_drafts[@intFromEnum(kind)]);
-        self.prompt_drafts[@intFromEnum(kind)] = &.{};
+        self.allocator.free(self.prompt_drafts[@backingInt(kind)]);
+        self.prompt_drafts[@backingInt(kind)] = &.{};
     }
 
     /// True once a username and password/token have been entered this session.
@@ -18796,32 +18813,39 @@ test "screen mode cycles side panels only; main is z's special case (issue #38)"
     defer deinitTestApp(&app);
 
     app.focus = .commits;
-    try std.testing.expectEqual(ScreenMode.normal, app.screen_mode);
+    try std.testing.expectEqual(ScreenMode.normal, app.panel_modes.get(.commits));
     try std.testing.expect(!app.accordionActive());
     try std.testing.expect(!app.screenModeActive());
 
     // `+` steps up; half turns on the accordion, full fills the terminal.
     app.cycleScreenMode(true);
-    try std.testing.expectEqual(ScreenMode.half, app.screen_mode);
+    try std.testing.expectEqual(ScreenMode.half, app.panel_modes.get(.commits));
     try std.testing.expect(app.accordionActive());
     try std.testing.expect(app.screenModeActive());
     app.cycleScreenMode(true);
-    try std.testing.expectEqual(ScreenMode.full, app.screen_mode);
+    try std.testing.expectEqual(ScreenMode.full, app.panel_modes.get(.commits));
     try std.testing.expect(app.sidePanelFullscreen()); // a side panel is focused
     try std.testing.expect(!app.mainFullscreen());
     app.cycleScreenMode(true); // clamps at full
-    try std.testing.expectEqual(ScreenMode.full, app.screen_mode);
+    try std.testing.expectEqual(ScreenMode.full, app.panel_modes.get(.commits));
 
-    // The main panel is a special case: `+`/`_` are no-ops there, and the side
+    app.focus = .files;
+    try std.testing.expectEqual(ScreenMode.normal, app.panel_modes.get(.files));
+    try std.testing.expect(!app.sidePanelFullscreen());
+    app.cycleScreenMode(false);
+    try std.testing.expectEqual(ScreenMode.single, app.panel_modes.get(.files));
+    try std.testing.expectEqual(ScreenMode.full, app.panel_modes.get(.commits));
+
+    // The main panel is a special case: `+`/`-` are no-ops there, and the side
     // screen mode has no effect on the layout while it is focused.
     app.focus = .main;
     try std.testing.expect(!app.sidePanelFullscreen());
     try std.testing.expect(!app.accordionActive());
     try std.testing.expect(!app.screenModeActive());
     app.cycleScreenMode(true);
-    try std.testing.expectEqual(ScreenMode.full, app.screen_mode); // unchanged on main
+    try std.testing.expectEqual(ScreenMode.full, app.panel_modes.get(.commits)); // unchanged on main
     app.cycleScreenMode(false);
-    try std.testing.expectEqual(ScreenMode.full, app.screen_mode); // still unchanged
+    try std.testing.expectEqual(ScreenMode.full, app.panel_modes.get(.commits)); // still unchanged
 
     // `z` drives the main panel's own fullscreen, independent of screen mode.
     try std.testing.expect(!app.mainFullscreen());
@@ -18830,13 +18854,23 @@ test "screen mode cycles side panels only; main is z's special case (issue #38)"
     try app.toggleDiffFullscreen();
     try std.testing.expect(!app.mainFullscreen());
 
-    // Back on a side panel, `_` steps down, clamped at normal.
+    // Back on a side panel, `-` steps down to collapsed.
     app.focus = .commits;
+    try app.handleKey(.{ .codepoint = '-' });
     app.cycleScreenMode(false);
+    try std.testing.expectEqual(ScreenMode.normal, app.panel_modes.get(.commits));
     app.cycleScreenMode(false);
-    try std.testing.expectEqual(ScreenMode.normal, app.screen_mode);
+    try std.testing.expectEqual(ScreenMode.single, app.panel_modes.get(.commits));
     app.cycleScreenMode(false);
-    try std.testing.expectEqual(ScreenMode.normal, app.screen_mode);
+    try std.testing.expect(app.panel_modes.get(.commits) == .collapsed);
+    app.cycleScreenMode(false);
+    try std.testing.expect(app.panel_modes.get(.commits) == .collapsed);
+    try app.handleKey(.{ .codepoint = '+' });
+    try std.testing.expect(app.panel_modes.get(.commits) != .collapsed);
+    try std.testing.expect(app.panel_modes.get(.commits) == .single);
+    app.cycleScreenMode(true);
+    try std.testing.expect(app.panel_modes.get(.commits) != .single);
+    try std.testing.expectEqual(ScreenMode.normal, app.panel_modes.get(.commits));
     try std.testing.expect(!app.accordionActive());
 }
 
@@ -20042,8 +20076,23 @@ test "file tree builds rows, selects files, and collapses directories" {
     try std.testing.expectEqual(@as(usize, 2), app.files_tree.cursor);
     app.moveTreeCursor(1); // clamps at the last row
     try std.testing.expectEqual(@as(usize, 2), app.files_tree.cursor);
-    app.files_tree.collapsed.remove("src");
-    try app.rebuildActiveTrees();
+    try app.handleKey(.{ .codepoint = '~' });
+    try std.testing.expectEqual(@as(usize, 6), app.files_tree.rows.len);
+    try app.handleKey(.{ .codepoint = '~' });
+    try std.testing.expectEqual(@as(usize, 3), app.files_tree.rows.len);
+    try std.testing.expect(!app.files_tree.rows[0].collapsed);
+    try std.testing.expectEqualStrings("README.md", app.files_tree.rows[1].path);
+    try std.testing.expectEqualStrings("src", app.files_tree.rows[2].path);
+    try std.testing.expect(app.files_tree.rows[2].collapsed);
+    try app.handleKey(.{ .codepoint = '~' });
+    try std.testing.expectEqual(@as(usize, 6), app.files_tree.rows.len);
+
+    try app.handleKey(.{ .codepoint = '-' });
+    try std.testing.expect(app.panel_modes.get(.files) == .single);
+    try app.handleKey(.{ .codepoint = '-' });
+    try std.testing.expect(app.panel_modes.get(.files) == .collapsed);
+    try app.handleKey(.{ .codepoint = '+' });
+    try std.testing.expect(app.panel_modes.get(.files) != .collapsed);
 
     files[1].has_staged = true;
     files[1].short_status = .{ 'M', 'M' };

@@ -1,23 +1,38 @@
 const std = @import("std");
+/// A network op run off the UI loop. Allocations use the SMP allocator, which is
+/// thread-safe, so a worker thread and the UI thread can share it with no
+/// cross-thread allocator race.
+///
+/// It must not be the page allocator. The startup fan-out makes a few thousand
+/// tiny allocations (per commit: a hash, an author, a subject, and so on), and
+/// the page allocator rounds each one up to a whole page, 16 KiB on Apple
+/// silicon. On this repository that is 3098 allocations holding about 300 KB of
+/// strings, which the page allocator would inflate to roughly 48 MB of resident
+/// memory for as long as the load is in flight, against the 8 MB the process
+/// uses in total.
+const async_allocator = std.heap.smp_allocator;
+/// The app version, sourced from `build.zig.zon` at build time so it can't drift.
+const app_version = @import("build_options").version;
+
 const vaxis = @import("vaxis");
 
+const aiauthor_mod = @import("aiauthor.zig");
 const app_mod = @import("app.zig");
+const commitgraph_mod = @import("commitgraph.zig");
 const config_mod = @import("config.zig");
-const credentials_mod = @import("credentials.zig");
-const git_mod = @import("git.zig");
-const filetree = @import("filetree.zig");
-const model = @import("model.zig");
-const patch_mod = @import("patch.zig");
 const conflicts_mod = @import("conflicts.zig");
+const credentials_mod = @import("credentials.zig");
 const diffmode_mod = @import("diffmode.zig");
 const donut_mod = @import("donut.zig");
-const rebaseplan_mod = @import("rebaseplan.zig");
-const staging_mod = @import("staging.zig");
-const commitgraph_mod = @import("commitgraph.zig");
+const filetree = @import("filetree.zig");
+const git_mod = @import("git.zig");
 const graphlanes_mod = @import("graphlanes.zig");
-const aiauthor_mod = @import("aiauthor.zig");
-const worddiff = @import("worddiff.zig");
+const model = @import("model.zig");
+const patch_mod = @import("patch.zig");
+const rebaseplan_mod = @import("rebaseplan.zig");
 const sidebyside = @import("sidebyside.zig");
+const staging_mod = @import("staging.zig");
+const worddiff = @import("worddiff.zig");
 
 /// Active theme, set from config at startup and read by `styles()`.
 var ui_theme: config_mod.Theme = .{};
@@ -68,19 +83,6 @@ const Event = union(enum) {
     ai_desc_done,
     pr_gen_done,
 };
-
-/// A network op run off the UI loop. Allocations use the SMP allocator, which is
-/// thread-safe, so a worker thread and the UI thread can share it with no
-/// cross-thread allocator race.
-///
-/// It must not be the page allocator. The startup fan-out makes a few thousand
-/// tiny allocations (per commit: a hash, an author, a subject, and so on), and
-/// the page allocator rounds each one up to a whole page, 16 KiB on Apple
-/// silicon. On this repository that is 3098 allocations holding about 300 KB of
-/// strings, which the page allocator would inflate to roughly 48 MB of resident
-/// memory for as long as the load is in flight, against the 8 MB the process
-/// uses in total.
-const async_allocator = std.heap.smp_allocator;
 
 const AsyncJob = struct {
     io: std.Io,
@@ -1208,7 +1210,8 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                     .grep = if (filters.grep) |g| async_allocator.dupe(u8, g) catch null else null,
                     .author = if (filters.author) |x| async_allocator.dupe(u8, x) catch null else null,
                     .path = if (filters.path) |p| async_allocator.dupe(u8, p) catch null else null,
-                    .branch_sort = app.git.branch_sort, .log_order = app.git.log_order,
+                    .branch_sort = app.git.branch_sort,
+                    .log_order = app.git.log_order,
                     .untracked = app.git.untracked_files,
                     .commit_limit = app.commit_limit,
                     .result = null,
@@ -1501,7 +1504,7 @@ fn sidePanelWidth(total: u16, percent: u8) u16 {
 
 const SidePanelHeights = struct { status: u16, files: u16, staged: u16, branches: u16, commits: u16, stash: u16 };
 
-fn sidePanelHeights(body_h: u16, focused: model.Focus, accordion: bool, expanded_weight: u16, extra_status_rows: u16, collapse_status: bool) SidePanelHeights {
+fn sidePanelHeights(body_h: u16, focused: model.Focus, accordion: bool, expanded_weight: u16, extra_status_rows: u16, collapse_status: bool, modes: app_mod.PanelScreenModes) SidePanelHeights {
     const panels = [_]model.Focus{ .status, .files, .staged, .branches, .commits, .stash };
     var heights: [6]u16 = @splat(0);
     var weights: [6]u16 = @splat(0);
@@ -1512,6 +1515,13 @@ fn sidePanelHeights(body_h: u16, focused: model.Focus, accordion: bool, expanded
         remaining -= height.*;
     }
     for (panels, 0..) |focus, i| {
+        if (modes.get(focus) == .collapsed) continue;
+        if (modes.get(focus) == .single) {
+            const extra = @min(remaining, 2);
+            heights[i] += extra;
+            remaining -= extra;
+            continue;
+        }
         if (focus == .status) {
             if (!collapse_status) {
                 const extra = @min(remaining, 4 + extra_status_rows);
@@ -1602,7 +1612,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
     const body_h = root.height - bottom_h;
     // Screen mode drives the split: `full` on the main panel hides the side
     // column (side_w = 0, main fills); `full` on a side panel hides the main
-    // panel instead (side_w = full width, main_w = 0). `half` just enlarges the
+    // panel instead (side_w = full width, main_w = 0). `large` just enlarges the
     // focused side panel via the accordion.
     const side_w = if (app.mainFullscreen())
         0
@@ -1620,6 +1630,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
         app.config.expanded_side_panel_weight,
         app.statusIndicatorRows() -| 1, // one indicator line fits the base height; the rest add a row each
         app.statusCollapsed(),
+        app.panel_modes,
     );
     // Full mode on a side panel gives that one panel the whole body; the others
     // collapse to nothing (their draw calls are height-guarded below).
@@ -1656,7 +1667,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
         if (status_h > 0) {
             // `fs` (side-panel fullscreen on Status) always wants the full panel,
             // so the collapsed title bar only applies in the normal layout.
-            if (fs == null and app.statusCollapsed())
+            if (fs == null and ((app.statusCollapsed() and app.panel_modes.get(.status) != .single) or app.panel_modes.get(.status) == .collapsed))
                 drawStatusTitleBar(root, 0, y, side_w, app.focus == .status, app)
             else
                 drawStatus(panel(root, 0, y, side_w, status_h, "[1] Status", app.focus == .status, null), app);
@@ -1674,7 +1685,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
                     app.file_filter,
                     if (app.focus == .files and app.fileFilterActive()) "; esc to cancel filter" else "",
                 }) catch app.file_filter;
-            const w = tabbedPanel(root, 0, y, side_w, files_h, 2, &files_tabs, @intFromEnum(app.files_tab), files_suffix, app.focus == .files, listScrollInfo(app, .files));
+            const w = tabbedPanel(root, 0, y, side_w, files_h, 2, &files_tabs, @backingInt(app.files_tab), files_suffix, app.focus == .files, listScrollInfo(app, .files));
             beginListPan(app, .files);
             switch (app.files_tab) {
                 .files => drawFiles(w, app, .files),
@@ -1715,7 +1726,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
                     (if (app.focus == .branches) "(esc to cancel filter)" else "(filtered)")
                 else
                     "";
-                break :blk tabbedPanel(root, 0, y, side_w, branches_h, 4, &branches_tabs, @intFromEnum(app.branches_tab), suffix, app.focus == .branches, listScrollInfo(app, .branches));
+                break :blk tabbedPanel(root, 0, y, side_w, branches_h, 4, &branches_tabs, @backingInt(app.branches_tab), suffix, app.focus == .branches, listScrollInfo(app, .branches));
             };
             beginListPan(app, .branches);
             drawBranches(w, app);
@@ -1741,7 +1752,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
                     (if (app.focus == .commits) "(esc to cancel filter)" else "(filtered)")
                 else
                     "";
-                break :blk tabbedPanel(root, 0, y, side_w, commits_h, 5, &commits_tabs, @intFromEnum(app.commits_tab), suffix, app.focus == .commits, listScrollInfo(app, .commits));
+                break :blk tabbedPanel(root, 0, y, side_w, commits_h, 5, &commits_tabs, @backingInt(app.commits_tab), suffix, app.focus == .commits, listScrollInfo(app, .commits));
             };
             beginListPan(app, .commits);
             drawCommits(w, app);
@@ -2191,6 +2202,7 @@ const help_lines = [_][]const u8{
     "Global",
     "  q, ctrl+c      quit",
     "  R              refresh",
+    "  ~              collapse folders below root / expand whole file tree",
     "  3              focus Staged files",
     "  1-6            jump to a panel; press again to cycle that panel's tabs",
     "  h, left        focus the panel on the left",
@@ -2209,7 +2221,7 @@ const help_lines = [_][]const u8{
     "  enter          inspect the selection in the main panel",
     "  esc            go back or cancel",
     "  z              maximize the Diff panel to full screen (z or esc exits)",
-    "  + / _          cycle the focused side panel's size: normal, half, full",
+    "  + / -          cycle the focused side panel's size: collapsed, single, normal, half, full",
     "  @              command log",
     "  ?              this help",
     "  ctrl+z         undo the last operation (reflog reset)",
@@ -4393,9 +4405,6 @@ fn drawStash(win: vaxis.Window, app: *const app_mod.App) void {
 
 // --- Status-panel "about" splash (banner + repo info + a rotating donut) ---
 
-/// The app version, sourced from `build.zig.zon` at build time so it can't drift.
-const app_version = @import("build_options").version;
-
 /// 5-row block-font glyphs (each 5 columns, `#` = filled) for the banner word.
 fn bannerGlyph(c: u8) [5][]const u8 {
     return switch (c) {
@@ -5282,7 +5291,9 @@ fn drawBottom(win: vaxis.Window, app: *app_mod.App) void {
     // hints draw into a window narrowed to leave room, so they never collide.
     // (The diff-context state is shown in the Diff panel title instead, next to
     // the wrap indicator.)
-    const mode_label: []const u8 = if (!app.screenModeActive()) "" else switch (app.screen_mode) {
+    const mode_label: []const u8 = if (!app.screenModeActive()) "" else switch (app.panel_modes.get(app.focus)) {
+        .collapsed => "[collapsed]",
+        .single => "[single]",
         .normal => "",
         .half => "[half]",
         .full => "[full]",
@@ -5483,10 +5494,10 @@ const FooterCtx = struct {
 /// those keys apply everywhere — except in the Branches list, where `R` renames
 /// rather than refreshes, so that footer uses a suffix without "R refresh".
 fn footerHints(c: FooterCtx) []const u8 {
-    const global = "  +/_ size  @ log  ? help  ^z undo  R refresh  q quit";
-    const global_branches = "  +/_ size  @ log  ? help  ^z undo  q quit";
+    const global = "  +/- size/collapse  @ log  ? help  ^z undo  R refresh  q quit";
+    const global_branches = "  +/- size/collapse  @ log  ? help  ^z undo  q quit";
     // The main panel is the `z` fullscreen special case; `+`/`_` are inert
-    // there, so its footer drops the `+/_ size` hint.
+    // there, so its footer drops the `+/- size` hint.
     const global_main = "  @ log  ? help  ^z undo  R refresh  q quit";
     // Local branches tab, split so the optional `V paste` hint (shown only when
     // commits are copied) can be inserted before the tab switcher.
@@ -5538,7 +5549,7 @@ fn footerHints(c: FooterCtx) []const u8 {
             .tags => "space checkout  n new-tag  d delete  P push  g reset  y copy  w worktree  W diff  [/] tabs" ++ global_branches,
         };
     }
-    if (c.focus == .staged) return "space unstage  a unstage all  c commit  enter hunks  ` tree" ++ global;
+    if (c.focus == .staged) return "space unstage  a unstage all  c commit  enter hunks  ` tree  ~ fold tree" ++ global;
     if (c.focus == .files) {
         return switch (c.files_tab) {
             .files => "space stage  a all  c/w commit/no-verify  A amend  e edit  d discard  i ignore/exclude  y copy  ^f fixup-base  s stash  / filter  ` tree  enter hunks  [/] tabs" ++ global,
@@ -6458,7 +6469,7 @@ test "side panel heights match the weighting" {
 
     // Default (no accordion): status fixed, stash a small fixed size when not
     // focused, files/branches/commits share the rest equally. Fills body_h.
-    const h = sidePanelHeights(body_h, .files, false, 2, 0, false);
+    const h = sidePanelHeights(body_h, .files, false, 2, 0, false, .initFill(.normal));
     try std.testing.expectEqual(@as(u16, 5), h.status);
     try std.testing.expectEqual(@as(u16, 3), h.stash);
     try std.testing.expectEqual(body_h, h.status + h.files + h.staged + h.branches + h.commits + h.stash);
@@ -6466,27 +6477,36 @@ test "side panel heights match the weighting" {
     try std.testing.expect(lists_spread <= 1);
 
     // Stash focused: it joins the weighted group and grows past the fixed 3.
-    const hs = sidePanelHeights(body_h, .stash, false, 2, 0, false);
+    const hs = sidePanelHeights(body_h, .stash, false, 2, 0, false, .initFill(.normal));
     try std.testing.expect(hs.stash > 3);
     try std.testing.expectEqual(body_h, hs.status + hs.files + hs.staged + hs.branches + hs.commits + hs.stash);
 
     // Accordion: the focused list panel is larger than the others.
-    const ha = sidePanelHeights(body_h, .commits, true, 2, 0, false);
+    const ha = sidePanelHeights(body_h, .commits, true, 2, 0, false, .initFill(.normal));
     try std.testing.expect(ha.commits > ha.files);
     try std.testing.expectEqual(body_h, ha.status + ha.files + ha.staged + ha.branches + ha.commits + ha.stash);
 
     // Each stacked filter beyond the first grows the Status panel by a row (so a
     // files+branches+commits filter shows all three lines).
-    try std.testing.expectEqual(@as(u16, 6), sidePanelHeights(body_h, .files, false, 2, 1, false).status);
-    try std.testing.expectEqual(@as(u16, 7), sidePanelHeights(body_h, .files, false, 2, 2, false).status);
+    try std.testing.expectEqual(@as(u16, 6), sidePanelHeights(body_h, .files, false, 2, 1, false, .initFill(.normal)).status);
+    try std.testing.expectEqual(@as(u16, 7), sidePanelHeights(body_h, .files, false, 2, 2, false, .initFill(.normal)).status);
 
     // Collapsed: the Status panel is a single title-bar row whatever the filter
     // count, and the reclaimed rows go to the list panels. Still fills body_h.
-    const hc = sidePanelHeights(body_h, .files, false, 2, 2, true);
+    const hc = sidePanelHeights(body_h, .files, false, 2, 2, true, .initFill(.normal));
     try std.testing.expectEqual(@as(u16, 1), hc.status);
     try std.testing.expectEqual(body_h, hc.status + hc.files + hc.staged + hc.branches + hc.commits + hc.stash);
     try std.testing.expect(hc.files > h.files); // more room than the uncollapsed layout
-
+    const collapsed = sidePanelHeights(body_h, .files, false, 2, 0, false, app_mod.PanelScreenModes.initDefault(.normal, .{ .files = .collapsed, .staged = .collapsed }));
+    try std.testing.expectEqual(@as(u16, 1), collapsed.files);
+    try std.testing.expectEqual(@as(u16, 1), collapsed.staged);
+    try std.testing.expect(collapsed.branches > h.branches);
+    try std.testing.expect(collapsed.commits > h.commits);
+    try std.testing.expectEqual(body_h, collapsed.status + collapsed.files + collapsed.staged + collapsed.branches + collapsed.commits + collapsed.stash);
+    const one_line = sidePanelHeights(body_h, .files, true, 15, 0, false, app_mod.PanelScreenModes.initDefault(.normal, .{ .files = .single, .status = .single }));
+    try std.testing.expectEqual(@as(u16, 3), one_line.files);
+    try std.testing.expectEqual(@as(u16, 3), one_line.status);
+    try std.testing.expectEqual(body_h, one_line.status + one_line.files + one_line.staged + one_line.branches + one_line.commits + one_line.stash);
 }
 
 test "a high accordion weight keeps unfocused panels at the framed minimum" {
@@ -6495,7 +6515,7 @@ test "a high accordion weight keeps unfocused panels at the framed minimum" {
     // A heavy weight makes the focused panel dominate, but every unfocused list
     // panel stays at least 3 rows tall so the renderer always draws its frame
     // and title (no orphaned, border-less content). The column still fills.
-    const h = sidePanelHeights(body_h, .branches, true, 15, 0, false);
+    const h = sidePanelHeights(body_h, .branches, true, 15, 0, false, .initFill(.normal));
     try std.testing.expect(h.files >= 3);
     try std.testing.expect(h.commits >= 3);
     try std.testing.expect(h.branches > h.files); // focused still dominates
@@ -6505,7 +6525,7 @@ test "a high accordion weight keeps unfocused panels at the framed minimum" {
     // On a column too short to frame them all, the floor is skipped rather than
     // forced (there is genuinely no room), and the heights still sum exactly.
     const tiny: u16 = 16; // status 5 + stash 3 leaves 8 for three list panels
-    const ht = sidePanelHeights(tiny, .branches, true, 15, 0, false);
+    const ht = sidePanelHeights(tiny, .branches, true, 15, 0, false, .initFill(.normal));
     try std.testing.expectEqual(tiny, ht.status + ht.files + ht.staged + ht.branches + ht.commits + ht.stash);
 }
 
@@ -6516,7 +6536,7 @@ test "the accordion squashes unfocused panels on a short column" {
 
     // Very short (< 21): unfocused list panels collapse to a title-only 1 row,
     // the focused one takes everything else and clearly dominates.
-    const short = sidePanelHeights(20, .branches, true, 10, 0, false);
+    const short = sidePanelHeights(20, .branches, true, 10, 0, false, .initFill(.normal));
     try std.testing.expectEqual(@as(u16, 1), short.files);
     try std.testing.expectEqual(@as(u16, 1), short.commits);
     try std.testing.expectEqual(@as(u16, 1), short.stash);
@@ -6525,7 +6545,7 @@ test "the accordion squashes unfocused panels on a short column" {
 
     // Moderately short (21..27): unfocused list panels keep a framed 3 rows, the
     // focused one still takes the rest.
-    const med = sidePanelHeights(24, .branches, true, 10, 0, false);
+    const med = sidePanelHeights(24, .branches, true, 10, 0, false, .initFill(.normal));
     try std.testing.expectEqual(@as(u16, 3), med.files);
     try std.testing.expectEqual(@as(u16, 3), med.commits);
     try std.testing.expectEqual(@as(u16, 3), med.stash);
@@ -6534,7 +6554,7 @@ test "the accordion squashes unfocused panels on a short column" {
 
     // The squash applies regardless of the accordion setting, so the focused
     // panel stays usable on a short terminal even without it.
-    const no_acc = sidePanelHeights(20, .branches, false, 2, 0, false);
+    const no_acc = sidePanelHeights(20, .branches, false, 2, 0, false, .initFill(.normal));
     try std.testing.expectEqual(@as(u16, 1), no_acc.files);
     try std.testing.expectEqual(@as(u16, 1), no_acc.commits);
     try std.testing.expect(no_acc.branches >= 8); // focused still usable
