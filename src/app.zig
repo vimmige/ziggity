@@ -198,6 +198,7 @@ pub const TextPromptKind = enum {
     new_tag,
     new_tag_message,
     push_tag,
+    fetch_tags,
     delete_remote_tag,
     add_remote_name,
     add_remote_url,
@@ -235,6 +236,7 @@ pub const TextPromptKind = enum {
             .new_tag => "New tag name",
             .new_tag_message => "Tag message (empty = lightweight)",
             .push_tag => "Push tag to remote",
+            .fetch_tags => "Fetch tags from remote",
             .delete_remote_tag => "Delete tag on remote",
             .add_remote_name => "New remote name",
             .add_remote_url => "New remote URL",
@@ -360,6 +362,7 @@ pub const AsyncOp = enum {
     /// Fetch a single remote: `fetch <remote>`. The remote name is appended by
     /// the worker from `fetch_remote_name` (see `fetchSelectedRemote`).
     fetch_remote,
+    fetch_tags,
     /// Push a tag to a remote: `push <remote> <tag>`. The remote and tag are
     /// appended by the worker from `push_upstream_remote`/`push_upstream_branch`
     /// (see `pushSelectedTag`).
@@ -379,17 +382,17 @@ pub const AsyncOp = enum {
     }
 
     /// A fetch-family op, so `fetch_prune_mode`'s `--prune`/`--no-prune` flag
-    /// applies (appended by the worker). Covers the global and per-remote fetch.
+    /// applies (appended by the worker).
     pub fn isFetch(self: AsyncOp) bool {
         return switch (self) {
-            .fetch, .fetch_remote => true,
+            .fetch, .fetch_remote, .fetch_tags => true,
             else => false,
         };
     }
 
     pub fn label(self: AsyncOp) []const u8 {
         return switch (self) {
-            .fetch, .fetch_remote => "fetch",
+            .fetch, .fetch_remote, .fetch_tags => "fetch",
             .pull, .pull_merge, .pull_rebase, .pull_ff_only => "pull",
             .push, .push_force, .push_force_plain, .push_set_upstream, .push_tag => "push",
             .prune_remote => "prune",
@@ -398,7 +401,7 @@ pub const AsyncOp = enum {
 
     pub fn gerund(self: AsyncOp) []const u8 {
         return switch (self) {
-            .fetch, .fetch_remote => "fetching",
+            .fetch, .fetch_remote, .fetch_tags => "fetching",
             .pull, .pull_merge, .pull_rebase, .pull_ff_only => "pulling",
             .push, .push_set_upstream, .push_tag => "pushing",
             .push_force => "force push with lease",
@@ -419,6 +422,7 @@ pub const AsyncOp = enum {
             .fetch => &.{ "fetch", "--all", "--no-write-fetch-head" },
             // The remote name (and any prune flag) is appended by the worker.
             .fetch_remote => &.{"fetch"},
+            .fetch_tags => &.{ "fetch", "--tags" },
             .pull => &.{ "pull", "--no-edit" },
             // Explicit merge overrides a `pull.rebase = true` config with
             // `--no-rebase`, so the menu's "Merge" always merges.
@@ -5232,12 +5236,13 @@ pub const App = struct {
                 // fall through to the existing branch handlers (drill-aware).
             }
         }
-        // The Tags tab adds reset-to-tag (g) and push-tag (P) on top of the
+        // The Tags tab adds fetch-tags (f), reset-to-tag (g) and push-tag (P) to the
         // shared branch keys (space checkout, n new, d delete-menu, w, W).
         if (self.focus == .branches and self.branches_tab == .tags and !self.branch_commits_active) {
             const km = self.config.keymap;
             if (km.reset.matches(key)) return self.openTagResetMenu(); // g
             if (km.push.matches(key)) return self.pushSelectedTag(); // P
+            if (km.fast_forward.matches(key)) return self.fetchTags(); // f
         }
         // The local Branches tab adds reset-to-branch (g), tag-at-branch (T),
         // move-commits (N), open-PR (G), force-checkout (F), and the sort menu (s)
@@ -7209,6 +7214,19 @@ pub const App = struct {
         if (self.fetch_remote_name) |old| self.allocator.free(old);
         self.fetch_remote_name = try self.allocator.dupe(u8, remote.name);
         return self.requestAsync(.fetch_remote);
+    }
+
+    fn fetchTags(self: *App) !void {
+        if (self.data.remotes.len == 0) {
+            return self.setMessage("no remote configured", .{});
+        }
+        if (self.data.remotes.len > 1) {
+            return self.startTextPrompt(.fetch_tags);
+        }
+        if (self.fetch_remote_name) |old| self.allocator.free(old);
+        self.fetch_remote_name = null;
+        self.fetch_remote_name = try self.allocator.dupe(u8, self.suggestedRemote());
+        return self.requestAsync(.fetch_tags);
     }
 
     /// `n` on a remote branch: create a new local branch from it (named).
@@ -9970,8 +9988,8 @@ pub const App = struct {
                 }
             },
             // The remote-selection prompts prefill with the suggested remote so
-            // a single Enter targets it; the tag name is already stashed.
-            .push_tag, .delete_remote_tag => {
+            // a single Enter targets it.
+            .push_tag, .fetch_tags, .delete_remote_tag => {
                 if (self.branches_tab != .tags) self.branches_tab = .tags;
                 self.focus = .branches;
                 prefill = self.suggestedRemote();
@@ -10793,6 +10811,19 @@ pub const App = struct {
                 self.text_prompt_kind = null;
                 self.input_buffer.clearRetainingCapacity();
                 return self.requestAsync(.push_tag);
+            },
+            .fetch_tags => {
+                if (value.len == 0) {
+                    self.cancelTextPrompt("enter a remote (e.g. origin)");
+                    return;
+                }
+                if (self.fetch_remote_name) |old| self.allocator.free(old);
+                self.fetch_remote_name = null;
+                self.fetch_remote_name = try self.allocator.dupe(u8, value);
+                self.mode = .normal;
+                self.text_prompt_kind = null;
+                self.input_buffer.clearRetainingCapacity();
+                return self.requestAsync(.fetch_tags);
             },
             .delete_remote_tag => {
                 if (value.len == 0) {

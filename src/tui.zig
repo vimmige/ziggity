@@ -123,6 +123,7 @@ fn asyncWorker(job: *AsyncJob) void {
     // A fetch forced on/off by `fetch_prune_mode` appends `--prune`/`--no-prune`
     // (before any remote name, so `git fetch --prune <remote>` stays valid).
     if (job.fetch_prune_arg) |p| argv.append(async_allocator, p) catch return postDone(job);
+    if (job.op == .fetch_tags) argv.append(async_allocator, "--") catch return postDone(job);
     // A first push of an upstream-less branch appends "<remote> <branch>".
     if (job.upstream_remote) |r| argv.append(async_allocator, r) catch return postDone(job);
     if (job.upstream_branch) |b| argv.append(async_allocator, b) catch return postDone(job);
@@ -1061,7 +1062,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                 }
                 // A per-remote fetch or prune carries the remote name (appended
                 // after "fetch" / "remote prune").
-                if (op == .fetch_remote or op == .prune_remote) {
+                if (op == .fetch_remote or op == .fetch_tags or op == .prune_remote) {
                     if (app.fetch_remote_name) |r| async_job.upstream_remote = async_allocator.dupe(u8, r) catch null;
                 }
                 // Fetch ops carry the prune flag forced by `fetch_prune_mode`, if any.
@@ -2399,6 +2400,7 @@ const help_lines = [_][]const u8{
     "  space          checkout the tag (detached HEAD)",
     "  n              new tag (empty message = lightweight, a message =",
     "                 annotated; overwriting prompts to force)",
+    "  f              fetch tags from a remote",
     "  P              push the tag to a remote",
     "  g              reset menu (soft, mixed, hard) onto the tag",
     "  d              delete menu (local, remote, both)",
@@ -5720,7 +5722,7 @@ fn footerHints(c: FooterCtx) []const u8 {
                 "space checkout  n new-local  M merge  r rebase  g reset  u upstream  d delete  y copy  w worktree  W diff  enter commits  esc back" ++ global_branches
             else
                 "enter branches  n add  e edit  d remove  f fetch  [/] tabs" ++ global_branches,
-            .tags => "space checkout  n new-tag  d delete  P push  g reset  y copy  w worktree  W diff  [/] tabs" ++ global_branches,
+            .tags => "space checkout  n new-tag  d delete  f fetch  P push  g reset  y copy  w worktree  W diff  [/] tabs" ++ global_branches,
         };
     }
     if (c.focus == .staged) return "space unstage  a unstage all  c commit  A amend  enter hunks  ` tree  ~ fold tree" ++ global;

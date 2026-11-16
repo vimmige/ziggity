@@ -138,6 +138,7 @@ the written reference. Every binding is remappable, see
   is checked out first (the menu names the target). The footer shows the hint
   only while something is copied
 - `space` (Remotes/Tags): check out the remote branch or tag
+- `f` (Tags): fetch tags from a remote (prompts when multiple remotes exist)
 - `n` / `P` / `g` / `d` (Tags): new tag / push to a remote / reset onto it /
   delete
 - `g` / `t` (Commits): reset menu / revert
