@@ -155,7 +155,7 @@ pub fn resolveContent(allocator: std.mem.Allocator, content: []const u8, c: Conf
 // --- App-facing interactive layer ---
 
 /// `enter` on a conflicted file: read it, parse its conflicts, and open the
-/// resolution view. Falls back with a message if it has no inline markers.
+/// resolution view, or the diff when no inline markers remain.
 pub fn open(app: *App, path: []const u8) !void {
     const content = app.git.readWorkingFile(path) catch {
         try app.setMessage("could not read {s}", .{path});
@@ -169,13 +169,8 @@ pub fn open(app: *App, path: []const u8) !void {
     if (parsed.len == 0) {
         app.allocator.free(content);
         app.allocator.free(parsed);
-        // No conflict markers left: the file was resolved by hand (in an editor
-        // or externally), so stage it to mark it resolved instead of dead-ending.
-        const res = app.git.stagePaths(&.{path}) catch {
-            try app.setMessage("could not stage {s}", .{path});
-            return;
-        };
-        return app.runMutationFiles(res, "marked {s} resolved", .{path});
+        try app.enterMain();
+        return app.setMessage("no conflict markers in {s}; mark resolved explicitly from Files (space)", .{path});
     }
     close(app); // clear any previous session
     app.conflict_path = try app.allocator.dupe(u8, path);

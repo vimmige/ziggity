@@ -278,8 +278,6 @@ pub const Confirmation = enum {
     force_tag,
     /// Offered before a force-checkout, which discards uncommitted changes.
     force_checkout,
-    /// Offered before checking out a commit/branch picked in the graph viewer.
-    checkout_ref,
     delete_remote_branch,
     remove_worktree,
     remove_submodule,
@@ -3987,10 +3985,6 @@ pub const App = struct {
     commit_graph_hscroll: u16 = 0,
     commit_graph_max_width: usize = 0,
     commit_graph_hash_buf: [64]u8 = undefined,
-    // The ref a graph `enter` will check out (a branch name or commit hash),
-    // pending the confirmation; owned.
-    graph_checkout_ref: []u8 = &.{},
-    graph_checkout_is_branch: bool = false,
     // Whether the pending remote-tag delete should also drop the local tag
     // (the "Delete local and remote tag" menu choice).
     tag_delete_also_local: bool = false,
@@ -5108,7 +5102,7 @@ pub const App = struct {
             } else if (self.config.keymap.up.matches(key) or key.matches(vaxis.Key.up, .{})) {
                 self.help_scroll -|= 1;
                 self.clearDialogSelection();
-            } else {
+            } else if (self.isEnterKey(key) or self.isDialogCloseKey(key)) {
                 self.mode = .normal;
                 self.clearDialogSelection();
             }
@@ -5225,7 +5219,6 @@ pub const App = struct {
         if (self.focus == .branches and self.branches_tab == .remotes and !self.branch_commits_active) {
             const km = self.config.keymap;
             if (self.remotesListActive()) {
-                if (km.select.matches(key)) return self.openRemoteDrill(); // space: drill in
                 if (km.new_branch.matches(key)) return self.startTextPrompt(.add_remote_name); // n: add remote
                 if (km.edit_remote.matches(key)) return branches_mod.startEditRemote(self); // e: rename + URL
                 if (km.discard.matches(key) or km.remove_remote.matches(key)) return branches_mod.startRemoveRemote(self); // d/x: remove
@@ -5489,11 +5482,10 @@ pub const App = struct {
                 } else if (self.staging_active) {
                     try staging_mod.applyStagingSelection(self);
                 } else switch (self.focus) {
-                    // Files tab: stage the file. Worktrees: point at opening
-                    // ziggity there. Submodules: init/update it.
+                    // Files tab: stage the file. Submodules: init/update it.
                     .files, .staged => switch (self.fileTab()) {
                         .files => try staging_mod.toggleSelectedFileStaged(self),
-                        .worktrees => try self.enterSelectedWorktree(),
+                        .worktrees => {},
                         .submodules => try self.updateSelectedSubmodule(),
                     },
                     // In the sub-commits drill, space on a file adds it to the
@@ -7480,7 +7472,7 @@ pub const App = struct {
         try self.setMessage("bulk submodule actions", .{});
     }
 
-    /// `space`/`enter` on another worktree: switch the whole app into it. The
+    /// `enter` on another worktree: switch the whole app into it. The
     /// current worktree just says so.
     pub fn enterSelectedWorktree(self: *App) !void {
         const wt = self.selectedWorktree() orelse {
@@ -7679,7 +7671,7 @@ pub const App = struct {
             self.recent_hscroll +|= horizontal_scroll_step;
             return;
         }
-        if (self.isEnterKey(key) or km.select.matches(key)) return self.switchToRecent();
+        if (self.isEnterKey(key)) return self.switchToRecent();
         // `d` removes the highlighted entry from the list (nothing on disk).
         if (key.matches('d', .{})) return self.removeSelectedRecent();
     }
@@ -8084,26 +8076,16 @@ pub const App = struct {
         return self.commit_files_active;
     }
 
-    /// <enter> behaviour per panel: on the Commits tab it drills into the
+    /// <enter> behaviour per panel: on the Commits panel it drills into the
     /// commit's file list; on the Files panel it opens the hunk-staging view;
     /// elsewhere it descends into the main panel to scroll.
     fn descendOrOpenCommitFiles(self: *App) !void {
-        // From the Diff panel (focused via tab): <enter> over a working-tree file
-        // drills into its hunk-staging view, just as it would from the Files
-        // panel — so you can tab to read the diff, then stage from there. Over
-        // anything else it does nothing (the diff is already shown).
-        if (self.focus == .main) {
-            if (!self.staging_active and self.main_origin.isFilePanel() and self.fileTab() == .files) {
-                if (self.tree_view) {
-                    if (self.treeSelectedRow()) |row| {
-                        if (row.is_dir) return; // a folder's combined diff has nothing to stage
-                    }
-                }
-                if (self.selectedFile() != null) return staging_mod.openStaging(self);
-            }
-            return;
+        if (self.staging_active) return;
+        if (self.focus == .main) self.focus = self.main_origin;
+        defer {
+            if (self.focus != .main) self.diff_fullscreen = false;
         }
-        if (self.focus == .commits and self.commits_tab == .commits and !self.commit_files_active) {
+        if (self.focus == .commits and !self.commit_files_active) {
             return drills_mod.openCommitFiles(self);
         }
         // Branches-panel drill: branch -> its commits -> the commit's files ->
@@ -8313,12 +8295,6 @@ pub const App = struct {
                     break :blk std.fmt.bufPrint(buf, "Force checkout {s}? This discards uncommitted changes.", .{b.name}) catch "Force checkout, discarding uncommitted changes?";
                 }
                 break :blk "Force checkout, discarding uncommitted changes?";
-            },
-            .checkout_ref => blk: {
-                if (self.graph_checkout_is_branch) {
-                    break :blk std.fmt.bufPrint(buf, "Check out branch {s}?", .{self.graph_checkout_ref}) catch "Check out the selected branch?";
-                }
-                break :blk std.fmt.bufPrint(buf, "Check out {s}? This detaches HEAD.", .{self.graph_checkout_ref}) catch "Check out the selected commit (detached HEAD)?";
             },
             .delete_remote_branch => blk: {
                 if (self.selectedRemoteBranch()) |branch| {
@@ -11513,7 +11489,7 @@ pub const App = struct {
             if (menu.index + 1 < menu.items.len) menu.index += 1;
             return;
         }
-        if (self.isEnterKey(key) or self.config.keymap.select.matches(key)) {
+        if (self.isEnterKey(key)) {
             const action = menu.items[menu.index].action;
             self.closeMenu();
             try self.runMenuAction(action);
@@ -12073,7 +12049,7 @@ pub const App = struct {
             if (self.status_filter_index + 1 < status_filter_options.len) self.status_filter_index += 1;
             return;
         }
-        if (self.isEnterKey(key) or self.config.keymap.select.matches(key)) {
+        if (self.isEnterKey(key)) {
             return self.setFileDisplayFilter(status_filter_options[self.status_filter_index]);
         }
         // Letter shortcuts for quick filters.
@@ -12187,11 +12163,6 @@ pub const App = struct {
                     return;
                 };
                 return self.runMutationScoped(try self.git.forceCheckout(branch.name), Refresh.checkout, "force-checked out {s}", .{branch.name});
-            },
-            .checkout_ref => {
-                const ref = self.graph_checkout_ref;
-                if (ref.len == 0) return;
-                return self.requestMutation(.{ .checkout = ref }, .{ .gerund = "checking out", .command = "git checkout", .refresh = Refresh.checkout }, "checked out {s}", .{ref});
             },
             .delete_remote_branch => {
                 if (self.rangeActive() and self.remoteDrillActive() and self.contentFocus() == .branches) {
@@ -15027,34 +14998,54 @@ test "graph reset target: only a commit on the current branch's log" {
     try std.testing.expect(commitgraph_mod.cursorCommitIndex(&app) == null);
 }
 
-test "graph enter on an off-branch tip confirms a checkout without freed-memory reads" {
+test "graph enter opens off-branch history without checking out" {
     const allocator = std.testing.allocator;
-    var no_files = [_]model.FileStatus{};
-    var app = try testApp(allocator, &no_files);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [160]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&pbuf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try testGitEnv(&env, dir_path);
+    try testRunSetup(allocator, std.testing.io, &env, dir_path,
+        \\set -e
+        \\git init -q -b main
+        \\git config user.email t@t
+        \\git config user.name t
+        \\git config commit.gpgsign false
+        \\git commit -qm base --allow-empty
+        \\git checkout -qb branch-B
+        \\git commit -qm offbranch --allow-empty
+        \\git checkout -q main
+    );
+    var app = try testApp(allocator, &.{});
     defer deinitTestApp(&app);
-    defer commitgraph_mod.deinit(&app); // frees graph_checkout_ref (App.deinit does this)
+    app.git = try git_mod.Git.initAt(allocator, std.testing.io, &env, dir_path);
+    defer app.git.deinit();
+    defer commitgraph_mod.deinit(&app);
+    defer drills_mod.deactivateBranchCommits(&app);
+    defer allocator.free(app.branch_commits_ref);
+    const hash = app.git.revParse("branch-B").?;
+    defer allocator.free(hash);
+    const head_before = try app.git.headHash();
+    defer allocator.free(head_before);
 
-    // No current-branch commits match the selected row, so it is "off-branch".
-    app.data.commits = &.{};
-
-    // A single decorated row tipping local branch `branch-B`. Both buffers are
-    // heap-allocated because `jumpToSelected` -> `close` frees them; the prompt
-    // must not read the branch name back out of that freed graph text (issue #27).
-    const row = "* abc1234 (branch-B) do things\n";
-    app.commit_graph = try allocator.dupe(u8, row);
-    app.commit_graph_plain = try allocator.dupe(u8, row);
-    app.commit_graph_sel = 0;
+    app.commit_graph = try std.fmt.allocPrint(allocator, "* {s} (branch-B) offbranch\n", .{hash});
+    app.commit_graph_plain = try allocator.dupe(u8, app.commit_graph.?);
     app.mode = .commit_graph;
-
     try commitgraph_mod.jumpToSelected(&app);
 
-    // The viewer tore down and a checkout confirmation is up for the right ref.
     try std.testing.expect(app.commit_graph == null);
     try std.testing.expect(app.commit_graph_plain == null);
-    try std.testing.expectEqual(Mode.confirmation, app.mode);
-    try std.testing.expect(app.graph_checkout_is_branch);
-    try std.testing.expectEqualStrings("branch-B", app.graph_checkout_ref);
-    try std.testing.expectEqualStrings("check out branch branch-B?", app.message);
+    try std.testing.expectEqual(Mode.normal, app.mode);
+    try std.testing.expectEqual(model.Focus.branches, app.focus);
+    try std.testing.expect(app.branch_commits_active);
+    try std.testing.expectEqualStrings(hash, app.selectedCommit().?.hash);
+    try std.testing.expect(app.pending_confirmation == null);
+    try std.testing.expect(app.mutation_requested == null);
+    const head_after = try app.git.headHash();
+    defer allocator.free(head_after);
+    try std.testing.expectEqualStrings(head_before, head_after);
 }
 
 test "drop and squash gate a confirmation before rewriting history" {

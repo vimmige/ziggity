@@ -461,7 +461,7 @@ essentials:
 | `\|` | Open the full-screen side-by-side review of the diff |
 | `+` `-` | Cycle the focused side panel's size: collapsed, single, normal, half, full |
 | `[` `]` | Switch the focused panel's tabs (or staging side) |
-| `enter` / `esc` | Inspect in the main panel / step back |
+| `enter` / `esc` | Open selection / step back |
 | `space` | Stage file · checkout branch · apply stash (by focus) |
 | `c` · `a` · `d` · `D` | Commit · stage all · discard menu · discard all |
 | `v` · `shift+arrows` · `*` | Start range · extend range · select branch commits |

@@ -17,7 +17,7 @@ the written reference. Every binding is remappable, see
 | `~` | Collapse folders below root, or expand the whole file tree |
 | `+` `-` | Cycle the focused side panel's size: collapsed, single, normal, half, full |
 | `[` `]` | Switch the focused panel's tabs (or staging side) |
-| `enter` / `esc` | Inspect in the main panel / step back |
+| `enter` / `esc` | Open selection / step back |
 | `space` | Stage file · checkout branch · apply stash (by focus) |
 | `c` · `a` · `d` · `D` | Commit · stage all · discard menu · discard all |
 | `v` · `shift+arrows` · `*` | Start range · extend range · select branch commits |
@@ -71,8 +71,8 @@ the written reference. Every binding is remappable, see
 - `H` / `L`: scroll the focused panel left and right (diff, or a list wider
   than the panel)
 - `tab`: focus the Diff panel from any side panel (press again to return).
-  Over a working tree file, `enter` there opens its staging view (the panel
-  title and footer show the hint)
+  `enter` there opens the same files or view as in the originating panel,
+  including the conflict resolver for conflicted files.
 - `z`: maximize the Diff panel to full screen; the side panels hide and the
   diff fills the terminal; press `z` again or `esc` to restore the layout. The
   main panel is a special case handled only by `z`, never by `+`/`-`
@@ -100,8 +100,9 @@ the written reference. Every binding is remappable, see
   `switch_tabs_with_panel_keys = false`.
 - `[` / `]`: switch panel tabs (Files/Worktrees/Submodules ·
   Local/Remotes/Tags · Commits/Reflog) or the staging side
-- `enter`: inspect in the main panel; on a commit, drill into its changed
-  files; on a file, open the staging view
+- `enter`: open the selection; on a commit (Commits, Reflog or Divergence),
+  drill into its changed files; on a working-tree file, open the staging view.
+  On a remote, open its branches; on a worktree, switch into it
 - `enter` on a file opens the staging view: `j` and `k` by line, `J` and `K`
   (or shift+arrows) jump to the next/previous hunk, `v` range, `space` stage
   the line(s) or hunk, `d` discard the line(s) or hunk instead, `[` and `]`
@@ -151,10 +152,12 @@ the written reference. Every binding is remappable, see
   menu: plain paste onto HEAD, paste and edit the message (folds the copied
   commits into one new commit you reword), or paste without committing
   (`--no-commit`)
-- `i` (Commits): interactive rebase plan editor
+- `i` (Commits): interactive rebase plan editor; `tab` inspects the selected
+  commit, `enter` runs the plan, `esc` cancels
 - `ctrl+l` (Commits): commit graph viewer (`j` and `k` move, `@` HEAD, `p`
   first parent, `H` and `L` pan, `a` toggle all branches, `y` copy,
-  `enter` jump, `esc` close; mouse scroll, drag and click)
+  `enter` jumps to a loaded commit or opens its history, `esc` closes;
+  mouse scroll, drag and click)
 - `G` (Commits): open the current branch's pull/merge request if it has one,
   otherwise the create page (GitHub, GitLab, Codeberg, Bitbucket) · `B`: mark a
   `rebase --onto` base
@@ -190,7 +193,8 @@ the written reference. Every binding is remappable, see
   conflict is resolved and staged
 - Conflicted files (Files panel): `enter` opens the per-conflict resolver (`o` /
   `t` take ours / theirs, `b` / `B` keep both with ours or theirs first, `u`
-  undo). `space` opens a menu with every
+  undo). If no markers remain, `enter` opens the diff without staging.
+  `space` opens a menu with every
   way to resolve the file: resolve conflicts one by one (the same per-conflict
   resolver), take ours / theirs for the whole file, **edit in your editor**
   (ziggity re-reads the file when the editor closes and stages it automatically

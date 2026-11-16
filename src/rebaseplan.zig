@@ -91,7 +91,7 @@ pub fn start(app: *App) !void {
     app.mode = .rebase_plan;
     app.resetMainView();
     try app.updatePreview();
-    try app.setMessage("interactive rebase: p/d/s/f/e mark, v/shift+arrows select, ^j/^k move, enter run, esc cancel", .{});
+    try app.setMessage("interactive rebase: p/d/s/f/e mark, v/shift+arrows select, ^j/^k move, tab inspect, enter run, esc cancel", .{});
 }
 
 /// The inclusive [lo, hi] plan rows the action/move applies to: the multi-commit

@@ -2261,7 +2261,7 @@ const help_lines = [_][]const u8{
     "                 H/L pan, esc back)",
     "  [              previous tab (or staging side)",
     "  ]              next tab (or staging side)",
-    "  enter          inspect the selection in the main panel",
+    "  enter          open the selection (files, hunks or patch lines)",
     "  esc            go back or cancel",
     "  z              maximize the Diff panel to full screen (z or esc exits)",
     "  + / -          cycle the focused side panel's size: collapsed, single, normal, half, full",
@@ -2324,7 +2324,7 @@ const help_lines = [_][]const u8{
     "                 stages the file automatically once the markers are gone",
     "",
     "Worktrees tab",
-    "  space, enter   switch into the worktree",
+    "  enter          switch into the worktree",
     "  n              new worktree",
     "  o              open it in your editor",
     "  d              remove the worktree",
@@ -2378,7 +2378,7 @@ const help_lines = [_][]const u8{
     "  s              branch sort menu",
     "",
     "Remotes tab — the remotes list",
-    "  enter, space   view the remote's branches",
+    "  enter          view the remote's branches",
     "  n              add a remote",
     "  e              edit it (rename and URL)",
     "  d              remove the remote",
@@ -2448,7 +2448,7 @@ const help_lines = [_][]const u8{
     "  i              interactive rebase — a plan editor for the commits down",
     "                 to the selected one. p/d/s/f/e mark pick/drop/squash/",
     "                 fixup/edit; v or shift+arrows select a range; ctrl+j and",
-    "                 ctrl+k reorder; enter runs it, esc cancels.",
+    "                 ctrl+k reorder; tab inspects, enter runs it, esc cancels.",
     "                 In a commit's file list: space toggles a whole file into",
     "                 the patch, enter opens the file to pick lines, e opens",
     "                 the editor, d discards the file's changes from the commit.",
@@ -3327,7 +3327,6 @@ fn drawConfirmPopup(root: vaxis.Window, app: *app_mod.App) void {
         .delete_tag => "Delete tag",
         .force_tag => "Overwrite tag",
         .force_checkout => "Force checkout",
-        .checkout_ref => "Checkout",
         .delete_remote_branch => "Delete remote branch",
         .remove_worktree => "Remove worktree",
         .remove_submodule => "Remove submodule",
@@ -5566,8 +5565,10 @@ const footer_contexts = [_]FooterCtx{
     .{ .focus = .stash },
     .{ .focus = .main },
     .{ .focus = .main, .main_file = true },
+    .{ .focus = .main, .main_patch_file = true },
     .{ .focus = .main, .fullscreen = true },
     .{ .focus = .main, .fullscreen = true, .main_file = true },
+    .{ .focus = .main, .fullscreen = true, .main_patch_file = true },
     .{ .staging = true },
     .{ .staging_patch = true },
     .{ .rebase_plan = true },
@@ -5654,6 +5655,7 @@ const FooterCtx = struct {
     conflict: bool = false,
     /// The Diff panel is showing a working-tree file (so `e` can edit it).
     main_file: bool = false,
+    main_patch_file: bool = false,
     /// The Diff/main panel is maximised to full screen.
     fullscreen: bool = false,
     /// Commits are on the cherry-pick clipboard, so `V` can paste them. Shown as
@@ -5717,7 +5719,7 @@ fn footerHints(c: FooterCtx) []const u8 {
             .remotes => if (c.remote_drill)
                 "space checkout  n new-local  M merge  r rebase  g reset  u upstream  d delete  y copy  w worktree  W diff  enter commits  esc back" ++ global_branches
             else
-                "enter/space branches  n add  e edit  d remove  f fetch  [/] tabs" ++ global_branches,
+                "enter branches  n add  e edit  d remove  f fetch  [/] tabs" ++ global_branches,
             .tags => "space checkout  n new-tag  d delete  P push  g reset  y copy  w worktree  W diff  [/] tabs" ++ global_branches,
         };
     }
@@ -5725,7 +5727,7 @@ fn footerHints(c: FooterCtx) []const u8 {
     if (c.focus == .files) {
         return switch (c.files_tab) {
             .files => "space stage  a all  c/w commit/no-verify  A amend  e edit  d discard  i ignore/exclude  y copy  ^f fixup-base  s stash  / filter  ` tree  enter hunks  [/] tabs" ++ global,
-            .worktrees => "space/enter switch  n new  o editor  d remove  [/] tabs" ++ global,
+            .worktrees => "enter switch  n new  o editor  d remove  [/] tabs" ++ global,
             .submodules => "enter enter  space update  n add  e edit-url  d remove  b bulk  [/] tabs" ++ global,
         };
     }
@@ -5734,21 +5736,26 @@ fn footerHints(c: FooterCtx) []const u8 {
         .files, .staged => unreachable,
         .branches => unreachable,
         .commits => if (c.divergence)
-            "\u{2191} ahead / \u{2193} incoming  space checkout  n new-branch  c/V/C copy/paste/clear commit  y copy menu  W diff  [/] tabs" ++ global
+            "\u{2191} ahead / \u{2193} incoming  enter files  space checkout  n new-branch  c/V/C copy/paste/clear commit  y copy menu  W diff  [/] tabs" ++ global
         else if (c.reflog)
-            "space checkout  g reset  n new-branch  c/V/C copy/paste/clear commit  y copy menu  o browser  W diff  [/] tabs" ++ global
+            "enter files  space checkout  g reset  n new-branch  c/V/C copy/paste/clear commit  y copy menu  o browser  W diff  [/] tabs" ++ global
         else
             "enter files  space checkout  n/N branch/move  T tag  g reset  t revert  x verify-sig  c/V/C copy/paste/clear commit  y copy menu  d/s/f/e/r rebase  F fixup  S autosquash  B mark-base  G pr  ^l graph  W diff  / filter  b bisect  ^j/^k move" ++ global,
         .stash => "space apply  g pop  d drop  r rename  w patch  y copy  enter view" ++ global,
-        .main => if (c.fullscreen)
-            (if (c.main_file)
-                "enter stage  j/k scroll  H/L pan  ^w wrap  | side-by-side  e edit  PgUp/PgDn page  drag select  y copy all  z exit full  esc back" ++ global_main
+        .main => if (c.main_patch_file)
+            (if (c.fullscreen)
+                "enter pick lines  j/k scroll  H/L pan  ^w wrap  | side-by-side  PgUp/PgDn page  drag select  y copy all  z exit full  esc back" ++ global_main
             else
-                "j/k scroll  H/L pan  ^w wrap  | side-by-side  PgUp/PgDn page  drag select  y copy all  z exit full  esc back" ++ global_main)
+                "enter pick lines  j/k scroll  H/L pan  ^w wrap  | side-by-side  PgUp/PgDn page  drag select  y copy all  z full  esc back" ++ global_main)
+        else if (c.fullscreen)
+            (if (c.main_file)
+                "enter open  j/k scroll  H/L pan  ^w wrap  | side-by-side  e edit  PgUp/PgDn page  drag select  y copy all  z exit full  esc back" ++ global_main
+            else
+                "enter open  j/k scroll  H/L pan  ^w wrap  | side-by-side  PgUp/PgDn page  drag select  y copy all  z exit full  esc back" ++ global_main)
         else if (c.main_file)
-            "enter stage  j/k scroll  H/L pan  ^w wrap  | side-by-side  e edit  PgUp/PgDn page  drag select  y copy all  z full  esc back" ++ global_main
+            "enter open  j/k scroll  H/L pan  ^w wrap  | side-by-side  e edit  PgUp/PgDn page  drag select  y copy all  z full  esc back" ++ global_main
         else
-            "j/k scroll  H/L pan  ^w wrap  | side-by-side  PgUp/PgDn page  drag select  y copy all  z full  esc back" ++ global_main,
+            "enter open  j/k scroll  H/L pan  ^w wrap  | side-by-side  PgUp/PgDn page  drag select  y copy all  z full  esc back" ++ global_main,
     };
 }
 
@@ -5771,6 +5778,7 @@ fn contextHints(app: *const app_mod.App) []const u8 {
         // `e` edits the file when the Diff panel shows a working-tree file.
         .main_file = app.focus == .main and !app.staging_active and
             app.contentFocus().isFilePanel() and app.selectedFile() != null,
+        .main_patch_file = app.focus == .main and !app.staging_active and app.selectedCommitFile() != null,
         .fullscreen = app.mainFullscreen(),
         .commits_copied = app.copied_commits.items.len > 0,
     });
@@ -6492,10 +6500,9 @@ test "footer hints have no key contradictions per stage" {
     try std.testing.expect(has(footerHints(.{ .focus = .main }), "z full"));
     try std.testing.expect(has(footerHints(.{ .focus = .main, .fullscreen = true }), "z exit full"));
 
-    // Over a working-tree file, the Diff panel advertises `enter` → staging;
-    // a plain commit/branch diff does not (enter does nothing there).
-    try std.testing.expect(has(footerHints(.{ .focus = .main, .main_file = true }), "enter stage"));
-    try std.testing.expect(!has(footerHints(.{ .focus = .main }), "enter stage"));
+    // Enter opens the originating panel's selection from the Diff panel.
+    try std.testing.expect(has(footerHints(.{ .focus = .main, .main_file = true }), "enter open"));
+    try std.testing.expect(has(footerHints(.{ .focus = .main }), "enter open"));
 
     // Conflict state (Files panel): advertises the resolve/continue keys, and
     // must NOT promise "esc back" — the panel is top-level during a conflict,
@@ -6926,7 +6933,7 @@ test "helpKeyEnd isolates the key column of a command line" {
     try std.testing.expectEqualStrings("q, ctrl+c", keyOf("  q, ctrl+c      quit").?);
     try std.testing.expectEqualStrings("ctrl+l", keyOf("  ctrl+l         commit graph viewer").?);
     try std.testing.expectEqualStrings("\\", keyOf("  \\              toggle split view").?);
-    try std.testing.expectEqualStrings("space, enter", keyOf("  space, enter   switch into the worktree").?);
+    try std.testing.expectEqualStrings("enter", keyOf("  enter          switch into the worktree").?);
 
     // Headers, continuation lines, and prose notes have no key column.
     try std.testing.expect(keyOf("Global") == null); // header (col 0)

@@ -241,7 +241,7 @@ The animation itself is in the [README](../README.md).
   remote branch (`d`).
 - Worktrees and Submodules tabs (Files panel): list, create or add, open,
   update, remove, a submodule bulk menu (`b`), and **switching repositories
-  in place**. `space` or `enter` on a worktree reroots the app onto it as a
+  in place**. `enter` on a worktree reroots the app onto it as a
   flat switch between siblings (the Worktrees list still shows every worktree
   to switch back through). `enter` on a submodule drills into it instead, with
   a `parent / current` breadcrumb and `esc` to walk back out.

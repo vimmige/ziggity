@@ -268,10 +268,8 @@ pub fn fromNormalKey(key: vaxis.Key, keymap: config_mod.KeyMap, focus: model.Foc
     if (keymap.commits_panel.matches(key)) return .focus_commits;
     if (keymap.stash_panel.matches(key)) return .focus_stash;
 
-    // <enter> on a side panel descends into the main panel to inspect the
-    // selected item (left with <esc>/<h>). In the main panel itself, <enter>
-    // over a working-tree file drills into its staging view (handled by the
-    // action); over other content it does nothing.
+    // Enter opens the selection; in the main panel it uses the originating
+    // side panel to choose the next view (handled by the action).
     if ((focus.isSidePanel() or focus == .main) and keymap.enter.matches(key)) return .focus_main;
 
     if (keymap.prev_tab.matches(key)) return .prev_tab;
