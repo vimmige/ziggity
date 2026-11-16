@@ -13219,7 +13219,7 @@ pub const App = struct {
         pub const checkout = ScopeSet.init(.{ .files = true, .status = true, .commits = true, .branches = true });
         pub const branches = ScopeSet.init(.{ .branches = true });
         pub const branches_commits = ScopeSet.init(.{ .branches = true, .commits = true });
-        pub const tags = ScopeSet.init(.{ .tags = true });
+        pub const tags = ScopeSet.init(.{ .tags = true, .commits = true, .branches = true });
         pub const remotes = ScopeSet.init(.{ .remotes = true });
         pub const stash = ScopeSet.init(.{ .files = true, .status = true, .stash = true });
         pub const worktrees = ScopeSet.init(.{ .worktrees = true });

@@ -4473,6 +4473,15 @@ fn drawCommitRows(win: vaxis.Window, app: *const app_mod.App, commits: []const m
             while (col < author_start + 2) col = printSpan(win, row, col, " ", base);
             col = printSpan(win, row, col, " ", base);
         }
+        var refs = std.mem.splitSequence(u8, commit.refs, ", ");
+        while (refs.next()) |ref| {
+            if (std.mem.startsWith(u8, ref, "tag: ")) {
+                const tag_style = withFg(base, ui_theme.tag);
+                col = printSpan(win, row, col, "[", tag_style);
+                col = printSpan(win, row, col, ref[5..], tag_style); // Omit Git's "tag: " prefix to keep the label compact.
+                col = printSpan(win, row, col, "] ", tag_style);
+            }
+        }
         printCommitSubject(win, row, col, commit.subject, base, app.config.highlight_conventional_commits);
     }
 }
