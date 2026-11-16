@@ -5175,8 +5175,12 @@ pub const App = struct {
         }
 
         if (self.config.keymap.toggle_tree_all.matches(key) and file_list_shown) {
-            if (!self.tree_view) try self.toggleTreeView();
             const tree = if (self.focus == .commits) &self.commit_tree else if (self.focus == .branches) &self.branch_tree else self.fileTree();
+            if (!self.tree_view) {
+                tree.collapsed.deinit();
+                tree.collapsed = std.BufSet.init(self.allocator);
+                try self.toggleTreeView();
+            }
             if (tree.collapsed.count() > 0) {
                 tree.collapsed.deinit();
                 tree.collapsed = std.BufSet.init(self.allocator);
