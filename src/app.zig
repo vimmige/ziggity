@@ -189,6 +189,7 @@ pub const StashKind = enum { all, untracked, staged, unstaged, file, keep };
 const donut_frame_ms: i96 = 80;
 
 pub const TextPromptKind = enum {
+    shell,
     new_branch,
     checkout_by_name,
     /// Pick a branch/ref to autosquash down to: the fixups your branch added
@@ -229,6 +230,7 @@ pub const TextPromptKind = enum {
 
     pub fn title(self: TextPromptKind) []const u8 {
         return switch (self) {
+            .shell => "Shell command >",
             .new_branch => "New branch name",
             .checkout_by_name => "Checkout branch by name",
             .autosquash_base => "Autosquash fixups down to (branch/ref)",
@@ -5139,6 +5141,11 @@ pub const App = struct {
             }
         }
 
+        if (self.mode == .normal and key.matches('>', .{})) {
+            if (self.foregroundBusy()) return self.setMessage("operation in progress...", .{});
+            return self.startTextPrompt(.shell);
+        }
+
         // ctrl+g opens the AI-generate menu on the Branches/Commits panels (the
         // sources a PR description can be generated from). Gated on `ai_command`
         // by startAiGenerateMenu.
@@ -10032,7 +10039,7 @@ pub const App = struct {
             // Prefill handled below (it needs to format remote + branch).
             .push_upstream => {},
             // Diff against a typed ref: no focus change or prefill.
-            .diff_ref => {},
+            .diff_ref, .shell => {},
             // Worktree/submodule prompts run from the Files panel's tabs.
             .new_worktree => self.focus = .files,
             .add_submodule_url, .add_submodule_path, .set_submodule_url => self.focus = .files,
@@ -10642,6 +10649,16 @@ pub const App = struct {
             return;
         }
         switch (kind) {
+            .shell => {
+                self.mode = .normal;
+                self.text_prompt_kind = null;
+                defer self.input_buffer.clearRetainingCapacity();
+                self.runCustomCommand(value) catch |err| {
+                    self.op_running = false;
+                    self.mode = .normal;
+                    try self.setMessage("shell command failed: {s}", .{@errorName(err)});
+                };
+            },
             .new_branch => {
                 const result = try self.git.createBranch(value);
                 self.mode = .normal;
@@ -13446,16 +13463,12 @@ pub const App = struct {
         // result_dialog policy as git actions.
         if (self.config.command_output == .show) {
             if (result.ok()) {
-                const summary = try std.fmt.allocPrint(self.allocator, "ran: {s}", .{command});
-                defer self.allocator.free(summary);
-                try self.finishOp(true, summary, result.stdout);
+                try self.finishOp(true, "", result.stdout);
             } else {
                 try self.finishOp(false, "command failed", if (result.stderr.len > 0) result.stderr else result.stdout);
             }
         } else if (result.ok()) {
-            const summary = try std.fmt.allocPrint(self.allocator, "ran: {s}", .{command});
-            defer self.allocator.free(summary);
-            try self.reportSuccess(summary, result.stdout);
+            try self.reportSuccess("", result.stdout);
         } else {
             try self.reportFailure("command failed", if (result.stderr.len > 0) result.stderr else result.stdout);
         }
