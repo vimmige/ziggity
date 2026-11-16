@@ -4981,7 +4981,8 @@ pub const App = struct {
         }
         if (self.mode == .rebase_plan) {
             try rebaseplan_mod.handleKey(self, key);
-            return;
+            self.resetMainView();
+            return self.updatePreview();
         }
         if (self.mode == .conflict_resolve) {
             try conflicts_mod.handleKey(self, key);
@@ -12312,6 +12313,12 @@ pub const App = struct {
         // While staging, the main panel renders the raw staging diff instead of
         // self.diff, so there is nothing to recompute here.
         if (self.staging_active) return;
+
+        if (self.mode == .rebase_plan) {
+            if (self.rebase_plan) |plan| {
+                return self.requestGitPreview(.{ .commit = plan[self.rebase_plan_index].hash });
+            }
+        }
 
         // Diffing mode overrides the normal preview with a ref-to-ref diff.
         if (self.diff_base) |base| {

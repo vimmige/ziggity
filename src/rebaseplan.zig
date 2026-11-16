@@ -89,6 +89,8 @@ pub fn start(app: *App) !void {
     app.rebase_plan_index = 0;
     app.rebase_plan_anchor = null;
     app.mode = .rebase_plan;
+    app.resetMainView();
+    try app.updatePreview();
     try app.setMessage("interactive rebase: p/d/s/f/e mark, v/shift+arrows select, ^j/^k move, enter run, esc cancel", .{});
 }
 
