@@ -15,6 +15,7 @@ const App = app_mod.App;
 
 pub fn startCommitPrompt(app: *App, no_verify: bool) !void {
     if (app.git.amend_view != null) return startAmendReword(app);
+    if (app.data.state == .rebasing and app.git.isRebaseEdit()) return startAmendReword(app);
     if (app.data.stagedCount() == 0) {
         try app.setMessage("stage files before committing", .{});
         return;
@@ -43,7 +44,13 @@ pub fn startCommitPrompt(app: *App, no_verify: bool) !void {
     // would — see git.prepareCommitMsg. Skipped when the message is preserved so
     // the hook never clobbers text the user was in the middle of writing.
     var seeded = false;
-    if (!restored and app.config.prepare_commit_msg_hook and app.git.git_dir.len > 0) {
+    if (!restored and app.data.state == .rebasing) {
+        const message = try app.git.commitMessage("REBASE_HEAD");
+        defer app.allocator.free(message);
+        const subject_end = std.mem.indexOfScalar(u8, message, '\n') orelse message.len;
+        try app.commit_buffer.appendSlice(app.allocator, message[0..subject_end]);
+        try app.commit_body_buffer.appendSlice(app.allocator, std.mem.trimStart(u8, message[subject_end..], "\r\n"));
+    } else if (!restored and app.config.prepare_commit_msg_hook and app.git.git_dir.len > 0) {
         if (app.git.prepareCommitMsg() catch null) |seed| {
             defer app.allocator.free(seed);
             if (seed.len > 0) {
