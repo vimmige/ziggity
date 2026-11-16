@@ -4980,6 +4980,37 @@ pub const App = struct {
             return;
         }
         if (self.mode == .rebase_plan) {
+            if (key.matches(vaxis.Key.page_up, .{})) return self.scrollMain(-10);
+            if (key.matches(vaxis.Key.page_down, .{})) return self.scrollMain(10);
+            if (actions.fromNormalKey(key, self.config.keymap, self.focus)) |action| {
+                switch (action) {
+                    .toggle_main => return if (self.focus == .main) self.leaveMain() else self.enterMain(),
+                    .toggle_fullscreen => return self.toggleDiffFullscreen(),
+                    .toggle_wrap => return self.toggleWrapDiff(),
+                    .scroll_left => return self.scrollFocusedHorizontal(-1),
+                    .scroll_right => return self.scrollFocusedHorizontal(1),
+                    else => {},
+                }
+                if (self.focus == .main) {
+                    switch (action) {
+                        .move_up => return self.scrollMain(-1),
+                        .move_down => return self.scrollMain(1),
+                        .cancel => {
+                            if (self.diff_sel_active) {
+                                self.diff_sel_active = false;
+                            } else if (self.diff_fullscreen) {
+                                self.diff_fullscreen = false;
+                            } else {
+                                try self.leaveMain();
+                            }
+                            return;
+                        },
+                        .focus_left, .focus_right => return self.leaveMain(),
+                        else => {},
+                    }
+                }
+            }
+            if (self.focus == .main) return;
             try rebaseplan_mod.handleKey(self, key);
             self.resetMainView();
             return self.updatePreview();
@@ -14816,6 +14847,21 @@ test "i builds an interactive-rebase plan from HEAD down to the selected commit"
     // Base is the parent of the oldest commit in the plan (the selected one).
     try std.testing.expectEqualStrings("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", app.rebase_plan_base);
     for (app.rebase_plan.?) |e| try std.testing.expectEqual(rebaseplan_mod.Action.pick, e.action);
+
+    app.focus = .commits;
+    try app.handleKey(.{ .codepoint = vaxis.Key.tab });
+    try std.testing.expectEqual(model.Focus.main, app.focus);
+    allocator.free(app.diff);
+    app.diff = try allocator.dupe(u8, "one\ntwo\nthree\nfour\n");
+    app.main_view_height = 1;
+    try app.handleKey(.{ .codepoint = 'j' });
+    try std.testing.expectEqual(@as(usize, 1), app.main_scroll);
+    try std.testing.expectEqual(@as(usize, 1), app.rebase_plan_index);
+    try app.handleKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqual(Mode.rebase_plan, app.mode);
+    try app.handleKey(.{ .codepoint = vaxis.Key.escape });
+    try std.testing.expectEqual(model.Focus.commits, app.focus);
+    try std.testing.expectEqual(Mode.rebase_plan, app.mode);
 
     rebaseplan_mod.cancel(&app);
     try std.testing.expectEqual(Mode.normal, app.mode);

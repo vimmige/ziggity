@@ -5666,7 +5666,8 @@ fn footerHints(c: FooterCtx) []const u8 {
     const local_branch_hints = "space checkout  c by-name  n new  R rename  d delete  M merge  r rebase  g reset  f ff  F force-co  T tag  N move  G pr  y copy  s sort  w worktree  W diff";
     const local_branch_tail = "  [/] tabs" ++ global_branches;
     if (c.rebase_plan) {
-        return "j/k move  p pick  d drop  s squash  f fixup  e edit  ^j/^k reorder  enter run  esc cancel";
+        if (c.focus == .main) return "j/k scroll  H/L pan  tab/esc back  z fullscreen  ^w wrap";
+        return "j/k move  p pick  d drop  s squash  f fixup  e edit  ^j/^k reorder  tab inspect  enter run  esc cancel";
     }
     if (c.staging_patch) {
         return "j/k line  v range  space add/remove line (@@=hunk)  ^p patch  e edit  esc back" ++ global;
