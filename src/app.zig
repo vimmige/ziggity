@@ -14808,6 +14808,7 @@ test "i builds an interactive-rebase plan from HEAD down to the selected commit"
 
     try rebaseplan_mod.start(&app);
     try std.testing.expectEqual(Mode.rebase_plan, app.mode);
+    try std.testing.expectEqual(app.commit_index, app.rebase_plan_index);
     // Plan covers HEAD (index 0) down to the selected commit (index 1): 2 entries.
     try std.testing.expectEqual(@as(usize, 2), app.rebase_plan.?.len);
     try std.testing.expectEqualStrings("aaaaaaa", app.rebase_plan.?[0].short_hash);
@@ -14838,6 +14839,7 @@ test "rebase plan range-marks and block-moves multiple commits" {
 
     try rebaseplan_mod.start(&app);
     try std.testing.expectEqual(@as(usize, 3), app.rebase_plan.?.len);
+    app.rebase_plan_index = 0;
 
     // v anchors a range at row 0, shift+down extends it to row 1.
     try rebaseplan_mod.handleKey(&app, vaxis.Key{ .codepoint = 'v' });
@@ -14894,7 +14896,13 @@ test "rebase plan drives the Commits panel scroll and scrollbar, not the log" {
     // The Commits panel's active list is now the 16-entry plan, not the log.
     try std.testing.expectEqual(@as(usize, 16), app.activeListLen(.commits));
 
+    // Opening the plan keeps the selected commit visible.
+    app.syncListView(.commits, 10);
+    try std.testing.expectEqual(@as(usize, 15), app.rebase_plan_index);
+    try std.testing.expectEqual(@as(usize, 6), app.listScroll(.commits));
+
     // Cursor at the top: a 10-row view shows from the top, no scroll.
+    app.rebase_plan_index = 0;
     app.syncListView(.commits, 10);
     try std.testing.expectEqual(@as(usize, 0), app.listScroll(.commits));
 

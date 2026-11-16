@@ -86,7 +86,7 @@ pub fn start(app: *App) !void {
     // Base is the parent of the oldest commit in the plan (the last entry).
     app.rebase_plan_base = try app.allocator.dupe(u8, commits[i].hash);
     app.rebase_plan = entries;
-    app.rebase_plan_index = 0;
+    app.rebase_plan_index = i;
     app.rebase_plan_anchor = null;
     app.mode = .rebase_plan;
     app.resetMainView();
