@@ -4089,10 +4089,12 @@ pub const App = struct {
     help_searching: bool = false,
     help_query: std.ArrayList(u8) = .empty,
     help_cursor: usize = 0,
+    help_selected: usize = 0,
+    help_max_selected: usize = 0,
     help_scroll: usize = 0,
     help_max_scroll: usize = 0,
     /// When the help dialog opens, the section header matching the current
-    /// context (e.g. "Branches"); the renderer highlights it. Null = none.
+    /// context (e.g. "Branches"). Null = none.
     help_focus_header: ?[]const u8 = null,
     /// One-shot: on the first help render, scroll so `help_focus_header` is in
     /// view. Cleared by the renderer so the user can scroll freely afterward.
@@ -5115,6 +5117,7 @@ pub const App = struct {
                 self.help_query.clearRetainingCapacity();
                 self.help_cursor = 0;
                 self.help_scroll = 0;
+                self.help_selected = 0;
                 self.clearDialogSelection();
                 return;
             }
@@ -5123,6 +5126,7 @@ pub const App = struct {
                     self.help_searching = false;
                 } else if (try self.editLine(&self.help_query, &self.help_cursor, key) == .changed) {
                     self.help_scroll = 0;
+                    self.help_selected = 0;
                     self.help_scroll_to_focus = false;
                     self.clearDialogSelection();
                 }
@@ -5133,10 +5137,10 @@ pub const App = struct {
                 return;
             }
             if (self.config.keymap.down.matches(key) or key.matches(vaxis.Key.down, .{})) {
-                self.help_scroll = @min(self.help_scroll + 1, self.help_max_scroll);
+                self.help_selected = @min(self.help_selected + 1, self.help_max_selected);
                 self.clearDialogSelection();
             } else if (self.config.keymap.up.matches(key) or key.matches(vaxis.Key.up, .{})) {
-                self.help_scroll -|= 1;
+                self.help_selected -|= 1;
                 self.clearDialogSelection();
             } else if (self.isEnterKey(key) or self.isDialogCloseKey(key)) {
                 self.mode = .normal;
@@ -5568,8 +5572,8 @@ pub const App = struct {
                 self.help_query.clearRetainingCapacity();
                 self.help_cursor = 0;
                 self.help_scroll = 0;
-                // Open the help scrolled to (and highlighting) the section that
-                // matches where the user pressed `?`.
+                self.help_selected = 0;
+                // Open at the commands for the panel where `?` was pressed.
                 self.help_focus_header = helpSectionKeyword(self.focus, self.staging_active);
                 self.help_scroll_to_focus = self.help_focus_header != null;
                 try self.setMessage("help", .{});
@@ -6422,6 +6426,7 @@ pub const App = struct {
                 return true;
             },
             .help => {
+                self.help_selected = if (down) @min(self.help_selected + lines, self.help_max_selected) else self.help_selected -| lines;
                 self.help_scroll = if (down) @min(self.help_scroll + lines, self.help_max_scroll) else self.help_scroll -| lines;
                 return true;
             },
@@ -14270,40 +14275,40 @@ test "fileDiffArgv pairs renames and sets rename/submodule flags" {
     for (argv2) |a| try std.testing.expect(!std.mem.eql(u8, a, "--staged"));
 }
 
-test "help dialog scrolling clamps at the bottom and resumes up immediately" {
+test "help dialog selection clamps at the bottom and resumes up immediately" {
     const allocator = std.testing.allocator;
     var no_files = [_]model.FileStatus{};
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
 
     app.mode = .help;
-    app.help_max_scroll = 2; // as a render would have computed
-    app.help_scroll = 0;
+    app.help_max_selected = 2; // as a render would have computed
+    app.help_selected = 0;
 
     const down = vaxis.Key{ .codepoint = 'j' };
     try app.handleKey(down);
     try app.handleKey(down);
     try app.handleKey(down); // past the bottom — must clamp, not accumulate
     try app.handleKey(down);
-    try std.testing.expectEqual(@as(usize, 2), app.help_scroll);
+    try std.testing.expectEqual(@as(usize, 2), app.help_selected);
 
     // Scrolling up moves on the very next press (no stuck phantom offset).
     const up = vaxis.Key{ .codepoint = 'k' };
     try app.handleKey(up);
-    try std.testing.expectEqual(@as(usize, 1), app.help_scroll);
+    try std.testing.expectEqual(@as(usize, 1), app.help_selected);
 
-    app.help_max_scroll = 12;
+    app.help_max_selected = 12;
     inline for (.{ .{ 'j', 'k' }, .{ vaxis.Key.down, vaxis.Key.up } }) |keys| {
-        app.help_scroll = 6;
+        app.help_selected = 6;
         try app.handleKey(.{ .codepoint = keys[0], .mods = .{ .ctrl = true } });
-        try std.testing.expectEqual(@as(usize, 11), app.help_scroll);
+        try std.testing.expectEqual(@as(usize, 11), app.help_selected);
         try app.handleKey(.{ .codepoint = keys[0], .mods = .{ .ctrl = true } });
-        try std.testing.expectEqual(@as(usize, 12), app.help_scroll);
+        try std.testing.expectEqual(@as(usize, 12), app.help_selected);
         try app.handleKey(.{ .codepoint = keys[1], .mods = .{ .ctrl = true } });
-        try std.testing.expectEqual(@as(usize, 7), app.help_scroll);
-        app.help_scroll = 2;
+        try std.testing.expectEqual(@as(usize, 7), app.help_selected);
+        app.help_selected = 2;
         try app.handleKey(.{ .codepoint = keys[1], .mods = .{ .ctrl = true } });
-        try std.testing.expectEqual(@as(usize, 0), app.help_scroll);
+        try std.testing.expectEqual(@as(usize, 0), app.help_selected);
     }
 }
 
@@ -14312,21 +14317,21 @@ test "help search edits text before navigation and escape clears before closing"
     var app = try testApp(std.testing.allocator, &no_files);
     defer deinitTestApp(&app);
     app.mode = .help;
-    app.help_scroll = 2;
+    app.help_selected = 2;
     app.help_scroll_to_focus = true;
     try app.handleKey(.{ .codepoint = '/' });
     try app.handleKey(.{ .codepoint = 'j', .text = "j" });
     try app.handleKey(.{ .codepoint = 'k', .text = "k" });
     try std.testing.expectEqualStrings("jk", app.help_query.items);
-    try std.testing.expectEqual(@as(usize, 0), app.help_scroll);
+    try std.testing.expectEqual(@as(usize, 0), app.help_selected);
     try std.testing.expect(!app.help_scroll_to_focus);
     try app.handleKey(.{ .codepoint = vaxis.Key.backspace });
     try std.testing.expectEqualStrings("j", app.help_query.items);
     try app.handleKey(.{ .codepoint = vaxis.Key.enter });
     try std.testing.expect(!app.help_searching);
-    app.help_max_scroll = 2;
+    app.help_max_selected = 2;
     try app.handleKey(.{ .codepoint = 'j' });
-    try std.testing.expectEqual(@as(usize, 1), app.help_scroll);
+    try std.testing.expectEqual(@as(usize, 1), app.help_selected);
     try app.handleKey(.{ .codepoint = vaxis.Key.escape });
     try std.testing.expectEqual(Mode.help, app.mode);
     try std.testing.expectEqual(@as(usize, 0), app.help_query.items.len);

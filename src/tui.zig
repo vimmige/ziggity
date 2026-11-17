@@ -2571,7 +2571,10 @@ fn drawHelpPopup(root: vaxis.Window, app: *app_mod.App) void {
     const w: u16 = @intCast(@min(@as(usize, root.width -| 2), longest + 4));
     const content_w: u16 = w -| 2;
 
-    const HelpLine = struct { text: []const u8, header: bool, focus: bool };
+    const HelpLine = struct { text: []const u8, header: bool, selection: ?usize = null };
+    var selectable: [512]usize = undefined;
+    var selectable_count: usize = 0;
+    var focus_selection: usize = 0;
     var wrapped: [512]HelpLine = undefined;
     var total: usize = 0;
     // The first wrapped-line index of the section matching the current context,
@@ -2585,7 +2588,7 @@ fn drawHelpPopup(root: vaxis.Window, app: *app_mod.App) void {
         const header = line.len > 0 and line[0] != ' ';
         if (line.len == 0) {
             if (total < wrapped.len) {
-                wrapped[total] = .{ .text = "", .header = false, .focus = false };
+                wrapped[total] = .{ .text = "", .header = false };
                 total += 1;
             }
             continue;
@@ -2593,12 +2596,18 @@ fn drawHelpPopup(root: vaxis.Window, app: *app_mod.App) void {
         // Mark the (first) header that matches the wanted section as focused.
         const is_focus = header and focus_start == null and
             want != null and std.mem.startsWith(u8, line, want.?);
+        if (is_focus) focus_selection = selectable_count;
+        const selection: ?usize = if (helpKeyEnd(line) != null and total < wrapped.len) blk: {
+            selectable[selectable_count] = total;
+            selectable_count += 1;
+            break :blk selectable_count - 1;
+        } else null;
         var segs: [8][]const u8 = undefined;
         const n = wrapText(line, content_w, &segs);
         for (segs[0..n]) |s| {
             if (total >= wrapped.len) break;
             if (is_focus and focus_start == null) focus_start = total;
-            wrapped[total] = .{ .text = s, .header = header, .focus = is_focus };
+            wrapped[total] = .{ .text = s, .header = header, .selection = selection };
             total += 1;
         }
     }
@@ -2611,15 +2620,24 @@ fn drawHelpPopup(root: vaxis.Window, app: *app_mod.App) void {
     const max_scroll = if (total > win_height) total - win_height else 0;
     app.help_max_scroll = max_scroll; // so key handlers can clamp scrolling
 
+    app.help_max_selected = selectable_count -| 1;
+
     // One-shot on open: jump so the matched section header sits at the top
     // (clamped). Cleared here so subsequent up/down scrolling is left alone.
     if (app.help_scroll_to_focus) {
         if (focus_start) |fs| app.help_scroll = @min(fs, max_scroll);
+        app.help_selected = focus_selection;
         app.help_scroll_to_focus = false;
     }
 
+    app.help_selected = @min(app.help_selected, app.help_max_selected);
+    if (selectable_count > 0) {
+        const selected_row = selectable[app.help_selected];
+        if (selected_row < app.help_scroll) app.help_scroll = selected_row;
+        if (selected_row >= app.help_scroll + win_height) app.help_scroll = selected_row -| (win_height -| 1);
+    }
     app.help_scroll = @min(app.help_scroll, max_scroll);
-    const title = if (app.help_searching) "Search help (enter scroll, esc clear)" else if (app.help_query.items.len > 0) "Help (/ edit search, esc clear)" else "Keybindings (/ search)";
+    const title = if (app.help_searching) "Search help (enter navigate, esc clear)" else if (app.help_query.items.len > 0) "Help (/ edit search, esc clear)" else "Keybindings (/ search)";
     const win = popup(root, w, h, title, .{ .len = total, .pos = app.help_scroll });
 
     const px0: u16 = (root.width - w) / 2;
@@ -2627,34 +2645,20 @@ fn drawHelpPopup(root: vaxis.Window, app: *app_mod.App) void {
     app.beginDialogGrid(px0 + 1, py0 + 1, win.height);
     if (total == 0) print(win, 0, 0, "No matches", st.warning);
 
-    // The matched header is drawn as a full-width highlighted bar (an arrow
-    // marker plus a selected-row background) so it stands out from the other,
-    // plain-accent section headers.
-    const focus_style: vaxis.Style = .{
-        .fg = .{ .index = ui_theme.accent },
-        .bg = .{ .index = ui_theme.selected_bg },
-        .bold = true,
-    };
-    // The key column of each command line is redrawn in this colour so the keys
-    // stand out from their descriptions.
+    var selected_style = st.normal;
+    applySel(&selected_style, .active);
     const key_style: vaxis.Style = .{ .fg = .{ .index = ui_theme.footer_key }, .bold = true };
     const start = @min(app.help_scroll, max_scroll);
     var row: u16 = 0;
     for (wrapped[start..total]) |wl| {
         if (row >= win.height) break;
-        if (wl.focus) {
-            fillRow(win, row, focus_style);
-            drawDialogRow(win, app, row, wl.text, focus_style);
-            // A right-edge "◀" pointer reinforces the highlight (drawn as a
-            // static glyph so it survives the post-render flush).
-            _ = printGlyph(win, row, win.width -| 2, glyph_focus_pointer, focus_style);
-        } else {
-            drawDialogRow(win, app, row, wl.text, if (wl.header) st.bottom_accent else st.normal);
-            // Recolour just the key token (leave headers, notes and any active
-            // text selection untouched).
-            if (!wl.header and app.dialogRowSelection(row) == null) {
-                if (helpKeyEnd(wl.text)) |end| print(win, row, 2, wl.text[2..end], key_style);
-            }
+        const selected = wl.selection != null and wl.selection.? == app.help_selected;
+        if (selected) fillRow(win, row, selected_style);
+        drawDialogRow(win, app, row, wl.text, if (selected) selected_style else if (wl.header) st.bottom_accent else st.normal);
+        if (!wl.header and app.dialogRowSelection(row) == null) {
+            var key_draw_style = key_style;
+            if (selected) applySel(&key_draw_style, .active);
+            if (helpKeyEnd(wl.text)) |end| print(win, row, 2, wl.text[2..end], key_draw_style);
         }
         row += 1;
     }
@@ -5437,7 +5441,7 @@ fn drawBottom(win: vaxis.Window, app: *app_mod.App) void {
             print(win, 0, @intCast(prefix.len), app.help_query.items[sc.origin..], st.bottom);
             if (app.help_searching) win.showCursor(@intCast(prefix.len + sc.view), 0);
         } else {
-            print(win, 0, 0, "help  -  / search  -  j/k scroll  -  esc close", st.bottom_accent);
+            print(win, 0, 0, "help  -  / search  -  j/k move  -  esc close", st.bottom_accent);
         }
         return;
     }
