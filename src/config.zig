@@ -67,10 +67,10 @@ pub const KeyMap = struct {
     // Open the full-screen side-by-side review of the current diff.
     diff_layout_toggle: Binding = .{ .codepoint = '|' },
     toggle_fullscreen: Binding = .{ .codepoint = 'z' },
-    // Screen-mode cycle for the focused panel: normal -> half
-    // (enlarged) -> full (fills the terminal), and back.
     screen_mode_next: Binding = .{ .codepoint = '+' },
-    screen_mode_prev: Binding = .{ .codepoint = '-' },
+    screen_mode_prev: Binding = .{ .codepoint = '_' },
+    panel_size_next: Binding = .{ .codepoint = '}' },
+    panel_size_prev: Binding = .{ .codepoint = '{' },
     open_status_filter: Binding = .{ .codepoint = 'b', .ctrl = true },
     cycle_status_filter: Binding = .{ .codepoint = 'b', .alt = true },
     discard: Binding = .{ .codepoint = 'd' },

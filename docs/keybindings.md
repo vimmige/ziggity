@@ -15,7 +15,8 @@ the written reference. Every binding is remappable, see
 | `z` | Maximize the Diff panel to full screen (`z` or `esc` to exit) |
 | `\|` | Open the full-screen side-by-side review of the diff |
 | `~` | Collapse folders below root, or expand the whole file tree |
-| `+` `-` | Cycle the focused side panel's size: collapsed, single, normal, half, full |
+| `+` `_` | Increase/decrease global screen mode: normal, half, full |
+| `}` `{` | Increase/decrease focused panel size: collapsed, single, normal |
 | `[` `]` | Switch the focused panel's tabs (or staging side) |
 | `enter` / `esc` | Open selection / step back |
 | `space` | Stage file · checkout branch · apply stash (by focus) |
@@ -90,13 +91,16 @@ the written reference. Every binding is remappable, see
   boxed hunk), `^w` soft-wraps both columns kept line for line, `H`/`L` pan, and
   `esc` returns. A terminal too narrow for two columns falls back to the unified view (see
   [configuration.md](configuration.md#side-by-side-review-))
-- `+` / `-`: cycle the focused **side** panel's screen mode. `+` grows it
-  (collapsed to single to normal to half to full), `-` shrinks it back. Collapsed panels
-  keep only their header; single shows one content row. Other panels share the
-  freed space. In half the focused side panel takes about half the column with the rest still visible; in full it fills the
-  whole terminal. `esc` is deliberately left out of this, so it keeps its
-  single meaning of stepping back out of drilled-in panels and selections. The
-  current mode shows as a `[collapsed]`, `[single]`, `[half]`, or `[full]` badge in the footer
+- `+` / `_`: increase/decrease global screen mode: normal uses the configured
+  narrow left pane, half splits the terminal equally, and full shows only the
+  left pane. Half and full show only the selected side panel; normal stacks panels.
+  The mode persists across focus changes. `z` independently maximizes Diff.
+- `}` / `{`: increase/decrease the focused side panel's size: collapsed,
+  single, normal. Collapsed keeps only its header; single shows one content row;
+  normal shares remaining space. Global screen mode sets the pane width first,
+  then individual panel sizes apply within it. Other left panels remain visible
+  only in normal screen mode.
+  The footer shows non-default screen mode and focused panel size.
 - `1`–`6`: focus status / files / staged / branches / commits / stash; pressing the
   number of the already-focused panel cycles its tabs (so `4` walks
   Local/Remotes/Tags), the same way `]` does. Turn this off with

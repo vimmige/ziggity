@@ -17,6 +17,8 @@ pub const Action = enum {
     toggle_fullscreen,
     screen_mode_next,
     screen_mode_prev,
+    panel_size_next,
+    panel_size_prev,
     toggle_staging_split,
     toggle_diff_layout,
     select,
@@ -301,6 +303,8 @@ pub fn fromNormalKey(key: vaxis.Key, keymap: config_mod.KeyMap, focus: model.Foc
     if (keymap.toggle_fullscreen.matches(key)) return .toggle_fullscreen;
     if (keymap.screen_mode_next.matches(key)) return .screen_mode_next;
     if (keymap.screen_mode_prev.matches(key)) return .screen_mode_prev;
+    if (keymap.panel_size_next.matches(key)) return .panel_size_next;
+    if (keymap.panel_size_prev.matches(key)) return .panel_size_prev;
     if (keymap.command_log.matches(key)) return .command_log;
     if (keymap.help.matches(key)) return .help;
     if (keymap.undo.matches(key)) return .undo;

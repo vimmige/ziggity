@@ -34,11 +34,9 @@ const staging_mod = @import("staging.zig");
 const stash_mod = @import("stash.zig");
 const textmatch = @import("textmatch.zig");
 
-/// Size of each side panel, from a collapsed title to fullscreen. Cycled by `+`/`-`
-/// only (`esc` is left out of it). The main panel is a separate special case
-/// (`z`/`esc` fullscreen) and is never affected by this.
-pub const ScreenMode = enum { collapsed, single, normal, half, full };
-pub const PanelScreenModes = std.EnumArray(model.Focus, ScreenMode);
+pub const ScreenMode = enum { normal, half, full };
+pub const PanelSize = enum { collapsed, single, normal };
+pub const PanelSizes = std.EnumArray(model.Focus, PanelSize);
 
 pub const Mode = enum {
     normal,
@@ -3545,7 +3543,8 @@ pub const App = struct {
     files_tree: TreeState = undefined,
     staged_tree: TreeState = undefined,
     staged_index: usize = 0,
-    panel_modes: PanelScreenModes = .initFill(.normal),
+    screen_mode: ScreenMode = .normal,
+    panel_sizes: PanelSizes = .initFill(.normal),
     branch_index: usize = 0,
     /// Set after a successful checkout so the next branches load moves the
     /// Branches selection onto the freshly checked-out (now current) branch.
@@ -3682,7 +3681,7 @@ pub const App = struct {
     diff_sel_dragged: bool = false,
     // Full-screen the Diff/main panel: the side panels hide and the main panel
     // fills the terminal. Its own special case, toggled by `z` and exited by `z`
-    // or `esc` (the `+`/`-` screen-mode cycle never touches the main panel).
+    // or `esc`, independently of the global screen mode.
     diff_fullscreen: bool = false,
     // The hunk the side-by-side review's cursor is on (index into the preview's
     // hunks). `J`/`K` move it and it is highlighted. Reset to 0 when the shown
@@ -4981,6 +4980,10 @@ pub const App = struct {
             .help => !self.help_searching,
             else => true,
         };
+        if (navigation_mode or self.mode == .confirmation) {
+            if (self.config.keymap.screen_mode_next.matches(key)) return self.cycleScreenMode(true);
+            if (self.config.keymap.screen_mode_prev.matches(key)) return self.cycleScreenMode(false);
+        }
         if (navigation_mode) {
             const down = key.matches('j', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{ .ctrl = true });
             const up = key.matches('k', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{ .ctrl = true });
@@ -5528,6 +5531,8 @@ pub const App = struct {
             .toggle_fullscreen => try self.toggleDiffFullscreen(),
             .screen_mode_next => self.cycleScreenMode(true),
             .screen_mode_prev => self.cycleScreenMode(false),
+            .panel_size_next => self.cyclePanelSize(true),
+            .panel_size_prev => self.cyclePanelSize(false),
             // Toggle the staging view between single and split layouts.
             .toggle_staging_split => if (self.staging_active and !self.staging_patch_mode) try staging_mod.toggleStagingSplit(self),
             .select => {
@@ -8461,22 +8466,9 @@ pub const App = struct {
     }
 
     /// The main/diff panel fills the terminal (side column hidden). Its own
-    /// special case, driven by `z` (not the `+`/`-` screen-mode cycle).
+    /// special case, driven by `z` independently of the global screen mode.
     pub fn mainFullscreen(self: *const App) bool {
         return self.diff_fullscreen;
-    }
-
-    /// A focused side panel fills the terminal (main + the other side panels
-    /// hidden): screen mode `full` while a side panel is focused.
-    pub fn sidePanelFullscreen(self: *const App) bool {
-        return !self.diff_fullscreen and self.panel_modes.get(self.focus) == .full and self.focus != .main;
-    }
-
-    /// The focused side panel is enlarged (accordion): the config option
-    /// `expand_focused_side_panel`, or half screen mode while a side panel is
-    /// focused.
-    pub fn accordionActive(self: *const App) bool {
-        return self.config.expand_focused_side_panel or (self.panel_modes.get(self.focus) == .half and self.focus != .main);
     }
 
     /// Whether the Status panel should render as a single title bar instead of
@@ -8493,16 +8485,10 @@ pub const App = struct {
         return true;
     }
 
-    /// Whether the `+`/`-` screen mode is actively shaping the layout (a side
-    /// panel is focused with a non-default size) — drives the footer badge.
-    pub fn screenModeActive(self: *const App) bool {
-        return self.panel_modes.get(self.focus) != .normal and self.focus != .main;
-    }
-
     /// Toggle the Diff/main panel between full-screen (side panels hidden, main
     /// fills the terminal) and the normal layout. Entering it focuses the main
     /// panel so there's something to read/scroll. Its own state, exited by `z`
-    /// or `esc`; the `+`/`-` cycle never touches the main panel.
+    /// or `esc`; the global screen mode is preserved.
     fn toggleDiffFullscreen(self: *App) !void {
         if (self.diff_fullscreen) {
             self.diff_fullscreen = false;
@@ -8512,25 +8498,25 @@ pub const App = struct {
         }
     }
 
-    /// Cycle the focused SIDE panel's screen mode (`+`/`-`): forward
-    /// steps collapsed -> single -> normal -> half -> full, backward reverses those steps,
-    /// clamped at each end. The main panel is a special case (`z`) and is never
-    /// affected, so this is a no-op while the main panel is focused.
     fn cycleScreenMode(self: *App, forward: bool) void {
-        if (self.focus == .main) return;
-        const mode = self.panel_modes.getPtr(self.focus);
-        mode.* = if (forward) switch (mode.*) {
-            .collapsed => .single,
-            .single => .normal,
+        self.screen_mode = if (forward) switch (self.screen_mode) {
             .normal => .half,
-            .half => .full,
-            .full => .full,
-        } else switch (mode.*) {
+            .half, .full => .full,
+        } else switch (self.screen_mode) {
             .full => .half,
-            .half => .normal,
+            .half, .normal => .normal,
+        };
+    }
+
+    fn cyclePanelSize(self: *App, forward: bool) void {
+        if (self.focus == .main) return;
+        const size = self.panel_sizes.getPtr(self.focus);
+        size.* = if (forward) switch (size.*) {
+            .collapsed => .single,
+            .single, .normal => .normal,
+        } else switch (size.*) {
             .normal => .single,
-            .single => .collapsed,
-            .collapsed => .collapsed,
+            .single, .collapsed => .collapsed,
         };
     }
 
@@ -19087,72 +19073,48 @@ test "path filter prefills the drilled commit-file path (issue #39)" {
     app.commit_files = &.{}; // stack-backed slice; keep teardown away from it
 }
 
-test "screen mode cycles side panels only; main is z's special case (issue #38)" {
+test "global screen mode and individual panel sizes cycle independently" {
     const a = std.testing.allocator;
     var no_files = [_]model.FileStatus{};
     var app = try testApp(a, &no_files);
     defer deinitTestApp(&app);
 
     app.focus = .commits;
-    try std.testing.expectEqual(ScreenMode.normal, app.panel_modes.get(.commits));
-    try std.testing.expect(!app.accordionActive());
-    try std.testing.expect(!app.screenModeActive());
-
-    // `+` steps up; half turns on the accordion, full fills the terminal.
-    app.cycleScreenMode(true);
-    try std.testing.expectEqual(ScreenMode.half, app.panel_modes.get(.commits));
-    try std.testing.expect(app.accordionActive());
-    try std.testing.expect(app.screenModeActive());
-    app.cycleScreenMode(true);
-    try std.testing.expectEqual(ScreenMode.full, app.panel_modes.get(.commits));
-    try std.testing.expect(app.sidePanelFullscreen()); // a side panel is focused
-    try std.testing.expect(!app.mainFullscreen());
-    app.cycleScreenMode(true); // clamps at full
-    try std.testing.expectEqual(ScreenMode.full, app.panel_modes.get(.commits));
+    try app.handleKey(.{ .codepoint = '+' });
+    try std.testing.expectEqual(ScreenMode.half, app.screen_mode);
+    try std.testing.expectEqual(PanelSize.normal, app.panel_sizes.get(.commits));
+    try app.handleKey(.{ .codepoint = '+' });
+    try app.handleKey(.{ .codepoint = '+' });
+    try std.testing.expectEqual(ScreenMode.full, app.screen_mode);
 
     app.focus = .files;
-    try std.testing.expectEqual(ScreenMode.normal, app.panel_modes.get(.files));
-    try std.testing.expect(!app.sidePanelFullscreen());
-    app.cycleScreenMode(false);
-    try std.testing.expectEqual(ScreenMode.single, app.panel_modes.get(.files));
-    try std.testing.expectEqual(ScreenMode.full, app.panel_modes.get(.commits));
+    try std.testing.expectEqual(ScreenMode.full, app.screen_mode);
+    try app.handleKey(.{ .codepoint = '{' });
+    try std.testing.expectEqual(PanelSize.single, app.panel_sizes.get(.files));
+    try app.handleKey(.{ .codepoint = '{' });
+    try app.handleKey(.{ .codepoint = '{' });
+    try std.testing.expectEqual(PanelSize.collapsed, app.panel_sizes.get(.files));
+    try std.testing.expectEqual(PanelSize.normal, app.panel_sizes.get(.commits));
+    try std.testing.expectEqual(ScreenMode.full, app.screen_mode);
+    try app.handleKey(.{ .codepoint = '}' });
+    try std.testing.expectEqual(PanelSize.single, app.panel_sizes.get(.files));
+    try app.handleKey(.{ .codepoint = '}' });
+    try app.handleKey(.{ .codepoint = '}' });
+    try std.testing.expectEqual(PanelSize.normal, app.panel_sizes.get(.files));
 
-    // The main panel is a special case: `+`/`-` are no-ops there, and the side
-    // screen mode has no effect on the layout while it is focused.
     app.focus = .main;
-    try std.testing.expect(!app.sidePanelFullscreen());
-    try std.testing.expect(!app.accordionActive());
-    try std.testing.expect(!app.screenModeActive());
-    app.cycleScreenMode(true);
-    try std.testing.expectEqual(ScreenMode.full, app.panel_modes.get(.commits)); // unchanged on main
-    app.cycleScreenMode(false);
-    try std.testing.expectEqual(ScreenMode.full, app.panel_modes.get(.commits)); // still unchanged
-
-    // `z` drives the main panel's own fullscreen, independent of screen mode.
-    try std.testing.expect(!app.mainFullscreen());
+    try app.handleKey(.{ .codepoint = '{' });
+    try std.testing.expectEqual(PanelSize.normal, app.panel_sizes.get(.main));
+    try app.handleKey(.{ .codepoint = '_' });
+    try std.testing.expectEqual(ScreenMode.half, app.screen_mode);
+    try app.handleKey(.{ .codepoint = '_' });
+    try app.handleKey(.{ .codepoint = '_' });
+    try std.testing.expectEqual(ScreenMode.normal, app.screen_mode);
     try app.toggleDiffFullscreen();
     try std.testing.expect(app.mainFullscreen());
     try app.toggleDiffFullscreen();
     try std.testing.expect(!app.mainFullscreen());
-
-    // Back on a side panel, `-` steps down to collapsed.
-    app.focus = .commits;
-    try app.handleKey(.{ .codepoint = '-' });
-    app.cycleScreenMode(false);
-    try std.testing.expectEqual(ScreenMode.normal, app.panel_modes.get(.commits));
-    app.cycleScreenMode(false);
-    try std.testing.expectEqual(ScreenMode.single, app.panel_modes.get(.commits));
-    app.cycleScreenMode(false);
-    try std.testing.expect(app.panel_modes.get(.commits) == .collapsed);
-    app.cycleScreenMode(false);
-    try std.testing.expect(app.panel_modes.get(.commits) == .collapsed);
-    try app.handleKey(.{ .codepoint = '+' });
-    try std.testing.expect(app.panel_modes.get(.commits) != .collapsed);
-    try std.testing.expect(app.panel_modes.get(.commits) == .single);
-    app.cycleScreenMode(true);
-    try std.testing.expect(app.panel_modes.get(.commits) != .single);
-    try std.testing.expectEqual(ScreenMode.normal, app.panel_modes.get(.commits));
-    try std.testing.expect(!app.accordionActive());
+    try std.testing.expectEqual(ScreenMode.normal, app.screen_mode);
 }
 
 test "isFetch groups the fetch ops that honour fetch_prune_mode" {
@@ -20370,12 +20332,12 @@ test "file tree builds rows, selects files, and collapses directories" {
     try app.handleKey(.{ .codepoint = '~' });
     try std.testing.expectEqual(@as(usize, 6), app.files_tree.rows.len);
 
-    try app.handleKey(.{ .codepoint = '-' });
-    try std.testing.expect(app.panel_modes.get(.files) == .single);
-    try app.handleKey(.{ .codepoint = '-' });
-    try std.testing.expect(app.panel_modes.get(.files) == .collapsed);
-    try app.handleKey(.{ .codepoint = '+' });
-    try std.testing.expect(app.panel_modes.get(.files) != .collapsed);
+    try app.handleKey(.{ .codepoint = '{' });
+    try std.testing.expect(app.panel_sizes.get(.files) == .single);
+    try app.handleKey(.{ .codepoint = '{' });
+    try std.testing.expect(app.panel_sizes.get(.files) == .collapsed);
+    try app.handleKey(.{ .codepoint = '}' });
+    try std.testing.expect(app.panel_sizes.get(.files) != .collapsed);
 
     files[1].has_staged = true;
     files[1].short_status = .{ 'M', 'M' };

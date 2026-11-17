@@ -437,8 +437,11 @@ The animation itself is in the [README](../README.md).
   a truecolor one (see
   [comparison.md](comparison.md#at-home-in-any-terminal)).
 - Panel sizing: `z` maximizes the Diff panel to full screen (`z` or `esc` to
-  exit); `+` and `_` cycle the focused side panel through normal, half and full,
-  with a `[half]`/`[full]` badge in the footer while it is enlarged. The
+  exit); `+` and `_` increase/decrease global screen mode: narrow left pane,
+  equal halves, or left pane only. Half and full show only the selected side
+  panel; normal stacks panels. `}` and `{` independently resize the focused
+  panel through collapsed, single and normal within that pane. Footer badges
+  show non-default screen mode and panel size. The
   `expand_focused_side_panel` option grows the focused list panel by default,
   and `collapse_status` shrinks the Status panel to a single title bar (it
   expands back on its own during an operation, a merge, rebase, or bisect, a

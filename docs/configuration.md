@@ -267,7 +267,9 @@ key.toggle_tree_all = ~
 key.staged_panel = 3
 key.toggle_fullscreen = z
 key.screen_mode_next = +
-key.screen_mode_prev = -
+key.screen_mode_prev = _
+key.panel_size_next = }
+key.panel_size_prev = {
 key.conflict_menu = m
 key.command_log = @
 
