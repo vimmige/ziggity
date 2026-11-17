@@ -5131,6 +5131,10 @@ pub const App = struct {
                 if (self.foregroundBusy()) return self.setMessage("operation in progress...", .{});
                 return commits_mod.amendLastCommit(self);
             }
+            if (self.config.keymap.amend_message.matches(key)) {
+                if (self.foregroundBusy()) return self.setMessage("operation in progress...", .{});
+                return commits_mod.startAmendReword(self);
+            }
         }
 
         // User-defined custom commands take precedence over built-in bindings.
@@ -5595,6 +5599,7 @@ pub const App = struct {
             },
             .find_fixup_base => try fixupbase_mod.findBaseAndFixup(self),
             .amend_commit => try commits_mod.amendLastCommit(self),
+            .amend_message => try commits_mod.startAmendReword(self),
             .cherry_pick => try self.toggleCommitCopy(),
             .tag_commit => try self.startTagAtCommit(),
             .open_pull_request => try diffmode_mod.openPullRequest(self),

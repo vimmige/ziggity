@@ -15,7 +15,6 @@ const App = app_mod.App;
 
 pub fn startCommitPrompt(app: *App, no_verify: bool) !void {
     if (app.git.amend_view != null) return startAmendReword(app);
-    if (app.data.state == .rebasing and app.git.isRebaseEdit()) return startAmendReword(app);
     if (app.data.stagedCount() == 0) {
         try app.setMessage("stage files before committing", .{});
         return;
@@ -44,7 +43,7 @@ pub fn startCommitPrompt(app: *App, no_verify: bool) !void {
     // would — see git.prepareCommitMsg. Skipped when the message is preserved so
     // the hook never clobbers text the user was in the middle of writing.
     var seeded = false;
-    if (!restored and app.data.state == .rebasing) {
+    if (!restored and app.data.state == .rebasing and !app.git.isRebaseEdit()) {
         const message = try app.git.commitMessage("REBASE_HEAD");
         defer app.allocator.free(message);
         const subject_end = std.mem.indexOfScalar(u8, message, '\n') orelse message.len;
@@ -261,7 +260,10 @@ pub fn amendLastCommit(app: *App) !void {
 
 /// Open the commit editor prefilled with HEAD's message so an amend can reword
 /// it while folding in staged changes. Submitting runs `git commit --amend -m`.
-fn startAmendReword(app: *App) !void {
+pub fn startAmendReword(app: *App) !void {
+    if (app.data.state != .clean and !(app.data.state == .rebasing and app.git.isRebaseEdit())) {
+        return app.setMessage("finish the in-progress operation first (m)", .{});
+    }
     const message = try app.git.commitMessage("HEAD");
     defer app.allocator.free(message);
     const subject_end = std.mem.indexOfScalar(u8, message, '\n') orelse message.len;

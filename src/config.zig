@@ -77,6 +77,7 @@ pub const KeyMap = struct {
     discard_all: Binding = .{ .codepoint = 'D' },
     commit: Binding = .{ .codepoint = 'c' },
     amend: Binding = .{ .codepoint = 'A' },
+    amend_message: Binding = .{ .codepoint = 'C' },
     cherry_pick: Binding = .{ .codepoint = 'c' },
     reset_cherry_pick: Binding = .{ .codepoint = 'C' },
     tag_commit: Binding = .{ .codepoint = 'T' },

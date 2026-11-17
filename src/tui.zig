@@ -2302,9 +2302,10 @@ const help_lines = [_][]const u8{
     "Files  (tabs: Files, Worktrees, Submodules — [ and ] switch)",
     "  space          stage (whole dir in tree view); unstage in Staged",
     "  a              stage all; unstage all in Staged",
-    "  c              commit",
+    "  c              new commit (also during rebase); amend in amend view",
     "  w              commit with --no-verify (skip hooks)",
-    "  A              amend the last commit",
+    "  A              enter amend view; then c edits the last commit's message",
+    "  C              edit the last commit's message and amend staged changes",
     "  e              open the file in your editor",
     "  i              ignore (.gitignore) or exclude (.git/info/exclude) the file",
     "  y              copy the file path to the clipboard",
@@ -2351,8 +2352,9 @@ const help_lines = [_][]const u8{
     "  [              switch to the unstaged side",
     "  ]              switch to the staged side",
     "  \\              toggle split view (unstaged | staged)",
-    "  c              commit the staged changes",
-    "  A              amend the staged changes",
+    "  c              new commit; amend in amend view",
+    "  A              enter amend view; then c edits the last commit's message",
+    "  C              edit the last commit's message and amend staged changes",
     "  e              open the file in your editor",
     "",
     "Branches  (tabs: Local, Remotes, Tags)",
@@ -3027,7 +3029,7 @@ fn drawCommitPopup(root: vaxis.Window, app: *app_mod.App) void {
         .amend_fixup => "Amend into commit (new message)",
         .amend => "Amend last commit (message)",
         .cherry_pick_commit => "Cherry-pick (edit message)",
-        .create => "Commit message",
+        .create => "New commit",
     };
     const win = popup(root, w, 12, title, null);
 
@@ -5686,7 +5688,7 @@ fn footerHints(c: FooterCtx) []const u8 {
         return "j/k line  v range  space add/remove line (@@=hunk)  ^p patch  e edit  esc back" ++ global;
     }
     if (c.staging) {
-        return "j/k line  J/K hunk  v range  space stage/unstage  d discard (@@=hunk)  [/] staged/unstaged  \\ split  | side-by-side  c/A commit/amend  e edit  esc back" ++ global;
+        return "j/k line  J/K hunk  v range  space stage/unstage  d discard (@@=hunk)  [/] staged/unstaged  \\ split  | side-by-side  c/A commit/amend  C amend message  e edit  esc back" ++ global;
     }
     // A commit's file list, building a custom patch: `space` toggles the whole
     // file, `enter` opens per-line selection, `^p` opens the patch menu, `e`
@@ -5725,10 +5727,10 @@ fn footerHints(c: FooterCtx) []const u8 {
             .tags => "space checkout  n new-tag  d delete  f fetch  P push  g reset  y copy  w worktree  W diff  [/] tabs" ++ global_branches,
         };
     }
-    if (c.focus == .staged) return "space unstage  a unstage all  c commit  A amend  enter hunks  ` tree  ~ fold tree" ++ global;
+    if (c.focus == .staged) return "space unstage  a unstage all  c commit  C amend message  A amend  enter hunks  ` tree  ~ fold tree" ++ global;
     if (c.focus == .files) {
         return switch (c.files_tab) {
-            .files => "space stage  a all  c/w commit/no-verify  A amend  e edit  d discard  i ignore/exclude  y copy  ^f fixup-base  s stash  / filter  ` tree  enter hunks  [/] tabs" ++ global,
+            .files => "space stage  a all  c/w commit/no-verify  C amend message  A amend  e edit  d discard  i ignore/exclude  y copy  ^f fixup-base  s stash  / filter  ` tree  enter hunks  [/] tabs" ++ global,
             .worktrees => "enter switch  n new  o editor  d remove  [/] tabs" ++ global,
             .submodules => "enter enter  space update  n add  e edit-url  d remove  b bulk  [/] tabs" ++ global,
         };

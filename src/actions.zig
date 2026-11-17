@@ -32,6 +32,7 @@ pub const Action = enum {
     cycle_status_filter,
     start_commit,
     amend_commit,
+    amend_message,
     cherry_pick,
     reset_cherry_pick,
     tag_commit,
@@ -200,6 +201,7 @@ pub fn isFilesContentAction(self: Action) bool {
         .start_commit,
         .commit_no_verify,
         .amend_commit,
+        .amend_message,
         .conflict_menu,
         .open_status_filter,
         .cycle_status_filter,
@@ -354,6 +356,7 @@ pub fn fromNormalKey(key: vaxis.Key, keymap: config_mod.KeyMap, focus: model.Foc
             if (keymap.commit.matches(key)) return .start_commit;
             if (keymap.commit_no_verify.matches(key)) return .commit_no_verify;
             if (keymap.amend.matches(key)) return .amend_commit;
+            if (keymap.amend_message.matches(key)) return .amend_message;
             if (keymap.ignore_file.matches(key)) return .ignore_file;
             if (keymap.copy_file_info.matches(key)) return .copy_file_info;
             if (keymap.find_fixup_base.matches(key)) return .find_fixup_base;
