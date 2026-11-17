@@ -91,7 +91,7 @@ pub fn start(app: *App) !void {
     app.mode = .rebase_plan;
     app.resetMainView();
     try app.updatePreview();
-    try app.setMessage("interactive rebase: p/d/s/f/e mark, v/shift+arrows select, ^j/^k move, tab inspect, enter run, esc cancel", .{});
+    try app.setMessage("interactive rebase: p/d/s/f/e mark, v/shift+arrows select, alt+j/k move, tab inspect, enter run, esc cancel", .{});
 }
 
 /// The inclusive [lo, hi] plan rows the action/move applies to: the multi-commit
@@ -164,8 +164,8 @@ pub fn handleKey(app: *App, key: vaxis.Key) !void {
         return;
     }
     // Reorder the selected entry/block within the plan (newest-first display).
-    if (km.commit_move_up.matches(key)) return moveBlock(app, false);
-    if (km.commit_move_down.matches(key)) return moveBlock(app, true);
+    if (km.commit_move_up.matches(key) or key.matches(vaxis.Key.up, .{ .alt = true })) return moveBlock(app, false);
+    if (km.commit_move_down.matches(key) or key.matches(vaxis.Key.down, .{ .alt = true })) return moveBlock(app, true);
 
     // Set the action for the selected entry, or every entry in the selection.
     const action: ?Action = if (km.commit_drop.matches(key))

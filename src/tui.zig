@@ -2253,6 +2253,8 @@ const help_lines = [_][]const u8{
     "  l, right       focus the panel on the right",
     "  j, down        move the selection down",
     "  k, up          move the selection up",
+    "  ctrl+j/down    move down five lines",
+    "  ctrl+k/up      move up five lines",
     "  tab            focus the Diff panel (tab again returns)",
     "  H, shift+left    scroll the focused panel left (long rows)",
     "  L, shift+right   scroll the focused panel right (long rows)",
@@ -2444,15 +2446,15 @@ const help_lines = [_][]const u8{
     "  /              filter the log by message, author or path (esc clears)",
     "  b              bisect menu (start, then mark good/bad/skip/reset)",
     "  ctrl+p         custom patch menu (apply, remove from commit, reset)",
-    "  ctrl+j         move the commit down",
-    "  ctrl+k         move the commit up",
+    "  alt+j          move the commit down",
+    "  alt+k          move the commit up",
     "  ctrl+l         commit graph viewer — the current branch and its upstream",
     "                 (so incoming commits show); a toggles all branches, @ jumps",
     "                 to the current commit (HEAD). Its own keys show in its footer.",
     "  i              interactive rebase — a plan editor for the commits down",
     "                 to the selected one. p/d/s/f/e mark pick/drop/squash/",
-    "                 fixup/edit; v or shift+arrows select a range; ctrl+j and",
-    "                 ctrl+k reorder; tab inspects, enter runs it, esc cancels.",
+    "                 fixup/edit; v or shift+arrows select a range; alt+j and",
+    "                 alt+k (or alt+arrows) reorder; tab inspects, enter runs it, esc cancels.",
     "                 In a commit's file list: space toggles a whole file into",
     "                 the patch, enter opens the file to pick lines, e opens",
     "                 the editor, d discards the file's changes from the commit.",
@@ -5682,7 +5684,7 @@ fn footerHints(c: FooterCtx) []const u8 {
     const local_branch_tail = "  [/] tabs" ++ global_branches;
     if (c.rebase_plan) {
         if (c.focus == .main) return "j/k scroll  H/L pan  tab/esc back  z fullscreen  ^w wrap";
-        return "j/k move  p pick  d drop  s squash  f fixup  e edit  ^j/^k reorder  tab inspect  enter run  esc cancel";
+        return "j/k move  p pick  d drop  s squash  f fixup  e edit  alt+j/k reorder  tab inspect  enter run  esc cancel";
     }
     if (c.staging_patch) {
         return "j/k line  v range  space add/remove line (@@=hunk)  ^p patch  e edit  esc back" ++ global;
@@ -5744,7 +5746,7 @@ fn footerHints(c: FooterCtx) []const u8 {
         else if (c.reflog)
             "enter files  space checkout  g reset  n new-branch  c/V/C copy/paste/clear commit  y copy menu  o browser  W diff  [/] tabs" ++ global
         else
-            "enter files  space checkout  n/N branch/move  T tag  g reset  t revert  x verify-sig  c/V/C copy/paste/clear commit  y copy menu  d/s/f/e/r rebase  F fixup  S autosquash  B mark-base  G pr  ^l graph  W diff  / filter  b bisect  ^j/^k move" ++ global,
+            "enter files  space checkout  n/N branch/move  T tag  g reset  t revert  x verify-sig  c/V/C copy/paste/clear commit  y copy menu  d/s/f/e/r rebase  F fixup  S autosquash  B mark-base  G pr  ^l graph  W diff  / filter  b bisect  alt+j/k move" ++ global,
         .stash => "space apply  g pop  d drop  r rename  w patch  y copy  enter view" ++ global,
         .main => if (c.main_patch_file)
             (if (c.fullscreen)

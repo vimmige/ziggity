@@ -58,8 +58,8 @@ that is the only valid `git reset` target.
 ![Commit graph viewer](screenshots/04-commit-graph.png)
 
 Full interactive rebase: press `i` on a commit to open a plan editor, mark
-`pick` / `drop` / `squash` / `fixup` / `edit`, reorder with `ctrl+j` and
-`ctrl+k`, then run it.
+`pick` / `drop` / `squash` / `fixup` / `edit`, reorder with `alt+j` and
+`alt+k`, then run it.
 
 ![Interactive rebase plan editor](screenshots/10-rebase-plan.png)
 
@@ -309,7 +309,7 @@ The animation itself is in the [README](../README.md).
 ### Interactive rebase & patches
 
 - Per commit interactive rebase: drop (`d`), squash (`s`), fixup (`f`), edit
-  (`e`), reword (`r`), move (`ctrl+j` and `ctrl+k`), mark a fixup/amend (`F`),
+  (`e`), reword (`r`), move (`alt+j` and `alt+k`), mark a fixup/amend (`F`),
   autosquash (`S`). Drop and squash confirm first (rewriting history), skippable
   via `skip_confirm.drop_commit` / `skip_confirm.squash_commit`. Dropping a merge
   commit uses a dedicated `git rebase --onto <merge>^1 <merge>` path (removing the

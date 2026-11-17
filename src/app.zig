@@ -3557,7 +3557,7 @@ pub const App = struct {
     /// otherwise leave the cursor on the now-older commit.
     select_top_commit_pending: bool = false,
     /// Target Commits-panel index to land on after the next successful commits
-    /// reload, used by the reorder actions (ctrl+j/ctrl+k) so the moved commit
+    /// reload, used by the reorder actions (alt+j/alt+k) so the moved commit
     /// stays under the cursor. Like `select_top_commit_pending`, it overrides the
     /// keep-by-hash restore (a reorder rewrites the moved commit's hash, so it
     /// could not be re-found anyway). Set when the reorder is requested and
@@ -4974,6 +4974,21 @@ pub const App = struct {
             .commit_prompt, .file_filter_prompt, .branch_filter_prompt, .text_prompt, .credential_prompt => {},
             else => return,
         };
+        const navigation_mode = switch (self.mode) {
+            .commit_prompt, .file_filter_prompt, .branch_filter_prompt, .text_prompt, .credential_prompt, .confirmation => false,
+            .help => !self.help_searching,
+            else => true,
+        };
+        if (navigation_mode) {
+            const down = key.matches('j', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{ .ctrl = true });
+            const up = key.matches('k', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{ .ctrl = true });
+            if (down or up) {
+                for (0..5) |_| {
+                    try self.handleKey(.{ .codepoint = if (down) vaxis.Key.down else vaxis.Key.up });
+                }
+                return;
+            }
+        }
         if (self.mode == .commit_prompt) {
             try commits_mod.handleCommitPromptKey(self, key);
             return;
@@ -14276,6 +14291,20 @@ test "help dialog scrolling clamps at the bottom and resumes up immediately" {
     const up = vaxis.Key{ .codepoint = 'k' };
     try app.handleKey(up);
     try std.testing.expectEqual(@as(usize, 1), app.help_scroll);
+
+    app.help_max_scroll = 12;
+    inline for (.{ .{ 'j', 'k' }, .{ vaxis.Key.down, vaxis.Key.up } }) |keys| {
+        app.help_scroll = 6;
+        try app.handleKey(.{ .codepoint = keys[0], .mods = .{ .ctrl = true } });
+        try std.testing.expectEqual(@as(usize, 11), app.help_scroll);
+        try app.handleKey(.{ .codepoint = keys[0], .mods = .{ .ctrl = true } });
+        try std.testing.expectEqual(@as(usize, 12), app.help_scroll);
+        try app.handleKey(.{ .codepoint = keys[1], .mods = .{ .ctrl = true } });
+        try std.testing.expectEqual(@as(usize, 7), app.help_scroll);
+        app.help_scroll = 2;
+        try app.handleKey(.{ .codepoint = keys[1], .mods = .{ .ctrl = true } });
+        try std.testing.expectEqual(@as(usize, 0), app.help_scroll);
+    }
 }
 
 test "help search edits text before navigation and escape clears before closing" {
@@ -14948,8 +14977,8 @@ test "rebase plan range-marks and block-moves multiple commits" {
     try std.testing.expectEqual(rebaseplan_mod.Action.drop, app.rebase_plan.?[1].action);
     try std.testing.expectEqual(rebaseplan_mod.Action.pick, app.rebase_plan.?[2].action);
 
-    // ctrl+j (move_down) slides the {a,b} block below c; c rises to the top.
-    try rebaseplan_mod.handleKey(&app, vaxis.Key{ .codepoint = 'j', .mods = .{ .ctrl = true } });
+    // alt+j (move_down) slides the {a,b} block below c; c rises to the top.
+    try rebaseplan_mod.handleKey(&app, vaxis.Key{ .codepoint = 'j', .mods = .{ .alt = true } });
     try std.testing.expectEqualStrings("ccccccc", app.rebase_plan.?[0].short_hash);
     try std.testing.expectEqualStrings("aaaaaaa", app.rebase_plan.?[1].short_hash);
     try std.testing.expectEqualStrings("bbbbbbb", app.rebase_plan.?[2].short_hash);
@@ -14957,6 +14986,15 @@ test "rebase plan range-marks and block-moves multiple commits" {
     const b2 = rebaseplan_mod.bounds(&app);
     try std.testing.expectEqual(@as(usize, 1), b2.lo);
     try std.testing.expectEqual(@as(usize, 2), b2.hi);
+
+    try app.handleKey(.{ .codepoint = vaxis.Key.up, .mods = .{ .alt = true } });
+    try std.testing.expectEqualStrings("aaaaaaa", app.rebase_plan.?[0].short_hash);
+    try std.testing.expectEqualStrings("bbbbbbb", app.rebase_plan.?[1].short_hash);
+    try std.testing.expectEqualStrings("ccccccc", app.rebase_plan.?[2].short_hash);
+    try app.handleKey(.{ .codepoint = vaxis.Key.down, .mods = .{ .alt = true } });
+    try std.testing.expectEqualStrings("ccccccc", app.rebase_plan.?[0].short_hash);
+    try std.testing.expectEqualStrings("aaaaaaa", app.rebase_plan.?[1].short_hash);
+    try std.testing.expectEqualStrings("bbbbbbb", app.rebase_plan.?[2].short_hash);
 
     rebaseplan_mod.cancel(&app);
 }
@@ -20539,7 +20577,7 @@ test "dropRecentAt compacts the recent list around the removed index" {
     app.recent_repos = &.{};
 }
 
-test "ctrl+k / ctrl+j defer the cursor move to the reorder's target index" {
+test "alt+k / alt+j defer the cursor move to the reorder's target index" {
     const allocator = std.testing.allocator;
     var no_files = [_]model.FileStatus{};
 
@@ -20562,7 +20600,7 @@ test "ctrl+k / ctrl+j defer the cursor move to the reorder's target index" {
         }
     }.f;
 
-    // move_up (ctrl+k): the middle commit (index 1) will land one row newer.
+    // move_up (alt+k): the middle commit (index 1) will land one row newer.
     // The cursor is NOT moved now (that would be wrong if the rebase fails); a
     // pending target is set, applied only when a successful reload lands.
     {
@@ -20579,7 +20617,7 @@ test "ctrl+k / ctrl+j defer the cursor move to the reorder's target index" {
         try std.testing.expectEqual(@as(usize, 1), app.commit_index); // not moved yet
     }
 
-    // move_down (ctrl+j): the middle commit will land one row older.
+    // move_down (alt+j): the middle commit will land one row older.
     {
         var app = try testApp(allocator, &no_files);
         defer deinitTestApp(&app);

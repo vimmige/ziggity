@@ -28,6 +28,9 @@ the written reference. Every binding is remappable, see
 ## Full keybinding reference
 
 - `q` / `ctrl+c`: quit
+- `ctrl+j` / `ctrl+down`, `ctrl+k` / `ctrl+up`: move down or up five lines
+- `alt+j` / `alt+k` (Commits / rebase plan): reorder the selected commits;
+  `alt+down` / `alt+up` also reorder in the rebase plan
 - `R`: refresh
 - `?`: keybindings help overlay (`j` and `k` to scroll), opened to the
   section for the current panel
