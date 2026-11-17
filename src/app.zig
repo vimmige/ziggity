@@ -3484,6 +3484,21 @@ pub const TreeState = struct {
                         }
                     }
                 }
+                // The selected file disappeared: follow the next file, even if
+                // removing its directory changed the number of visible rows.
+                self.cursor = self.rows.len -| 1;
+                for (entries) |entry| {
+                    if (!std.mem.lessThan(u8, path, entry.path)) continue;
+                    for (self.rows, 0..) |row, i| {
+                        if (std.mem.eql(u8, row.path, entry.path) or
+                            (row.collapsed and filetree.underDir(entry.path, row.path)))
+                        {
+                            self.cursor = i;
+                            break :found;
+                        }
+                    }
+                    break;
+                }
             }
         }
         if (self.rows.len > 0) self.cursor = @min(self.cursor, self.rows.len - 1);
@@ -13493,19 +13508,8 @@ pub const App = struct {
     }
 
     pub fn clampSelections(self: *App) void {
-        if (self.data.files.len == 0) self.fileIndex().* = 0 else self.fileIndex().* = @min(self.fileIndex().*, self.data.files.len - 1);
-        self.normalizeFileSelectionForFilter();
         inline for (.{ model.Focus.files, model.Focus.staged }) |focus| {
-            const index = if (focus == .staged) &self.staged_index else &self.file_index;
-            index.* = @min(index.*, self.data.files.len -| 1);
-            if (self.data.files.len > 0 and !self.fileMatchesPanelFilter(self.data.files[index.*], focus)) {
-                for (self.data.files, 0..) |file, i| {
-                    if (self.fileMatchesPanelFilter(file, focus)) {
-                        index.* = i;
-                        break;
-                    }
-                }
-            }
+            self.normalizePanelFileSelection(focus);
         }
         const vbc = self.visibleBranchCount();
         if (vbc == 0) self.branch_index = 0 else self.branch_index = @min(self.branch_index, vbc - 1);
@@ -14073,13 +14077,23 @@ pub const App = struct {
     }
 
     fn normalizeFileSelectionForFilter(self: *App) void {
-        if (self.data.files.len == 0) {
-            self.fileIndex().* = 0;
-            return;
+        self.normalizePanelFileSelection(self.contentFocus());
+    }
+
+    fn normalizePanelFileSelection(self: *App, focus: model.Focus) void {
+        const index = if (focus == .staged) &self.staged_index else &self.file_index;
+        index.* = @min(index.*, self.data.files.len -| 1);
+        if (self.data.files.len > 0 and self.fileMatchesPanelFilter(self.data.files[index.*], focus)) return;
+        var previous: usize = 0;
+        for (self.data.files, 0..) |file, i| {
+            if (!self.fileMatchesPanelFilter(file, focus)) continue;
+            if (i >= index.*) {
+                index.* = i;
+                return;
+            }
+            previous = i;
         }
-        self.fileIndex().* = @min(self.fileIndex().*, self.data.files.len - 1);
-        if (self.fileMatchesFilter(self.data.files[self.fileIndex().*])) return;
-        self.fileIndex().* = self.firstMatchingFileIndex() orelse 0;
+        index.* = previous;
     }
 
     fn firstMatchingFileIndex(self: *const App) ?usize {
