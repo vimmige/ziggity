@@ -51,8 +51,8 @@ pub const Entry = struct {
 };
 
 /// `i` on the Commits tab: build a plan for the commits from HEAD down to (and
-/// including) the selected one, all initially `pick`, and enter plan mode.
-pub fn start(app: *App) !void {
+/// including) the selected one, or since the default-branch fork for `I`.
+pub fn start(app: *App, from_root: bool) !void {
     if (app.commits_tab != .commits) {
         try app.setMessage("interactive rebase applies to the Commits tab", .{});
         return;
@@ -61,12 +61,28 @@ pub fn start(app: *App) !void {
         try app.setMessage("finish the in-progress rebase/merge first (m)", .{});
         return;
     }
-    const commits = app.data.commits;
+    var git = app.git;
+    git.log_grep = null;
+    git.log_author = null;
+    git.log_path = null;
+    const fork = if (from_root) blk: {
+        const branch = try git.defaultBranch();
+        defer app.allocator.free(branch);
+        break :blk git.mergeBaseWith(branch) catch {
+            try app.setMessage("no common base with {s}", .{branch});
+            return;
+        };
+    } else null;
+    defer if (fork) |base| app.allocator.free(base);
+    const range = if (fork) |base| try std.fmt.allocPrint(app.allocator, "{s}..HEAD", .{base}) else null;
+    defer if (range) |ref| app.allocator.free(ref);
+    const commits = if (range) |ref| try git.loadCommits(ref, null) else app.data.commits;
+    defer if (from_root) model.deinitCommits(app.allocator, commits);
     if (commits.len == 0) {
-        try app.setMessage("no commit selected", .{});
+        try app.setMessage("{s}", .{if (from_root) "no commits since the default-branch fork" else "no commit selected"});
         return;
     }
-    const i = @min(app.commit_index, commits.len - 1);
+    const i = if (from_root) commits.len - 1 else @min(app.commit_index, commits.len - 1);
 
     free(app); // drop any stale plan
     var entries = try app.allocator.alloc(Entry, i + 1);
@@ -83,8 +99,10 @@ pub fn start(app: *App) !void {
             .subject = try app.allocator.dupe(u8, c.subject),
         };
     }
-    // Base is the parent of the oldest commit in the plan (the last entry).
-    app.rebase_plan_base = try app.allocator.dupe(u8, commits[i].hash);
+    app.rebase_plan_base = if (fork) |base|
+        try app.allocator.dupe(u8, base)
+    else
+        try std.fmt.allocPrint(app.allocator, "{s}^", .{commits[i].hash});
     app.rebase_plan = entries;
     app.rebase_plan_index = i;
     app.rebase_plan_anchor = null;
@@ -239,7 +257,7 @@ fn execute(app: *App) !void {
     const todo = try aw.toOwnedSlice();
     defer app.allocator.free(todo);
 
-    const base_ref = try std.fmt.allocPrint(app.allocator, "{s}^", .{app.rebase_plan_base});
+    const base_ref = try app.allocator.dupe(u8, app.rebase_plan_base);
     defer app.allocator.free(base_ref);
 
     // Exit plan mode before queuing; the mutation owns its own copies.

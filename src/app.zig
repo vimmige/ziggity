@@ -5638,7 +5638,8 @@ pub const App = struct {
             .tag_commit => try self.startTagAtCommit(),
             .open_pull_request => try diffmode_mod.openPullRequest(self),
             .move_to_new_branch => try self.startMoveCommitsToNewBranch(),
-            .interactive_rebase => try rebaseplan_mod.start(self),
+            .interactive_rebase => try rebaseplan_mod.start(self, false),
+            .interactive_rebase_root => try rebaseplan_mod.start(self, true),
             .log_menu => try commitgraph_mod.open(self),
             .copy_commit_attr => {
                 if (self.selectedCommit() == null) {
@@ -14909,7 +14910,7 @@ test "i builds an interactive-rebase plan from HEAD down to the selected commit"
     app.commits_tab = .commits;
     app.commit_index = 1; // select the middle commit
 
-    try rebaseplan_mod.start(&app);
+    try rebaseplan_mod.start(&app, false);
     try std.testing.expectEqual(Mode.rebase_plan, app.mode);
     try std.testing.expectEqual(app.commit_index, app.rebase_plan_index);
     // Plan covers HEAD (index 0) down to the selected commit (index 1): 2 entries.
@@ -14917,7 +14918,7 @@ test "i builds an interactive-rebase plan from HEAD down to the selected commit"
     try std.testing.expectEqualStrings("aaaaaaa", app.rebase_plan.?[0].short_hash);
     try std.testing.expectEqualStrings("bbbbbbb", app.rebase_plan.?[1].short_hash);
     // Base is the parent of the oldest commit in the plan (the selected one).
-    try std.testing.expectEqualStrings("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", app.rebase_plan_base);
+    try std.testing.expectEqualStrings("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb^", app.rebase_plan_base);
     for (app.rebase_plan.?) |e| try std.testing.expectEqual(rebaseplan_mod.Action.pick, e.action);
 
     app.focus = .commits;
@@ -14955,7 +14956,7 @@ test "rebase plan range-marks and block-moves multiple commits" {
     app.commits_tab = .commits;
     app.commit_index = 2; // plan covers all three commits
 
-    try rebaseplan_mod.start(&app);
+    try rebaseplan_mod.start(&app, false);
     try std.testing.expectEqual(@as(usize, 3), app.rebase_plan.?.len);
     app.rebase_plan_index = 0;
 
@@ -15019,7 +15020,7 @@ test "rebase plan drives the Commits panel scroll and scrollbar, not the log" {
     app.focus = .commits;
     app.commit_index = 15; // plan spans all 16 commits
 
-    try rebaseplan_mod.start(&app);
+    try rebaseplan_mod.start(&app, false);
     // The Commits panel's active list is now the 16-entry plan, not the log.
     try std.testing.expectEqual(@as(usize, 16), app.activeListLen(.commits));
 

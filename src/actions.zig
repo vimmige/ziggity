@@ -41,6 +41,7 @@ pub const Action = enum {
     copy_commit_attr,
     amend_attribute,
     interactive_rebase,
+    interactive_rebase_root,
     log_menu,
     recent_repos,
     toggle_wrap,
@@ -176,6 +177,7 @@ pub fn isDivergenceBlocked(self: Action) bool {
         .rebase_autosquash,
         .rebase_fixup,
         .interactive_rebase,
+        .interactive_rebase_root,
         .mark_base,
         .bisect_menu,
         .tag_commit,
@@ -393,6 +395,7 @@ pub fn fromNormalKey(key: vaxis.Key, keymap: config_mod.KeyMap, focus: model.Foc
             if (keymap.copy_commit_attr.matches(key)) return .copy_commit_attr;
             if (keymap.amend_attribute.matches(key)) return .amend_attribute;
             if (keymap.interactive_rebase.matches(key)) return .interactive_rebase;
+            if (keymap.interactive_rebase_root.matches(key)) return .interactive_rebase_root;
             if (keymap.log_menu.matches(key)) return .log_menu;
         },
         .stash => {

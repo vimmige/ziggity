@@ -1344,9 +1344,9 @@ pub const Git = struct {
         return .{ .stdout = result.stdout, .stderr = result.stderr, .term = result.term };
     }
 
-    pub fn loadCommits(self: *Git, ref_name: []const u8, limit: usize) ![]model.Commit {
-        const limit_arg = try std.fmt.allocPrint(self.allocator, "-{d}", .{limit});
-        defer self.allocator.free(limit_arg);
+    pub fn loadCommits(self: *Git, ref_name: []const u8, limit: ?usize) ![]model.Commit {
+        var limit_buf: [32]u8 = undefined;
+        const limit_arg = if (limit) |n| try std.fmt.bufPrint(&limit_buf, "-{d}", .{n}) else null;
 
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(self.allocator);
@@ -1357,8 +1357,8 @@ pub const Git = struct {
             // %P (parent hashes) feeds the inline commit graph.
             "--pretty=format:%H%x00%h%x00%an%x00%cr%x00%D%x00%P%x00%s",
             "--no-show-signature",
-            limit_arg,
         });
+        if (limit_arg) |arg| try argv.append(self.allocator, arg);
         // Commit ordering (date / topo / author-date) — topo keeps a branch's
         // commits contiguous so the inline graph's lanes stay readable.
         if (model.logOrderFlag(self.log_order)) |flag| try argv.append(self.allocator, flag);

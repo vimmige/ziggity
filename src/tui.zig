@@ -2451,6 +2451,7 @@ const help_lines = [_][]const u8{
     "  ctrl+l         commit graph viewer — the current branch and its upstream",
     "                 (so incoming commits show); a toggles all branches, @ jumps",
     "                 to the current commit (HEAD). Its own keys show in its footer.",
+    "  I              interactive rebase since the fork from the default branch",
     "  i              interactive rebase — a plan editor for the commits down",
     "                 to the selected one. p/d/s/f/e mark pick/drop/squash/",
     "                 fixup/edit; v or shift+arrows select a range; alt+j and",
@@ -5750,7 +5751,7 @@ fn footerHints(c: FooterCtx) []const u8 {
         else if (c.reflog)
             "enter files  space checkout  g reset  n new-branch  c/V/C copy/paste/clear commit  y copy menu  o browser  W diff  [/] tabs" ++ global
         else
-            "enter files  space checkout  n/N branch/move  T tag  g reset  t revert  x verify-sig  c/V/C copy/paste/clear commit  y copy menu  d/s/f/e/r rebase  F fixup  S autosquash  B mark-base  G pr  ^l graph  W diff  / filter  b bisect  alt+j/k move" ++ global,
+            "enter files  space checkout  n/N branch/move  T tag  g reset  t revert  x verify-sig  c/V/C copy/paste/clear commit  y copy menu  i/I plan/root  d/s/f/e/r rebase  F fixup  S autosquash  B mark-base  G pr  ^l graph  W diff  / filter  b bisect  alt+j/k move" ++ global,
         .stash => "space apply  g pop  d drop  r rename  w patch  y copy  enter view" ++ global,
         .main => if (c.main_patch_file)
             (if (c.fullscreen)

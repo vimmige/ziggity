@@ -156,6 +156,9 @@ the written reference. Every binding is remappable, see
   menu: plain paste onto HEAD, paste and edit the message (folds the copied
   commits into one new commit you reword), or paste without committing
   (`--no-commit`)
+- `I` (Commits): interactive rebase plan editor for commits since the common
+  ancestor with the default branch (`origin/HEAD`, else `main`/`master`),
+  ignoring log filters
 - `i` (Commits): interactive rebase plan editor; `tab` inspects the selected
   commit, `enter` runs the plan, `esc` cancels
 - `ctrl+l` (Commits): commit graph viewer (`j` and `k` move, `@` HEAD, `p`

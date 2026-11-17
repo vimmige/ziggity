@@ -86,6 +86,7 @@ pub const KeyMap = struct {
     copy_commit_attr: Binding = .{ .codepoint = 'y' },
     amend_attribute: Binding = .{ .codepoint = 'a' },
     interactive_rebase: Binding = .{ .codepoint = 'i' },
+    interactive_rebase_root: Binding = .{ .codepoint = 'I' },
     log_menu: Binding = .{ .codepoint = 'l', .ctrl = true },
     // Open the recent-repositories switcher: jump to another repo opened earlier
     // in this or a past session, without restarting.
