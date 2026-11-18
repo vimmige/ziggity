@@ -1702,8 +1702,8 @@ pub const Mutation = union(enum) {
     bisect_reset,
     amend_continue_rebase,
     apply_custom_patch: struct { patch: []const u8, reverse: bool },
-    remove_patch_from_commit: struct { base_ref: []const u8, todo: []const u8, patch: []const u8 },
-    rebase_todo: struct { base_ref: []const u8, todo: []const u8, message: ?[]const u8, expected_head: []const u8 = &.{} },
+    remove_patch_from_commit: struct { base_ref: []const u8, todo: []const u8, patch: []const u8, expected_head: []const u8 },
+    rebase_todo: struct { base_ref: []const u8, todo: []const u8, message: ?[]const u8, expected_head: []const u8 },
     /// A coalesced batch of stage/unstage work, so rapid space-toggles and the
     /// stage/unstage-all key run off the UI thread instead of blocking input on a
     /// synchronous git command. `all` (when set) runs `git add -A` / `git reset`
@@ -1801,21 +1801,8 @@ pub const Mutation = union(enum) {
             .bisect_reset => wgit.bisectReset(),
             .amend_continue_rebase => wgit.amendAndContinueRebase(),
             .apply_custom_patch => |x| wgit.applyCustomPatch(x.patch, x.reverse),
-            .remove_patch_from_commit => |x| wgit.removePatchFromCommit(x.base_ref, x.todo, x.patch),
-            .rebase_todo => |x| blk: {
-                if (x.expected_head.len > 0) {
-                    const head = wgit.historyHead() catch null;
-                    defer if (head) |value| gpa.free(value);
-                    if (head == null or !std.mem.eql(u8, head.?, x.expected_head)) {
-                        break :blk .{
-                            .stdout = &.{},
-                            .stderr = try gpa.dupe(u8, "Branch or HEAD changed. Open a new rebase plan."),
-                            .term = .{ .exited = 1 },
-                        };
-                    }
-                }
-                break :blk wgit.rebaseTodo(x.base_ref, x.todo, x.message);
-            },
+            .remove_patch_from_commit => |x| wgit.removePatchFromCommit(x.base_ref, x.todo, x.patch, x.expected_head),
+            .rebase_todo => |x| wgit.rebaseTodo(x.base_ref, x.todo, x.message, x.expected_head),
             .stage_batch => |b| blk: {
                 // All-op baseline first, then per-path overrides; report the
                 // first failure.
@@ -1890,7 +1877,15 @@ pub const Mutation = union(enum) {
             .bisect_reset => .bisect_reset,
             .amend_continue_rebase => .amend_continue_rebase,
             .apply_custom_patch => |x| .{ .apply_custom_patch = .{ .patch = try gpa.dupe(u8, x.patch), .reverse = x.reverse } },
-            .remove_patch_from_commit => |x| .{ .remove_patch_from_commit = .{ .base_ref = try gpa.dupe(u8, x.base_ref), .todo = try gpa.dupe(u8, x.todo), .patch = try gpa.dupe(u8, x.patch) } },
+            .remove_patch_from_commit => |x| blk: {
+                const base_ref = try gpa.dupe(u8, x.base_ref);
+                errdefer gpa.free(base_ref);
+                const todo = try gpa.dupe(u8, x.todo);
+                errdefer gpa.free(todo);
+                const patch = try gpa.dupe(u8, x.patch);
+                errdefer gpa.free(patch);
+                break :blk .{ .remove_patch_from_commit = .{ .base_ref = base_ref, .todo = todo, .patch = patch, .expected_head = try gpa.dupe(u8, x.expected_head) } };
+            },
             .rebase_todo => |x| blk: {
                 const base_ref = try gpa.dupe(u8, x.base_ref);
                 errdefer gpa.free(base_ref);
@@ -1986,6 +1981,7 @@ pub const Mutation = union(enum) {
                 gpa.free(x.base_ref);
                 gpa.free(x.todo);
                 gpa.free(x.patch);
+                gpa.free(x.expected_head);
             },
             .rebase_todo => |x| {
                 gpa.free(x.base_ref);
@@ -12088,7 +12084,7 @@ pub const App = struct {
         var cmd_buf: [128]u8 = undefined;
         const cmd = std.fmt.bufPrint(&cmd_buf, "git rebase -i {s} (remove patch, amend)", .{base_ref}) catch "git rebase -i";
         return self.requestMutation(
-            .{ .remove_patch_from_commit = .{ .base_ref = base_ref, .todo = todo, .patch = patch } },
+            .{ .remove_patch_from_commit = .{ .base_ref = base_ref, .todo = todo, .patch = patch, .expected_head = self.data.commits_head } },
             .{ .gerund = "removing patch", .command = cmd, .post = .clear_patch },
             "removed patch from commit",
             .{},

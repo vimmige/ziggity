@@ -153,7 +153,7 @@ pub fn runRebaseRange(app: *App, action: RebaseAction, lo: usize, hi: usize) !vo
     var run_buf: [96]u8 = undefined;
     const shown = std.fmt.bufPrint(&run_buf, "git rebase -i {s}", .{base_ref}) catch "git rebase -i";
     return app.requestMutation(
-        .{ .rebase_todo = .{ .base_ref = base_ref, .todo = todo, .message = null } },
+        .{ .rebase_todo = .{ .base_ref = base_ref, .todo = todo, .message = null, .expected_head = app.data.commits_head } },
         .{ .gerund = "rebasing", .command = shown },
         "{s} ({d} commits)",
         .{ action.label(), count },
@@ -261,7 +261,7 @@ fn submitCommitAmend(app: *App, i: usize, exec_cmd: []const u8, gerund: []const 
     defer app.allocator.free(todo);
 
     return app.requestMutation(
-        .{ .rebase_todo = .{ .base_ref = base_ref, .todo = todo, .message = null } },
+        .{ .rebase_todo = .{ .base_ref = base_ref, .todo = todo, .message = null, .expected_head = app.data.commits_head } },
         .{ .gerund = gerund, .command = "git rebase -i" },
         success_fmt,
         .{commits[i].short_hash},
@@ -508,7 +508,7 @@ pub fn discardFilesFromCommit(app: *App) !void {
     const count = paths.items.len;
     app.clearRange();
     return app.requestMutation(
-        .{ .rebase_todo = .{ .base_ref = base_ref, .todo = todo, .message = null } },
+        .{ .rebase_todo = .{ .base_ref = base_ref, .todo = todo, .message = null, .expected_head = app.data.commits_head } },
         .{ .gerund = "discarding from commit", .command = "git rebase -i", .refresh = App.Refresh.commit },
         "discarded {d} file(s) from {s}",
         .{ count, commits[i].short_hash },
@@ -565,7 +565,7 @@ pub fn runRebase(app: *App, action: RebaseAction, i: usize, message: ?[]const u8
         else => {},
     }
     return app.requestMutation(
-        .{ .rebase_todo = .{ .base_ref = base_ref, .todo = todo, .message = message } },
+        .{ .rebase_todo = .{ .base_ref = base_ref, .todo = todo, .message = message, .expected_head = app.data.commits_head } },
         .{ .gerund = "rebasing", .command = shown },
         "{s}",
         .{action.label()},

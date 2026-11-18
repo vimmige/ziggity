@@ -570,11 +570,11 @@ pub const Git = struct {
     /// caller's `edit` todo to stop at the source, reverse-apply the patch to
     /// the index and tree, amend, then continue. If the patch fails to apply
     /// the rebase is aborted; a conflict on continue is left for the user.
-    pub fn removePatchFromCommit(self: *Git, base_ref: []const u8, todo: []const u8, patch: []const u8) !ExecResult {
+    pub fn removePatchFromCommit(self: *Git, base_ref: []const u8, todo: []const u8, patch: []const u8, expected_head: []const u8) !ExecResult {
         const p = try self.writeTempFile(patch);
         defer self.removeTempFile(p);
 
-        var r1 = try self.rebaseTodo(base_ref, todo, null);
+        var r1 = try self.rebaseTodo(base_ref, todo, null, expected_head);
         if (!r1.ok()) return r1;
         r1.deinit(self.allocator);
 
@@ -602,8 +602,31 @@ pub const Git = struct {
     /// `sequence.editor` that copies it over git's generated todo; messages are
     /// accepted as-is (`core.editor=true`) unless `message` is given, in which
     /// case it replaces the message git would have opened (used for reword).
-    pub fn rebaseTodo(self: *Git, base_ref: []const u8, todo: []const u8, message: ?[]const u8) !ExecResult {
-        const todo_path = try self.writeTempFile(todo);
+    pub fn rebaseTodo(self: *Git, base_ref: []const u8, todo: []const u8, message: ?[]const u8, expected_head: []const u8) !ExecResult {
+        const head = self.historyHead() catch return self.rebaseFailure("Could not read HEAD. Refresh the commit list and try again.");
+        defer self.allocator.free(head);
+        if (!std.mem.eql(u8, head, expected_head)) {
+            return self.rebaseFailure("Branch or HEAD changed. Refresh the commit list and try again.");
+        }
+
+        const head_hash = historyHash(head);
+        const base: ?[]u8 = if (std.mem.eql(u8, base_ref, "--root")) null else self.revParse(base_ref) orelse
+            return self.rebaseFailure("Could not read the rebase base.");
+        defer if (base) |value| self.allocator.free(value);
+        const range = if (base) |value| try std.fmt.allocPrint(self.allocator, "{s}..{s}", .{ value, head_hash }) else head_hash;
+        defer if (base != null) self.allocator.free(range);
+        const history = self.output(&.{ "rev-list", "--reverse", "--topo-order", "--parents", range, "--" }) catch
+            return self.rebaseFailure("Could not read the full rebase history.");
+        defer self.allocator.free(history);
+        const complete = completeRebaseTodo(self.allocator, history, base orelse "", todo) catch |err| switch (err) {
+            error.NonLinearHistory => return self.rebaseFailure("This edit requires a linear range. The range includes a merge or a different branch."),
+            error.HiddenSquashTarget => return self.rebaseFailure("Squash would target a hidden commit. Clear the filter and choose the commits again."),
+            error.InvalidTodo => return self.rebaseFailure("The rebase selection no longer matches the branch history. Refresh and try again."),
+            else => return err,
+        };
+        defer self.allocator.free(complete);
+
+        const todo_path = try self.writeTempFile(complete);
         defer self.removeTempFile(todo_path);
 
         // The sequence editor copies our todo over git's; the commit-message
@@ -623,9 +646,15 @@ pub const Git = struct {
         try env.put("GIT_SEQUENCE_EDITOR", seq_editor);
         try env.put("GIT_EDITOR", msg_editor orelse "true");
 
-        const argv = [_][]const u8{ "git", "rebase", "-i", "--autostash", base_ref };
+        const current_head = self.historyHead() catch return self.rebaseFailure("Could not confirm HEAD before rebasing.");
+        defer self.allocator.free(current_head);
+        if (!std.mem.eql(u8, current_head, head)) {
+            return self.rebaseFailure("Branch or HEAD changed. Refresh the commit list and try again.");
+        }
+
+        const argv = [_][]const u8{ "git", "-c", "rebase.missingCommitsCheck=error", "rebase", "-i", "--autostash", "--no-rebase-merges", base orelse "--root" };
         self.recordCommand(argv[1..]);
-        const result = try runWithLockRetry(self.allocator, self.io, .{
+        const result = try std.process.run(self.allocator, self.io, .{
             .argv = &argv,
             .cwd = .{ .path = self.root },
             .environ_map = &env,
@@ -633,6 +662,71 @@ pub const Git = struct {
             .stderr_limit = .limited(4 * 1024 * 1024),
         });
         return .{ .stdout = result.stdout, .stderr = result.stderr, .term = result.term };
+    }
+
+    fn rebaseFailure(self: *Git, message: []const u8) !ExecResult {
+        return .{ .stdout = &.{}, .stderr = try self.allocator.dupe(u8, message), .term = .{ .exited = 1 } };
+    }
+
+    fn completeRebaseTodo(a: std.mem.Allocator, history: []const u8, base: []const u8, todo: []const u8) ![]u8 {
+        const Row = struct { index: usize, selected: bool = false };
+        var rows = std.StringHashMap(Row).init(a);
+        defer rows.deinit();
+        var hashes: std.ArrayList([]const u8) = .empty;
+        defer hashes.deinit(a);
+
+        var parent = base;
+        var history_lines = std.mem.tokenizeScalar(u8, history, '\n');
+        while (history_lines.next()) |line| {
+            var fields = std.mem.tokenizeScalar(u8, line, ' ');
+            const hash = fields.next() orelse return error.NonLinearHistory;
+            if (!std.mem.eql(u8, fields.next() orelse "", parent) or fields.next() != null) {
+                return error.NonLinearHistory;
+            }
+            try rows.put(hash, .{ .index = hashes.items.len });
+            try hashes.append(a, hash);
+            parent = hash;
+        }
+
+        var commands = std.mem.tokenizeScalar(u8, todo, '\n');
+        while (commands.next()) |line| {
+            if (std.mem.startsWith(u8, line, "exec ")) {
+                continue;
+            }
+            const split = std.mem.lastIndexOfScalar(u8, line, ' ') orelse return error.InvalidTodo;
+            const row = rows.getPtr(line[split + 1 ..]) orelse return error.InvalidTodo;
+            if (row.selected) {
+                return error.InvalidTodo;
+            }
+            row.selected = true;
+        }
+
+        var result: std.Io.Writer.Allocating = .init(a);
+        defer result.deinit();
+        var next: usize = 0;
+        commands.reset();
+        while (commands.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "exec ")) {
+                const split = std.mem.lastIndexOfScalar(u8, line, ' ').?;
+                const row = rows.get(line[split + 1 ..]).?;
+                while (next < row.index) : (next += 1) {
+                    const hash = hashes.items[next];
+                    if (!rows.get(hash).?.selected) {
+                        if (std.mem.startsWith(u8, line, "squash ") or std.mem.startsWith(u8, line, "fixup ")) {
+                            return error.HiddenSquashTarget;
+                        }
+                        try result.writer.print("pick {s}\n", .{hash});
+                    }
+                }
+            }
+            try result.writer.print("{s}\n", .{line});
+        }
+        for (hashes.items[next..]) |hash| {
+            if (!rows.get(hash).?.selected) {
+                try result.writer.print("pick {s}\n", .{hash});
+            }
+        }
+        return result.toOwnedSlice();
     }
 
     fn copyEditorCommand(self: *Git, path: []const u8) ![]u8 {
@@ -806,10 +900,13 @@ pub const Git = struct {
             else => return err,
         };
         errdefer self.allocator.free(head);
-        const hash = head[0 .. std.mem.indexOfScalar(u8, head, '\n') orelse head.len];
-        const commits = try self.loadCommits(hash, limit);
+        const commits = try self.loadCommits(historyHash(head), limit);
         self.markPushStatus(commits);
         return .{ .head = head, .commits = commits };
+    }
+
+    pub fn historyHash(head: []const u8) []const u8 {
+        return head[0 .. std.mem.indexOfScalar(u8, head, '\n') orelse head.len];
     }
 
     /// A cheap fingerprint of HEAD plus every ref, for the background
