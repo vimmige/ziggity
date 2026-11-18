@@ -7942,7 +7942,7 @@ pub const App = struct {
         drills_mod.deactivateBranchCommits(self); // frees branch commits + files, clears branch tree
         drills_mod.deactivateCommitFiles(self); // frees commit files, clears commit tree
         rebaseplan_mod.free(self); // frees any in-progress interactive-rebase plan
-        commitgraph_mod.freeGraph(self); // frees any loaded commit graph
+        commitgraph_mod.close(self);
         a.free(self.branch_commits_ref);
         self.branch_commits_ref = &.{};
 
@@ -7987,7 +7987,18 @@ pub const App = struct {
         self.preview_wanted = null;
         a.free(self.last_head);
         self.last_head = &.{};
+        self.worktree_refresh_requested = false;
+        self.external_check_requested = false;
+        self.last_refs_fingerprint = null;
+        self.pending_scopes = ScopeSet.empty;
+        self.commit_graph_requested = false;
+        self.bg_fetch_requested = false;
+        self.pr_status_requested = false;
         self.clearPrStatus();
+        self.clearPrRequest();
+        self.pr_gen_active = false;
+        self.freePrDoc();
+        self.resetCommitAiState();
         a.free(self.diff);
         self.diff = a.dupe(u8, "") catch &.{};
 

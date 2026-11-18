@@ -114,8 +114,8 @@ const WorkerCompletions = struct {
         return done;
     }
 
-    fn discard(self: *WorkerCompletions, done: WorkerDone) void {
-        _ = self.pending.fetchAnd(~done.bit(), .monotonic);
+    fn discardAll(self: *WorkerCompletions) void {
+        self.pending.store(0, .monotonic);
     }
 };
 
@@ -290,6 +290,13 @@ const GraphRun = struct {
     generation: u64,
     result: ?[]u8 = null,
     parents: ?[]u8 = null,
+
+    fn free(self: *GraphRun) void {
+        if (self.result) |r| async_allocator.free(r);
+        if (self.parents) |p| async_allocator.free(p);
+        self.result = null;
+        self.parents = null;
+    }
 };
 
 /// Append the revision scope shared by both graph passes: `--all` for every
@@ -757,8 +764,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
     var graph_future: ?std.Io.Future(void) = null;
     defer if (graph_future) |*f| {
         f.cancel(io);
-        if (graph_run.result) |r| async_allocator.free(r);
-        if (graph_run.parents) |p| async_allocator.free(p);
+        graph_run.free();
     };
 
     var bg_fetch_run: BgFetchRun = undefined;
@@ -1040,72 +1046,77 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
             render_needed = true;
         }
 
-        // A queued in-process re-root (entering/leaving a worktree or submodule):
-        // drain the read-only background workers — they borrow the old `root` —
-        // switch repositories, then start a fresh load against the new root.
-        // Mutations/network ops are gated by `foregroundBusy` in the request, so
-        // only these read-only futures can be in flight here.
+        // Join every worker borrowing the old paths before switching repos.
+        // Foreground operations already prevent a re-root request.
         if (app.reroot_request) |new_root| {
+            std.debug.assert(async_future == null and mutation_future == null and repo_load_future == null);
             if (preview_future) |*f| {
-                f.await(io);
+                f.cancel(io);
                 preview_future = null;
-                completions.discard(.preview_done);
                 if (preview_run.result) |r| async_allocator.free(r);
-                preview_run.result = null;
-                // The in-flight job is page-allocated (`buildPreviewJob`) and
-                // would otherwise leak on every re-root.
-                preview_run.job.deinit(std.heap.page_allocator);
+                app.completePreview(preview_run.job, null, async_allocator);
             }
             if (worktree_future) |*f| {
-                f.await(io);
+                f.cancel(io);
                 worktree_future = null;
-                completions.discard(.worktree_done);
                 if (worktree_run.result) |*r| r.deinit(async_allocator);
-                worktree_run.result = null;
+                app.worktree_refresh_active = false;
+            }
+            if (ext_check_future) |*f| {
+                f.cancel(io);
+                ext_check_future = null;
+                app.applyRefsFingerprint(null);
+            }
+            if (graph_future) |*f| {
+                f.cancel(io);
+                graph_future = null;
+                graph_run.free();
+                app.commit_graph_loading = false;
             }
             if (bg_fetch_future) |*f| {
-                f.await(io);
+                f.cancel(io);
                 bg_fetch_future = null;
-                completions.discard(.bg_fetch_done);
             }
-            // The worker borrows the old root. A first write can take tens of
-            // seconds on a huge repo, so cancel rather than wait; it's a cache.
             if (commit_graph_future) |*f| {
                 f.cancel(io);
                 commit_graph_future = null;
-                completions.discard(.commit_graph_done);
             }
-            app.commit_graph_requested = false;
             if (pr_status_future) |*f| {
-                f.await(io);
+                f.cancel(io);
                 pr_status_future = null;
-                completions.discard(.pr_status_done);
                 if (pr_status_run.result) |*r| r.deinit(async_allocator);
-                pr_status_run.result = null;
             }
             if (scoped_load_future) |*f| {
-                f.await(io);
+                f.cancel(io);
                 scoped_load_future = null;
-                completions.discard(.scoped_load_done);
                 if (scoped_load_run.result) |*r| r.deinit(async_allocator);
-                scoped_load_run.result = null;
                 scoped_load_run.freeFilters();
                 app.applyScopedLoad(null, async_allocator);
             }
             if (tags_load_future) |*f| {
                 f.cancel(io);
                 tags_load_future = null;
-                completions.discard(.tags_load_done);
                 if (tags_load_run.result) |*r| r.deinit(async_allocator);
                 app.applyTags(null, async_allocator);
             }
-            if (repo_load_future) |*f| {
-                f.await(io);
-                repo_load_future = null;
-                completions.discard(.repo_load_done);
-                if (repo_load_run.result) |*r| r.deinit(async_allocator);
-                repo_load_run.result = null;
+            if (ai_title_future) |*f| {
+                f.cancel(io);
+                ai_title_future = null;
+                ai_title_run.free();
             }
+            if (ai_desc_future) |*f| {
+                f.cancel(io);
+                ai_desc_future = null;
+                ai_desc_run.free();
+            }
+            if (pr_gen_future) |*f| {
+                f.cancel(io);
+                pr_gen_future = null;
+                pr_gen_run.free();
+                app.pr_gen_active = false;
+            }
+            // Any queued Vaxis wake just prompts a read of these bits.
+            completions.discardAll();
 
             app.reroot_request = null;
             const push = app.reroot_push;
