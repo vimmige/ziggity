@@ -60,11 +60,19 @@ pub fn createPatchFromSelectedStash(self: *App) !void {
         try self.setMessage("stash has no changes to patch", .{});
         return;
     }
-    const filename = try std.fmt.allocPrint(self.allocator, "stash-{d}.patch", .{entry.index});
-    defer self.allocator.free(filename);
-    self.git.writeWorkingFile(filename, res.stdout) catch {
-        try self.setMessage("could not write {s}", .{filename});
-        return;
+    var name_buf: [64]u8 = undefined;
+    const filename = try std.fmt.bufPrint(&name_buf, "stash-{d}.patch", .{entry.index});
+    const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.git.root, filename });
+    defer self.allocator.free(path);
+    const io = self.git.io;
+    var patch = std.Io.Dir.cwd().createFileAtomic(io, path, .{}) catch
+        return self.setMessage("could not write {s}", .{filename});
+    defer patch.deinit(io);
+    patch.file.writeStreamingAll(io, res.stdout) catch
+        return self.setMessage("could not write {s}", .{filename});
+    patch.link(io) catch |err| switch (err) {
+        error.PathAlreadyExists => return self.setMessage("{s} already exists", .{filename}),
+        else => return self.setMessage("could not write {s}", .{filename}),
     };
     // The new .patch is an untracked file — refresh so it shows in Files.
     self.refreshViews(App.Refresh.files);
