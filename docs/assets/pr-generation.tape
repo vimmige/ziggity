@@ -16,7 +16,7 @@ Set TypingSpeed 45ms
 Set Theme { "name": "TokyoNight Moon", "background": "#222436", "foreground": "#c8d3f5", "cursor": "#c8d3f5", "selection": "#2d3f76", "black": "#1b1d2b", "red": "#ff757f", "green": "#c3e88d", "yellow": "#ffc777", "blue": "#82aaff", "magenta": "#c099ff", "cyan": "#86e1fc", "white": "#828bb8", "brightBlack": "#444a73", "brightRed": "#ff757f", "brightGreen": "#c3e88d", "brightYellow": "#ffc777", "brightBlue": "#82aaff", "brightMagenta": "#c099ff", "brightCyan": "#86e1fc", "brightWhite": "#c8d3f5" }
 
 Hide
-Type "Z=$PWD/zig-out/bin/ziggity; cd /tmp/zdemo-pr && $Z"
+Type "Z=$PWD/zig-out/bin/ziggity; cd /tmp/zdemo-pr && ZIGGITY_CONFIG=/tmp/zdemo-ai.ini $Z"
 Enter
 Sleep 2.5s
 Show

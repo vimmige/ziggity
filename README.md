@@ -400,8 +400,7 @@ subscriptions you may already have, so there is no per-token bill.
    pi-ai login
    ```
 
-2. Point ziggity at it from your config (`<repo>/.ziggity.ini`, or the file in
-   `ZIGGITY_CONFIG` for every repo):
+2. Add these settings to the file in `ZIGGITY_CONFIG`.
 
    ```ini
    ai_command = pi -p
@@ -474,17 +473,15 @@ Every key, including the panel key tab cycling, is in
 
 ## Configuration
 
-Ziggity loads its defaults, then reads (each overriding the previous):
+Ziggity loads defaults, the file in `ZIGGITY_CONFIG`, then repository settings
+from `<repo>/.ziggity.ini`. Set `ZIGGITY_CONFIG` in your shell profile to the
+path of a file you control, for example
+`export ZIGGITY_CONFIG="$HOME/.config/ziggity/config.ini"`.
 
-1. the path in `ZIGGITY_CONFIG`
-2. `<repo>/.ziggity.ini`
-
-There is **no** auto loaded global file (no `~/.config/ziggity/`, no XDG
-path). To apply settings everywhere, point `ZIGGITY_CONFIG` at a file from
-your shell profile, e.g.
-`export ZIGGITY_CONFIG="$HOME/.config/ziggity/config.ini"`, and a repo's
-`.ziggity.ini` overrides those per repo. Without any file, settings fall back
-to per repo auto detection (notably the editor).
+Set custom commands (`command.*`), editor settings (`editor_*`), `ai_command`,
+`auto_generate_commit_*`, and `prepare_commit_msg_hook` in that file. The same
+applies to remaps for AI generation, file editing, and opening the commit dialog.
+Repository config can override other settings such as layout and colors.
 
 [docs/configuration.md](docs/configuration.md) is the annotated `.ini` with
 every setting, key and color, plus the staging layout and editor rules.

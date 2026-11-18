@@ -73,9 +73,7 @@ else
 fi
 AISTUB
 chmod +x /tmp/zdemo-ai.sh
-printf 'ai_command = bash /tmp/zdemo-ai.sh\n' > /tmp/zdemo-commit-ai/.ziggity.ini
-# Keep the config out of the Files panel so the recording shows only the change.
-printf '.ziggity.ini\n' >> /tmp/zdemo-commit-ai/.git/info/exclude
+printf 'ai_command = bash /tmp/zdemo-ai.sh\n' > /tmp/zdemo-ai.ini
 
 # --- /tmp/zdemo-pr: a feature branch ahead of main, wired to the stub ai_command
 # Records the AI PR-description demo offline: on the Branches panel, ctrl+g drafts
@@ -98,8 +96,6 @@ git commit -q -m "Track line and column in the lexer"
 printf 'pub fn next(l: *Lexer) ?Token {\n    return l.scan();\n}\n' >> src/lexer.zig
 git add src/lexer.zig
 git commit -q -m "Add next() token helper"
-printf 'ai_command = bash /tmp/zdemo-ai.sh\n' > /tmp/zdemo-pr/.ziggity.ini
-printf '.ziggity.ini\n' >> /tmp/zdemo-pr/.git/info/exclude
 
 # --- /tmp/zdemo-co: an origin with a feature branch not present locally ------
 rm -rf /tmp/zdemo-co

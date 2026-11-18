@@ -11213,7 +11213,7 @@ pub const App = struct {
     /// when `ai_command` is set and there's a branch/commit to describe).
     fn startAiGenerateMenu(self: *App) !void {
         if (!self.config.aiConfigured()) {
-            try self.setMessage("set ai_command to enable AI generation", .{});
+            try self.setMessage("set ai_command in ZIGGITY_CONFIG to enable AI", .{});
             return;
         }
         if (self.focus != .branches and self.focus != .commits) {
@@ -11265,7 +11265,7 @@ pub const App = struct {
     /// same source, open the base-ref prompt (branch), or generate (commit).
     fn startPrGeneration(self: *App) !void {
         if (!self.config.aiConfigured()) {
-            try self.setMessage("set ai_command to enable AI generation", .{});
+            try self.setMessage("set ai_command in ZIGGITY_CONFIG to enable AI", .{});
             return;
         }
         // Session save: a previously generated doc for this exact source reopens

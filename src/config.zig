@@ -301,6 +301,8 @@ pub const ConfirmSkips = struct {
 };
 
 pub const Config = struct {
+    const Source = enum { user, repository };
+
     side_panel_width_percent: u8 = 34,
     diff_context: u8 = 3,
     /// The commit-summary character count at which the counter in the commit /
@@ -458,26 +460,26 @@ pub const Config = struct {
         var cfg: Config = .{};
 
         if (env_map.get("ZIGGITY_CONFIG")) |path| {
-            try cfg.applyFile(allocator, io, path);
+            try cfg.applyFile(allocator, io, path, .user);
         }
 
         const repo_config = try std.fmt.allocPrint(allocator, "{s}/.ziggity.ini", .{repo_root});
         defer allocator.free(repo_config);
-        try cfg.applyFile(allocator, io, repo_config);
+        try cfg.applyFile(allocator, io, repo_config, .repository);
 
         return cfg;
     }
 
-    fn applyFile(self: *Config, allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    fn applyFile(self: *Config, allocator: std.mem.Allocator, io: std.Io, path: []const u8, source: Source) !void {
         const bytes = std.Io.Dir.readFileAlloc(.cwd(), io, path, allocator, .limited(64 * 1024)) catch |err| switch (err) {
             error.FileNotFound => return,
             else => |e| return e,
         };
         defer allocator.free(bytes);
-        self.applyBytes(bytes);
+        self.applyBytes(source, bytes);
     }
 
-    pub fn applyBytes(self: *Config, bytes: []const u8) void {
+    fn applyBytes(self: *Config, source: Source, bytes: []const u8) void {
         var lines = std.mem.splitScalar(u8, bytes, '\n');
         while (lines.next()) |raw_line| {
             const no_cr = std.mem.trim(u8, raw_line, "\r");
@@ -487,11 +489,11 @@ pub const Config = struct {
             const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
             const key = std.mem.trim(u8, line[0..eq], " \t");
             const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
-            self.applyEntry(key, value);
+            self.applyEntry(source, key, value);
         }
     }
 
-    fn applyEntry(self: *Config, key: []const u8, value: []const u8) void {
+    fn applyEntry(self: *Config, source: Source, key: []const u8, value: []const u8) void {
         if (std.mem.eql(u8, key, "side_panel_width_percent")) {
             const parsed = std.fmt.parseInt(u8, value, 10) catch return;
             self.side_panel_width_percent = @min(70, @max(20, parsed));
@@ -525,15 +527,15 @@ pub const Config = struct {
             if (parseBool(value)) |on| self.highlight_conventional_commits = on;
             return;
         }
-        if (std.mem.eql(u8, key, "ai_command")) {
+        if (source == .user and std.mem.eql(u8, key, "ai_command")) {
             self.ai_command.set(value);
             return;
         }
-        if (std.mem.eql(u8, key, "auto_generate_commit_title")) {
+        if (source == .user and std.mem.eql(u8, key, "auto_generate_commit_title")) {
             if (parseBool(value)) |on| self.auto_generate_commit_title = on;
             return;
         }
-        if (std.mem.eql(u8, key, "auto_generate_commit_description")) {
+        if (source == .user and std.mem.eql(u8, key, "auto_generate_commit_description")) {
             if (parseBool(value)) |on| self.auto_generate_commit_description = on;
             return;
         }
@@ -541,7 +543,7 @@ pub const Config = struct {
             if (parseBool(value)) |on| self.ai_commit_style_defaults = on;
             return;
         }
-        if (std.mem.eql(u8, key, "prepare_commit_msg_hook")) {
+        if (source == .user and std.mem.eql(u8, key, "prepare_commit_msg_hook")) {
             if (parseBool(value)) |on| self.prepare_commit_msg_hook = on;
             return;
         }
@@ -623,15 +625,15 @@ pub const Config = struct {
             if (std.meta.stringToEnum(model.FileSortOrder, value)) |v| self.file_sort_order = v;
             return;
         }
-        if (std.mem.eql(u8, key, "editor_preset")) {
+        if (source == .user and std.mem.eql(u8, key, "editor_preset")) {
             self.editor.preset.set(value);
             return;
         }
-        if (std.mem.eql(u8, key, "editor_command")) {
+        if (source == .user and std.mem.eql(u8, key, "editor_command")) {
             self.editor.command.set(value);
             return;
         }
-        if (std.mem.eql(u8, key, "editor_in_terminal")) {
+        if (source == .user and std.mem.eql(u8, key, "editor_in_terminal")) {
             if (parseBool(value)) |on| self.editor.in_terminal = on;
             return;
         }
@@ -647,7 +649,7 @@ pub const Config = struct {
             return;
         }
 
-        if (std.mem.startsWith(u8, key, "command.")) {
+        if (source == .user and std.mem.startsWith(u8, key, "command.")) {
             if (self.custom_count >= max_custom_commands) return;
             if (value.len == 0 or value.len > 256) return;
             const binding = parseBinding(key["command.".len..]) orelse return;
@@ -674,6 +676,11 @@ pub const Config = struct {
         const binding = parseBinding(value) orelse return;
         inline for (@typeInfo(KeyMap).@"struct".field_names) |fname| {
             if (std.mem.eql(u8, key_name, fname)) {
+                // These actions can run commands configured by the user.
+                const runs_command = comptime std.mem.eql(u8, fname, "ai_generate") or
+                    std.mem.eql(u8, fname, "edit_file") or std.mem.eql(u8, fname, "commit") or
+                    std.mem.eql(u8, fname, "commit_no_verify");
+                if (source == .repository and runs_command) return;
                 @field(self.keymap, fname) = binding;
                 return;
             }
@@ -711,7 +718,7 @@ pub fn parseBinding(raw: []const u8) ?Binding {
 
 test "config parser applies key overrides and bounded layout" {
     var cfg: Config = .{};
-    cfg.applyBytes(
+    cfg.applyBytes(.user,
         \\side_panel_width_percent = 80
         \\key.quit = x
         \\key.push = ctrl+p
@@ -736,7 +743,7 @@ test "reword_on_amend defaults off and parses" {
     const def: Config = .{};
     try std.testing.expect(!def.reword_on_amend);
     var cfg: Config = .{};
-    cfg.applyBytes("reword_on_amend = true");
+    cfg.applyBytes(.user, "reword_on_amend = true");
     try std.testing.expect(cfg.reword_on_amend);
 }
 
@@ -745,11 +752,11 @@ test "fetch_interval_secs defaults to 60 and parses (0 disables)" {
     try std.testing.expectEqual(@as(u16, 60), def.fetch_interval_secs);
 
     var cfg: Config = .{};
-    cfg.applyBytes("fetch_interval_secs = 120");
+    cfg.applyBytes(.user, "fetch_interval_secs = 120");
     try std.testing.expectEqual(@as(u16, 120), cfg.fetch_interval_secs);
 
     var off: Config = .{};
-    off.applyBytes("fetch_interval_secs = 0");
+    off.applyBytes(.user, "fetch_interval_secs = 0");
     try std.testing.expectEqual(@as(u16, 0), off.fetch_interval_secs);
 }
 
@@ -758,11 +765,11 @@ test "commit_summary_limit parses and defaults to 50" {
     try std.testing.expectEqual(@as(u16, 50), def.commit_summary_limit);
 
     var cfg: Config = .{};
-    cfg.applyBytes("commit_summary_limit = 72");
+    cfg.applyBytes(.user, "commit_summary_limit = 72");
     try std.testing.expectEqual(@as(u16, 72), cfg.commit_summary_limit);
 
     var off: Config = .{};
-    off.applyBytes("commit_summary_limit = 0");
+    off.applyBytes(.user, "commit_summary_limit = 0");
     try std.testing.expectEqual(@as(u16, 0), off.commit_summary_limit);
 }
 
@@ -771,11 +778,11 @@ test "commit_body_guide parses and defaults to 72" {
     try std.testing.expectEqual(@as(u16, 72), def.commit_body_guide);
 
     var cfg: Config = .{};
-    cfg.applyBytes("commit_body_guide = 80");
+    cfg.applyBytes(.user, "commit_body_guide = 80");
     try std.testing.expectEqual(@as(u16, 80), cfg.commit_body_guide);
 
     var off: Config = .{};
-    off.applyBytes("commit_body_guide = 0");
+    off.applyBytes(.user, "commit_body_guide = 0");
     try std.testing.expectEqual(@as(u16, 0), off.commit_body_guide);
 }
 
@@ -784,13 +791,13 @@ test "prepare_commit_msg_hook parses and defaults on" {
     try std.testing.expect(def.prepare_commit_msg_hook);
 
     var cfg: Config = .{};
-    cfg.applyBytes("prepare_commit_msg_hook = false");
+    cfg.applyBytes(.user, "prepare_commit_msg_hook = false");
     try std.testing.expect(!cfg.prepare_commit_msg_hook);
 }
 
 test "config parser applies theme colors and newer keybindings" {
     var cfg: Config = .{};
-    cfg.applyBytes(
+    cfg.applyBytes(.user,
         \\color.selected_bg = 5
         \\color.added = 2
         \\key.fast_forward = F
@@ -822,7 +829,7 @@ test "config parser applies result-dialog, command-output, and skip-confirm flag
     try std.testing.expect(!cfg.auto_generate_commit_description);
     try std.testing.expect(cfg.ai_commit_style_defaults); // built-in style guidance on by default
 
-    cfg.applyBytes(
+    cfg.applyBytes(.user,
         \\result_dialog = always
         \\command_output = silent
         \\ai_command = pi -p
@@ -862,7 +869,7 @@ test "config parser applies result-dialog, command-output, and skip-confirm flag
     try std.testing.expectEqual(CommandOutput.silent, cfg.command_output);
     try std.testing.expectEqual(model.BranchSortOrder.recency, cfg.branch_sort_order);
     try std.testing.expectEqual(model.FileSortOrder.status, cfg.file_sort_order); // default name, overridden
-    cfg.applyBytes("staging_split = auto");
+    cfg.applyBytes(.user, "staging_split = auto");
     try std.testing.expectEqual(StagingSplitMode.auto, cfg.staging_split);
     try std.testing.expect(cfg.skip_confirm.discard_all);
     try std.testing.expect(cfg.skip_confirm.amend);
@@ -877,11 +884,11 @@ test "config parser applies result-dialog, command-output, and skip-confirm flag
 test "fetch_prune_mode defaults to git and parses on, off, and bad values" {
     var cfg: Config = .{};
     try std.testing.expectEqual(model.FetchPruneMode.git, cfg.fetch_prune_mode); // default
-    cfg.applyBytes("fetch_prune_mode = off");
+    cfg.applyBytes(.user, "fetch_prune_mode = off");
     try std.testing.expectEqual(model.FetchPruneMode.off, cfg.fetch_prune_mode);
-    cfg.applyBytes("fetch_prune_mode = on");
+    cfg.applyBytes(.user, "fetch_prune_mode = on");
     try std.testing.expectEqual(model.FetchPruneMode.on, cfg.fetch_prune_mode);
-    cfg.applyBytes("fetch_prune_mode = nonsense"); // unknown: left unchanged
+    cfg.applyBytes(.user, "fetch_prune_mode = nonsense"); // unknown: left unchanged
     try std.testing.expectEqual(model.FetchPruneMode.on, cfg.fetch_prune_mode);
 }
 
@@ -890,23 +897,23 @@ test "footer_hint_rows defaults to 1 and parses a number, 0, or full" {
     try std.testing.expectEqual(@as(u16, 1), cfg.footer_hint_rows.rows); // default: single line
     try std.testing.expectEqual(@as(u16, 1), cfg.footer_hint_rows.cap());
 
-    cfg.applyBytes("footer_hint_rows = 4");
+    cfg.applyBytes(.user, "footer_hint_rows = 4");
     try std.testing.expectEqual(@as(u16, 4), cfg.footer_hint_rows.cap());
 
-    cfg.applyBytes("footer_hint_rows = 0"); // disabled -> single line (cap 1)
+    cfg.applyBytes(.user, "footer_hint_rows = 0"); // disabled -> single line (cap 1)
     try std.testing.expectEqual(model.FooterHintWrap.off, cfg.footer_hint_rows);
     try std.testing.expectEqual(@as(u16, 1), cfg.footer_hint_rows.cap());
 
-    cfg.applyBytes("footer_hint_rows = full");
+    cfg.applyBytes(.user, "footer_hint_rows = full");
     try std.testing.expectEqual(model.FooterHintWrap.full, cfg.footer_hint_rows);
 
-    cfg.applyBytes("footer_hint_rows = nonsense"); // bad value: unchanged
+    cfg.applyBytes(.user, "footer_hint_rows = nonsense"); // bad value: unchanged
     try std.testing.expectEqual(model.FooterHintWrap.full, cfg.footer_hint_rows);
 }
 
 test "config parser stores custom commands bound to keys" {
     var cfg: Config = .{};
-    cfg.applyBytes(
+    cfg.applyBytes(.user,
         \\command.C = git commit --amend --no-edit
         \\command.ctrl+t = ctags -R .
     );
