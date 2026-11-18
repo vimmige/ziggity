@@ -77,6 +77,7 @@ const Event = union(enum) {
     mutation_done,
     repo_load_done,
     scoped_load_done,
+    tags_load_done: usize,
     graph_done,
     pr_status_done,
     ai_title_done,
@@ -403,11 +404,12 @@ const MutationRun = struct {
     environ: *std.process.Environ.Map,
     mutation: app_mod.Mutation,
     result: ?git_mod.ExecResult = null,
+    checkout_head: ?[]u8 = null,
     amend_view: ?git_mod.Git.AmendView = null,
 };
 
 fn mutationWorker(mr: *MutationRun) void {
-    mr.result = mr.mutation.run(async_allocator, mr.io, mr.environ, mr.root, mr.git_dir, mr.amend_view) catch null;
+    mr.result = mr.mutation.run(async_allocator, mr.io, mr.environ, mr.root, mr.git_dir, mr.amend_view, &mr.checkout_head) catch null;
     _ = mr.loop.tryPostEvent(.mutation_done) catch false;
 }
 
@@ -452,6 +454,7 @@ const ScopedLoadRun = struct {
     untracked: git_mod.Git.UntrackedFiles = .all,
     commit_limit: usize = app_mod.commit_load_batch,
     result: ?app_mod.ScopedData = null,
+    tag_request: ?usize = null,
 
     amend_view: ?git_mod.Git.AmendView = null,
 
@@ -471,7 +474,7 @@ fn scopedLoadWorker(sr: *ScopedLoadRun) void {
         .author = sr.author,
         .path = sr.path,
     }, sr.branch_sort, sr.log_order, sr.untracked, sr.commit_limit, sr.amend_view);
-    _ = sr.loop.tryPostEvent(.scoped_load_done) catch false;
+    _ = sr.loop.tryPostEvent(if (sr.tag_request) |id| .{ .tags_load_done = id } else .scoped_load_done) catch false;
 }
 
 /// An off-thread AI commit-authoring request (one per field). Owns its command
@@ -742,6 +745,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
     defer if (mutation_future) |*f| {
         f.await(io);
         if (mutation_run.result) |*r| r.deinit(async_allocator);
+        if (mutation_run.checkout_head) |head| async_allocator.free(head);
         // The mutation payload is page-allocated (see `requestMutation`); free it
         // with the page allocator, not the worker's smp allocator.
         mutation_run.mutation.deinit(std.heap.page_allocator);
@@ -793,6 +797,13 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
         f.cancel(io); // read-only views, safe to interrupt on quit
         if (scoped_load_run.result) |*r| r.deinit(async_allocator);
         scoped_load_run.freeFilters();
+    };
+    var tags_load_run: ScopedLoadRun = undefined;
+    var tags_load_future: ?std.Io.Future(void) = null;
+    var tag_request: usize = 0;
+    defer if (tags_load_future) |*f| {
+        f.cancel(io);
+        if (tags_load_run.result) |*r| r.deinit(async_allocator);
     };
 
     // Size the screen up front so the first in-loop render is correctly sized
@@ -889,6 +900,11 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                 if (mutation_future) |*f| {
                     f.await(io);
                     mutation_future = null;
+                    if (mutation_run.checkout_head) |head| {
+                        defer async_allocator.free(head);
+                        // The checkout already queues history, so mark its HEAD as seen.
+                        if (head.len > 0) app.recordHead(head);
+                    }
                     try app.completeMutation(mutation_run.mutation, mutation_run.result, async_allocator);
                     mutation_run.result = null;
                 }
@@ -908,6 +924,14 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                     app.applyScopedLoad(scoped_load_run.result, async_allocator);
                     scoped_load_run.result = null;
                     scoped_load_run.freeFilters();
+                }
+            },
+            .tags_load_done => |id| {
+                if (id == tag_request and tags_load_future != null) {
+                    tags_load_future.?.await(io);
+                    tags_load_future = null;
+                    app.applyTags(tags_load_run.result, async_allocator);
+                    tags_load_run.result = null;
                 }
             },
             .graph_done => {
@@ -1023,6 +1047,13 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                 if (scoped_load_run.result) |*r| r.deinit(async_allocator);
                 scoped_load_run.result = null;
                 scoped_load_run.freeFilters();
+                app.applyScopedLoad(null, async_allocator);
+            }
+            if (tags_load_future) |*f| {
+                f.cancel(io);
+                tags_load_future = null;
+                if (tags_load_run.result) |*r| r.deinit(async_allocator);
+                app.applyTags(null, async_allocator);
             }
             if (repo_load_future) |*f| {
                 f.await(io);
@@ -1231,6 +1262,24 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                 };
                 render_needed = true;
             }
+        }
+
+        // Tag status can wait on a remote, so give it a worker of its own.
+        if (tags_load_future == null and app.takeTags()) {
+            tag_request +%= 1;
+            tags_load_run = .{
+                .io = io,
+                .loop = &loop,
+                .root = app.git.root,
+                .git_dir = app.git.git_dir,
+                .environ = app.git.environ,
+                .scopes = app_mod.ScopeSet.init(.{ .tags = true }),
+                .tag_request = tag_request,
+            };
+            tags_load_future = io.concurrent(scopedLoadWorker, .{&tags_load_run}) catch blk: {
+                app.applyTags(null, async_allocator);
+                break :blk null;
+            };
         }
 
         // Start a queued AI commit-title generation off the loop (single-flight).

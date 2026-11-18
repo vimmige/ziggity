@@ -1713,7 +1713,7 @@ pub const Mutation = union(enum) {
     /// Worker-thread entry point: run the mutation on a throwaway page-allocator
     /// `Git`. The wgit's command log (mutations are recorded) is page-allocated
     /// and freed here since the real app log is updated separately on request.
-    pub fn run(self: Mutation, gpa: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, root: []u8, git_dir: []const u8, amend_view: ?git_mod.Git.AmendView) !git_mod.ExecResult {
+    pub fn run(self: Mutation, gpa: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, root: []u8, git_dir: []const u8, amend_view: ?git_mod.Git.AmendView, checkout_head: *?[]u8) !git_mod.ExecResult {
         var wgit = git_mod.Git{ .allocator = gpa, .io = io, .environ = environ, .root = root, .git_dir = @constCast(git_dir), .amend_view = amend_view };
         defer {
             for (wgit.command_log.items) |e| gpa.free(e);
@@ -1725,8 +1725,11 @@ pub const Mutation = union(enum) {
             .commit => |x| wgit.commit(x.message, x.no_verify),
             .amend => wgit.amendCommit(),
             .amend_message => |m| wgit.amendCommitMessage(m),
-            .checkout => |b| wgit.checkout(b),
-            .checkout_track => |b| wgit.checkoutTrack(b),
+            .checkout, .checkout_track => |b| blk: {
+                const result = try if (self == .checkout) wgit.checkout(b) else wgit.checkoutTrack(b);
+                if (result.ok()) checkout_head.* = wgit.headHash() catch null;
+                break :blk result;
+            },
             .revert => |h| wgit.revertCommit(h),
             .revert_many => |hs| wgit.revertCommits(hs),
             .create_fixup => |h| wgit.createFixup(h),
@@ -4651,11 +4654,22 @@ pub const App = struct {
     /// flight (single in-flight; new requests accumulate until it finishes).
     pub fn takeScopes(self: *App) ?ScopeSet {
         if (self.scoped_load_active) return null;
-        if (self.pending_scopes.count() == 0) return null;
-        const scopes = self.pending_scopes;
-        self.pending_scopes = ScopeSet.empty;
+        var scopes = self.pending_scopes;
+        scopes.remove(.tags);
+        if (scopes.count() == 0) return null;
+        // Paint the Branches panel while the slower history refresh is still running.
+        if (scopes.contains(.branches) and scopes.contains(.commits)) {
+            scopes = ScopeSet.init(.{ .branches = true });
+        }
+        self.pending_scopes = self.pending_scopes.differenceWith(scopes);
         self.scoped_load_active = true;
         return scopes;
+    }
+
+    pub fn takeTags(self: *App) bool {
+        if (!self.pending_scopes.contains(.tags)) return false;
+        self.pending_scopes.remove(.tags);
+        return true;
     }
 
     /// The active Commits-list filters, so a scoped commits reload applies them.
@@ -4669,9 +4683,15 @@ pub const App = struct {
     /// untouched, so concurrent refreshes of other views don't conflict.
     pub fn applyScopedLoad(self: *App, sd_opt: ?ScopedData, gpa: std.mem.Allocator) void {
         self.scoped_load_active = false;
-        // Loads are single in-flight, so unless tags are still queued, the load
-        // that just finished was the one carrying them (loaded or failed).
+        self.applyScopedData(sd_opt, gpa);
+    }
+
+    pub fn applyTags(self: *App, sd_opt: ?ScopedData, gpa: std.mem.Allocator) void {
         if (!self.pending_scopes.contains(.tags)) self.tags_loading = false;
+        self.applyScopedData(sd_opt, gpa);
+    }
+
+    fn applyScopedData(self: *App, sd_opt: ?ScopedData, gpa: std.mem.Allocator) void {
         var sd = sd_opt orelse return;
         defer sd.deinit(gpa);
         const a = self.allocator;
@@ -4952,12 +4972,7 @@ pub const App = struct {
         // whose branch/commit data the initial load already brought in.
         if (snap.head.len > 0 and self.last_head.len > 0 and !std.mem.eql(u8, snap.head, self.last_head))
             self.refreshViews(Refresh.branches_commits);
-        if (!std.mem.eql(u8, snap.head, self.last_head)) {
-            if (self.allocator.dupe(u8, snap.head)) |dup| {
-                self.allocator.free(self.last_head);
-                self.last_head = dup;
-            } else |_| {}
-        }
+        self.recordHead(snap.head);
 
         const content = self.contentFocus();
         if (content.isFilePanel() or content == .status) {
@@ -4965,6 +4980,13 @@ pub const App = struct {
                 try self.setMessage("preview failed: {s}", .{@errorName(err)});
             };
         }
+    }
+
+    pub fn recordHead(self: *App, head: []const u8) void {
+        if (std.mem.eql(u8, head, self.last_head)) return;
+        const copy = self.allocator.dupe(u8, head) catch return;
+        self.allocator.free(self.last_head);
+        self.last_head = copy;
     }
 
     pub fn handleKey(self: *App, key: vaxis.Key) !void {
