@@ -6,6 +6,7 @@
 const std = @import("std");
 
 const app_mod = @import("app.zig");
+const commitops = @import("commitops.zig");
 const model = @import("model.zig");
 
 const App = app_mod.App;
@@ -85,13 +86,26 @@ pub fn start(app: *App, from_root: bool) !void {
         return;
     }
     const i = if (from_root) commits.len - 1 else @min(app.commit_index, commits.len - 1);
+    if (!from_root and commits[i].parents.len == 0 and head_hash.len > 0) {
+        var object = git.exec(&.{ "cat-file", "commit", commits[i].hash }) catch
+            return app.setMessage("Could not verify the root commit.", .{});
+        defer object.deinit(app.allocator);
+        const headers = std.mem.indexOf(u8, object.stdout, "\n\n") orelse
+            return app.setMessage("Could not verify the root commit.", .{});
+        if (!object.ok()) {
+            return app.setMessage("Could not verify the root commit.", .{});
+        }
+        if (std.mem.indexOf(u8, object.stdout[0..headers], "\nparent ") != null) {
+            return app.setMessage("Commit has missing parents. Deepen this shallow clone before rebasing.", .{});
+        }
+    }
 
     free(app); // drop any stale plan
     {
         const plan_base = if (fork) |base|
             try app.allocator.dupe(u8, base)
         else
-            try std.fmt.allocPrint(app.allocator, "{s}^", .{commits[i].hash});
+            try commitops.rebaseBaseRef(app.allocator, commits[i]);
         errdefer app.allocator.free(plan_base);
         const plan_head = try app.allocator.dupe(u8, app.data.commits_head);
         errdefer app.allocator.free(plan_head);

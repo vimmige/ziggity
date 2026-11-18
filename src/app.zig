@@ -14977,6 +14977,8 @@ test "i builds an interactive-rebase plan from HEAD down to the selected commit"
     app.data.commits = &commits;
     app.commits_tab = .commits;
     app.commit_index = 1; // select the middle commit
+    var middle_parents = [_][]u8{commits[2].hash};
+    commits[1].parents = &middle_parents;
 
     try rebaseplan_mod.start(&app, false);
     try std.testing.expectEqual(Mode.rebase_plan, app.mode);

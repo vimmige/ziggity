@@ -103,7 +103,7 @@ pub fn rebaseSelectedCommit(app: *App, action: RebaseAction) !void {
 /// `c` is the root commit. `<hash>^` is an invalid upstream for the root (it has
 /// no parent), which is why rewording/dropping/etc. the very first commit failed.
 /// Owned string; free with the same allocator.
-fn rebaseBaseRef(allocator: std.mem.Allocator, c: model.Commit) ![]u8 {
+pub fn rebaseBaseRef(allocator: std.mem.Allocator, c: model.Commit) ![]u8 {
     if (c.parents.len == 0) return allocator.dupe(u8, "--root");
     return std.fmt.allocPrint(allocator, "{s}^", .{c.hash});
 }
