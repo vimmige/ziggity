@@ -109,8 +109,23 @@ fn stripCommentLines(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     return allocator.dupe(u8, std.mem.trim(u8, out.items, " \t\r\n"));
 }
 
-fn literalPathspec(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, ":(literal){s}", .{path});
+const conflicting_pathspec_env = [_][]const u8{
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+};
+
+pub fn literalPathspecEnv(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) !?std.process.Environ.Map {
+    for (conflicting_pathspec_env) |key| {
+        if (environ.contains(key)) {
+            var env = try environ.clone(allocator);
+            for (conflicting_pathspec_env) |conflict| {
+                _ = env.swapRemove(conflict);
+            }
+            return env;
+        }
+    }
+    return null;
 }
 
 /// Run a process like `std.process.run`, but retry briefly on a transient git
@@ -342,7 +357,8 @@ pub const Git = struct {
     }
 
     fn recordCommand(self: *Git, args: []const []const u8) void {
-        if (isReadOnly(args)) return;
+        const command = if (hasLiteralPathspecs(args)) args[1..] else args;
+        if (isReadOnly(command)) return;
         var buf: std.Io.Writer.Allocating = .init(self.allocator);
         defer buf.deinit();
         buf.writer.writeAll("git") catch return;
@@ -376,6 +392,10 @@ pub const Git = struct {
         return .{ .stdout = result.stdout, .stderr = result.stderr, .term = result.term };
     }
 
+    fn hasLiteralPathspecs(args: []const []const u8) bool {
+        return args.len > 0 and std.mem.eql(u8, args[0], "--literal-pathspecs");
+    }
+
     pub fn exec(self: *Git, args: []const []const u8) !ExecResult {
         return self.execWithRetry(args, true);
     }
@@ -397,11 +417,13 @@ pub const Git = struct {
         try argv.append(self.allocator, "--no-optional-locks");
         try argv.appendSlice(self.allocator, args);
 
+        var env = if (hasLiteralPathspecs(args)) try literalPathspecEnv(self.allocator, self.environ) else null;
+        defer if (env) |*clean| clean.deinit();
         const options: std.process.RunOptions = .{
             .argv = argv.items,
             .cwd = .{ .path = self.root },
             // Also keep the env (GIT_TERMINAL_PROMPT=0, GIT_OPTIONAL_LOCKS=0).
-            .environ_map = self.environ,
+            .environ_map = if (env) |*clean| clean else self.environ,
             .stdout_limit = .limited(16 * 1024 * 1024),
             .stderr_limit = .limited(4 * 1024 * 1024),
         };
@@ -431,10 +453,10 @@ pub const Git = struct {
         const context_arg = try std.fmt.allocPrint(self.allocator, "--unified={d}", .{diff_context});
         defer self.allocator.free(context_arg);
         if (staged) {
-            if (self.stagingBaseRef()) |base| return self.output(&.{ "diff", "--staged", "--no-ext-diff", "--no-color", context_arg, base, "--", path });
-            return self.output(&.{ "diff", "--staged", "--no-ext-diff", "--no-color", context_arg, "--", path });
+            if (self.stagingBaseRef()) |base| return self.output(&.{ "--literal-pathspecs", "diff", "--staged", "--no-ext-diff", "--no-color", context_arg, base, "--", path });
+            return self.output(&.{ "--literal-pathspecs", "diff", "--staged", "--no-ext-diff", "--no-color", context_arg, "--", path });
         }
-        return self.output(&.{ "diff", "--no-ext-diff", "--no-color", context_arg, "--", path });
+        return self.output(&.{ "--literal-pathspecs", "diff", "--no-ext-diff", "--no-color", context_arg, "--", path });
     }
 
     /// The whole staged (or unstaged) diff with 3 lines of context — used to
@@ -646,8 +668,8 @@ pub const Git = struct {
     /// Resolve a conflicted file by keeping our side (or theirs), then stage it.
     pub fn resolveConflict(self: *Git, path: []const u8, take_theirs: bool) !ExecResult {
         const side = if (take_theirs) "--theirs" else "--ours";
-        if (try self.runStep(&.{ "checkout", side, "--", path })) |failure| return failure;
-        if (try self.runStep(&.{ "add", "--", path })) |failure| return failure;
+        if (try self.runStep(&.{ "--literal-pathspecs", "checkout", side, "--", path })) |failure| return failure;
+        if (try self.runStep(&.{ "--literal-pathspecs", "add", "--", path })) |failure| return failure;
         return self.successResult();
     }
 
@@ -1008,7 +1030,7 @@ pub const Git = struct {
     }
 
     pub fn updateSubmodule(self: *Git, path: []const u8) !ExecResult {
-        return self.exec(&.{ "submodule", "update", "--init", "--", path });
+        return self.exec(&.{ "--literal-pathspecs", "submodule", "update", "--init", "--", path });
     }
 
     pub fn addSubmodule(self: *Git, url: []const u8, path: []const u8) !ExecResult {
@@ -1018,19 +1040,19 @@ pub const Git = struct {
     /// Point the submodule at a new URL (in `.gitmodules`) and sync it into the
     /// active config.
     pub fn setSubmoduleUrl(self: *Git, path: []const u8, url: []const u8) !ExecResult {
-        var r = try self.exec(&.{ "submodule", "set-url", "--", path, url });
+        var r = try self.exec(&.{ "--literal-pathspecs", "submodule", "set-url", "--", path, url });
         if (!r.ok()) return r;
         r.deinit(self.allocator);
-        return self.exec(&.{ "submodule", "sync", "--", path });
+        return self.exec(&.{ "--literal-pathspecs", "submodule", "sync", "--", path });
     }
 
     /// Remove a submodule: deinit it, then `git rm` (which also drops its
     /// `.gitmodules` entry from the index).
     pub fn removeSubmodule(self: *Git, path: []const u8) !ExecResult {
-        var r = try self.exec(&.{ "submodule", "deinit", "-f", "--", path });
+        var r = try self.exec(&.{ "--literal-pathspecs", "submodule", "deinit", "-f", "--", path });
         if (!r.ok()) return r;
         r.deinit(self.allocator);
-        return self.exec(&.{ "rm", "-f", "--", path });
+        return self.exec(&.{ "--literal-pathspecs", "rm", "-f", "--", path });
     }
 
     pub const SubmoduleBulk = enum { init_all, update_all, update_recursive, deinit_all };
@@ -1579,7 +1601,7 @@ pub const Git = struct {
     pub fn diffForCommitFile(self: *Git, hash: []const u8, path: []const u8, diff_context: u32) ![]u8 {
         const context_arg = try std.fmt.allocPrint(self.allocator, "--unified={d}", .{diff_context});
         defer self.allocator.free(context_arg);
-        var result = try self.exec(&.{ "show", "-m", "--first-parent", hash, "--no-ext-diff", "--no-color", context_arg, "--format=", "--", path });
+        var result = try self.exec(&.{ "--literal-pathspecs", "show", "-m", "--first-parent", hash, "--no-ext-diff", "--no-color", context_arg, "--format=", "--", path });
         errdefer result.deinit(self.allocator);
         if (!result.ok()) return GitError.CommandFailed;
         self.allocator.free(result.stderr);
@@ -1613,7 +1635,7 @@ pub const Git = struct {
         if (paths.len == 0) return self.successResult();
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(self.allocator);
-        try args.appendSlice(self.allocator, &.{ "add", "--" });
+        try args.appendSlice(self.allocator, &.{ "--literal-pathspecs", "add", "--" });
         try args.appendSlice(self.allocator, paths);
         return self.exec(args.items);
     }
@@ -1622,7 +1644,7 @@ pub const Git = struct {
         if (paths.len == 0) return self.successResult();
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(self.allocator);
-        try args.appendSlice(self.allocator, &.{ "reset", self.stagingBaseRef() orelse "HEAD", "--" });
+        try args.appendSlice(self.allocator, &.{ "--literal-pathspecs", "reset", self.stagingBaseRef() orelse "HEAD", "--" });
         try args.appendSlice(self.allocator, paths);
         return self.exec(args.items);
     }
@@ -1640,9 +1662,9 @@ pub const Git = struct {
         if (file.isRename()) {
             if (try self.resetFilePaths(file)) |failure| return failure;
             if (file.previous_path) |previous| {
-                if (try self.runStep(&.{ "checkout", self.stagingBaseRef() orelse "HEAD", "--", previous })) |failure| return failure;
+                if (try self.runStep(&.{ "--literal-pathspecs", "checkout", self.stagingBaseRef() orelse "HEAD", "--", previous })) |failure| return failure;
             }
-            if (try self.runStep(&.{ "clean", "-fd", "--", file.path })) |failure| return failure;
+            if (try self.runStep(&.{ "--literal-pathspecs", "clean", "-fd", "--", file.path })) |failure| return failure;
             return self.successResult();
         }
 
@@ -1650,18 +1672,18 @@ pub const Git = struct {
             if (file.has_staged) {
                 if (try self.resetFilePaths(file)) |failure| return failure;
             }
-            if (try self.runStep(&.{ "clean", "-fd", "--", file.path })) |failure| return failure;
+            if (try self.runStep(&.{ "--literal-pathspecs", "clean", "-fd", "--", file.path })) |failure| return failure;
             return self.successResult();
         }
 
-        if (try self.runStep(&.{ "checkout", self.stagingBaseRef() orelse "HEAD", "--", file.path })) |failure| return failure;
+        if (try self.runStep(&.{ "--literal-pathspecs", "checkout", self.stagingBaseRef() orelse "HEAD", "--", file.path })) |failure| return failure;
         return self.successResult();
     }
 
     /// Discard only the unstaged (working-tree) changes for a file, keeping any
     /// staged changes intact by restoring the working tree from the index.
     pub fn discardUnstaged(self: *Git, file: model.FileStatus) !ExecResult {
-        return self.exec(&.{ "checkout", "--", file.path });
+        return self.exec(&.{ "--literal-pathspecs", "checkout", "--", file.path });
     }
 
     pub fn discardAll(self: *Git) !ExecResult {
@@ -2358,37 +2380,31 @@ pub const Git = struct {
     pub fn stashFile(self: *Git, path: []const u8, message: ?[]const u8) !ExecResult {
         // `--include-untracked` so a selected *untracked* file can be stashed too:
         // a bare `stash push -- <path>` errors ("pathspec did not match any
-        // file(s) known to git") on a path git doesn't yet track. Prefix the
-        // pathspec with `:(literal)` so Git doesn't treat characters like `*`,
-        // `?`, `[`, or a leading `:(...)` as pathspec syntax for a selected file.
-        // `-- <pathspec>` must come last.
-        const literal = try literalPathspec(self.allocator, path);
-        defer self.allocator.free(literal);
-
+        // file(s) known to git") on a path git doesn't yet track.
         // A file staged for deletion is gone from the index, so a pathspec-limited
         // `git stash push` can't match it: it fails with "did not match any files"
         // and, worse, `--include-untracked` records a spurious full stash first.
         // Unstage the deletion so it becomes an ordinary unstaged deletion, which
         // stashes cleanly — popping the entry restores the file the same way
         // regardless of which side the deletion sat on.
-        if (try self.pathStagedForDeletion(literal)) {
-            var unstaged = try self.exec(&.{ "restore", "--staged", "--", literal });
+        if (try self.pathStagedForDeletion(path)) {
+            var unstaged = try self.exec(&.{ "--literal-pathspecs", "restore", "--staged", "--", path });
             if (!unstaged.ok()) return unstaged; // caller owns and reports it
             unstaged.deinit(self.allocator);
         }
 
-        if (message) |m| return self.exec(&.{ "stash", "push", "--include-untracked", "-m", m, "--", literal });
-        return self.exec(&.{ "stash", "push", "--include-untracked", "--", literal });
+        if (message) |m| return self.exec(&.{ "--literal-pathspecs", "stash", "push", "--include-untracked", "-m", m, "--", path });
+        return self.exec(&.{ "--literal-pathspecs", "stash", "push", "--include-untracked", "--", path });
     }
 
-    /// True when `pathspec` (a single-file `:(literal)…` spec) is staged for
+    /// True when `path` is staged for
     /// deletion — a `D` in the index (first) column of porcelain status. Such a
     /// file no longer exists in the index, so a pathspec-limited stash can't
     /// match it. Any error answers false and lets the stash surface the real
     /// problem. An unmerged `DD` is excluded (that is a conflict, not a plain
     /// staged deletion).
-    fn pathStagedForDeletion(self: *Git, pathspec: []const u8) !bool {
-        var res = try self.exec(&.{ "status", "--porcelain", "--", pathspec });
+    fn pathStagedForDeletion(self: *Git, path: []const u8) !bool {
+        var res = try self.exec(&.{ "--literal-pathspecs", "status", "--porcelain", "--", path });
         defer res.deinit(self.allocator);
         if (!res.ok()) return false;
         const s = res.stdout;
@@ -2496,11 +2512,11 @@ pub const Git = struct {
     }
 
     fn resetFilePaths(self: *Git, file: model.FileStatus) !?ExecResult {
-        var args: std.ArrayList([]const u8) = .empty;
-        defer args.deinit(self.allocator);
-        try args.appendSlice(self.allocator, &.{ "reset", self.stagingBaseRef() orelse "HEAD", "--", file.path });
-        if (file.previous_path) |previous| try args.append(self.allocator, previous);
-        return self.runStep(args.items);
+        const paths: [2][]const u8 = .{ file.path, file.previous_path orelse "" };
+        var result = try self.unstagePaths(paths[0..if (file.previous_path == null) 1 else 2]);
+        if (!result.ok()) return result;
+        result.deinit(self.allocator);
+        return null;
     }
 
     fn runStep(self: *Git, args: []const []const u8) !?ExecResult {

@@ -476,14 +476,15 @@ pub fn discardFilesFromCommit(app: *App) !void {
     // restore the parent's version if it existed there, otherwise remove it.
     var cmd: std.ArrayList(u8) = .empty;
     defer cmd.deinit(app.allocator);
+    const literal_git = "GIT_GLOB_PATHSPECS=0 GIT_NOGLOB_PATHSPECS=0 GIT_ICASE_PATHSPECS=0 git --literal-pathspecs ";
     for (paths.items) |p| {
         const spec = try std.fmt.allocPrint(app.allocator, "HEAD^:{s}", .{p});
         defer app.allocator.free(spec);
         try cmd.appendSlice(app.allocator, "if git cat-file -e ");
         try shellQuote(&cmd, app.allocator, spec);
-        try cmd.appendSlice(app.allocator, " 2>/dev/null; then git checkout HEAD^ -- ");
+        try cmd.appendSlice(app.allocator, " 2>/dev/null; then " ++ literal_git ++ "checkout HEAD^ -- ");
         try shellQuote(&cmd, app.allocator, p);
-        try cmd.appendSlice(app.allocator, "; else git rm -f -- ");
+        try cmd.appendSlice(app.allocator, "; else " ++ literal_git ++ "rm -f -- ");
         try shellQuote(&cmd, app.allocator, p);
         try cmd.appendSlice(app.allocator, "; fi; ");
     }

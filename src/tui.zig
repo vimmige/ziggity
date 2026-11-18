@@ -217,13 +217,14 @@ fn postDone(job: *AsyncJob) void {
 const PreviewRun = struct {
     io: std.Io,
     completions: *WorkerCompletions,
+    environ: *const std.process.Environ.Map,
     root: []const u8,
     job: app_mod.PreviewJob,
     result: ?[]u8 = null,
 };
 
 fn previewWorker(pr: *PreviewRun) void {
-    pr.result = pr.job.run(async_allocator, pr.io, pr.root) catch null;
+    pr.result = pr.job.run(async_allocator, pr.io, pr.environ, pr.root) catch null;
     pr.completions.post(.preview_done);
 }
 
@@ -1178,7 +1179,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
         // so intermediate items are skipped rather than each spawning git.
         if (preview_future == null) {
             if (app.takePreviewJob()) |job| {
-                preview_run = .{ .io = io, .completions = &completions, .root = app.git.root, .job = job };
+                preview_run = .{ .io = io, .completions = &completions, .root = app.git.root, .environ = app.git.environ, .job = job };
                 preview_future = io.concurrent(previewWorker, .{&preview_run}) catch blk: {
                     app.completePreview(job, null, async_allocator);
                     break :blk null;

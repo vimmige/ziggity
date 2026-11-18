@@ -1037,7 +1037,9 @@ pub const PreviewJob = struct {
     /// Worker-thread entry point: run each section's git command and stitch the
     /// non-empty outputs together with their labels. Allocates with `gpa` (the
     /// page allocator); the returned slice is owned by the caller.
-    pub fn run(self: PreviewJob, gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]u8 {
+    pub fn run(self: PreviewJob, gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, root: []const u8) ![]u8 {
+        var env = try git_mod.literalPathspecEnv(gpa, environ);
+        defer if (env) |*clean| clean.deinit();
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);
         var huge = false;
@@ -1054,11 +1056,12 @@ pub const PreviewJob = struct {
             // not to; without this the preview can collide with a concurrent
             // `git add` and come back empty (a spurious "No diff") until the next
             // refresh. No-op for `log`/`show`/`stash show`.
-            try argv.append(gpa, "--no-optional-locks");
+            try argv.appendSlice(gpa, &.{ "--no-optional-locks", "--literal-pathspecs" });
             try argv.appendSlice(gpa, sec.argv);
             const res = std.process.run(gpa, io, .{
                 .argv = argv.items,
                 .cwd = .{ .path = root },
+                .environ_map = if (env) |*clean| clean else environ,
                 .stdout_limit = .limited(16 * 1024 * 1024),
                 .stderr_limit = .limited(4 * 1024 * 1024),
             }) catch continue;
@@ -19616,7 +19619,7 @@ test "merge commit's per-file preview shows the brought-in file (issue #22 follo
     // The newly-added file: its per-file preview must not come back empty.
     const job = try app.buildPreviewJob(.{ .commit_file = .{ .hash = merge_hash, .path = "feat.txt" } }, try page_alloc.dupe(u8, "k"));
     defer job.deinit(page_alloc);
-    const out = try job.run(page_alloc, tio, app.git.root);
+    const out = try job.run(page_alloc, tio, app.git.environ, app.git.root);
     defer page_alloc.free(out);
     // The argv uses `--color=always`, so assert on substrings without ANSI codes
     // between their bytes: the "new file" marker and the path in the diff header.
