@@ -418,14 +418,14 @@ actually on, not the branch that contains it.
 
 `ctrl+r` opens the recent repositories switcher: a list of every repo you have
 opened in ziggity, most recent first, each row aligned as name, current branch,
-and path. Pick one with `enter` and ziggity re-roots in place, no restart and
+and path. Pick one with `space` and ziggity re-roots in place, no restart and
 no second process. The list lives in a plain text file under the XDG state
 directory (`~/.local/state/ziggity/recent`), one path per line, safe to read or
 edit by hand.
 
 Navigate with `j` and `k` or the mouse wheel, and pan long paths left and right
 with `H` and `L`. Click a row to highlight it, or drag to select and copy text;
-switching always happens on `enter`. If a listed repo has since been moved or
+switching always happens on `space`. If a listed repo has since been moved or
 deleted, picking it asks whether to drop it from the list (nothing on disk is
 touched). Remove the highlighted entry at any time with `d`; removing the last
 one just closes the switcher.
@@ -434,7 +434,7 @@ one just closes the switcher.
   <img src="screenshots/19-recent-repos.png" alt="The ctrl+r recent repositories switcher" width="900">
 </p>
 
-<p align="center"><i>ctrl+r lists the repos you have opened, aligned as name, branch and path. Enter switches in place; the current repo is left out.</i></p>
+<p align="center"><i>ctrl+r lists the repos you have opened, aligned as name, branch and path. Space switches in place; the current repo is left out.</i></p>
 
 ## Stash Without Losing Your Working Tree
 

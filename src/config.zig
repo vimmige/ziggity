@@ -193,7 +193,7 @@ pub const Theme = struct {
     header: u8 = 13,
     /// Commit short hashes in the log (the classic `git log --oneline` yellow).
     hash: u8 = 3,
-    /// A tag's annotation/subject shown beside its name in the Tags list.
+    /// Tag descriptions in the Tags list and tag labels beside commits.
     tag: u8 = 3,
     /// Footer (bottom bar) keybinding hints: the key is highlighted in
     /// `footer_key`, its description shown in `footer`.

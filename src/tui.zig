@@ -835,7 +835,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                     bg_fetch_future = null;
                     // New remote-tracking refs: refresh the status summary
                     // (ahead/behind) and the branch list (its arrows).
-                    app.refreshViews(app_mod.ScopeSet.init(.{ .files = true, .branches = true }));
+                    app.refreshViews(app_mod.ScopeSet.init(.{ .files = true, .branches = true, .tags = true }));
                 }
             },
             .commit_graph_done => {
@@ -2081,7 +2081,7 @@ fn drawRecentReposPopup(root: vaxis.Window, app: *app_mod.App) void {
     const win = popup(root, w, h, "Recent repositories", null);
 
     const footer_row: u16 = win.height -| 1;
-    print(win, footer_row, 0, "j/k move  H/L pan  enter switch  d remove  esc close", st.bottom_accent);
+    print(win, footer_row, 0, "j/k move  H/L pan  space switch  d remove  esc close", st.bottom_accent);
 
     const avail: usize = footer_row; // content rows above the footer
     if (avail == 0) return;
@@ -2332,7 +2332,7 @@ const help_lines = [_][]const u8{
     "                 stages the file automatically once the markers are gone",
     "",
     "Worktrees tab",
-    "  enter          switch into the worktree",
+    "  space, enter   switch into the worktree",
     "  n              new worktree",
     "  o              open it in your editor",
     "  d              remove the worktree",
@@ -4113,7 +4113,7 @@ fn drawTags(win: vaxis.Window, app: *const app_mod.App) void {
     // are git refs (ASCII, no spaces), so byte length is their display width.
     var name_w: usize = 0;
     for (app.data.tags) |t| name_w = @max(name_w, t.name.len);
-    const subj_col: u16 = @intCast(@min(name_w + 2, @as(usize, win.width)));
+    const subj_col: u16 = @intCast(@min(name_w + 4, @as(usize, win.width)));
     const start = app.listScroll(.branches);
     var row: u16 = 0;
     var idx = start;
@@ -4122,13 +4122,18 @@ fn drawTags(win: vaxis.Window, app: *const app_mod.App) void {
         row += 1;
     }) {
         const tag = app.data.tags[idx];
-        // Tag name in the default colour, its annotation/subject dimmed so the
-        // name stands out (the row's selection background still spans both).
         var base = styles().normal;
         const sel = rowSel(app, .branches, idx, idx == app.tag_index, app.focus == .branches);
         applySel(&base, sel);
         if (sel != .none) fillRow(win, row, base);
-        _ = printSpan(win, row, 0, tag.name, base);
+        const status_fg = switch (tag.status) {
+            .unpushed => ui_theme.unstaged,
+            .pushed => ui_theme.hash,
+            .different => ui_theme.warning,
+            .none => ui_theme.muted,
+        };
+        _ = drawGraphCodepoint(win, row, 0, graphlanes_mod.commit_symbol, base, status_fg, false);
+        _ = printSpan(win, row, 2, tag.name, base);
         if (tag.subject.len > 0) {
             _ = printSpan(win, row, subj_col, tag.subject, withFg(base, ui_theme.tag));
         }
@@ -5746,7 +5751,7 @@ fn footerHints(c: FooterCtx) []const u8 {
     if (c.focus == .files) {
         return switch (c.files_tab) {
             .files => "space stage  a all  c/w commit/no-verify  C amend message  A amend  e edit  d discard  i ignore/exclude  y copy  ^f fixup-base  s stash  / filter  ` tree  enter hunks  [/] tabs" ++ global,
-            .worktrees => "enter switch  n new  o editor  d remove  [/] tabs" ++ global,
+            .worktrees => "space/enter switch  n new  o editor  d remove  [/] tabs" ++ global,
             .submodules => "enter enter  space update  n add  e edit-url  d remove  b bulk  [/] tabs" ++ global,
         };
     }
@@ -6960,7 +6965,7 @@ test "helpKeyEnd isolates the key column of a command line" {
     try std.testing.expectEqualStrings("q, ctrl+c", keyOf("  q, ctrl+c      quit").?);
     try std.testing.expectEqualStrings("ctrl+l", keyOf("  ctrl+l         commit graph viewer").?);
     try std.testing.expectEqualStrings("\\", keyOf("  \\              toggle split view").?);
-    try std.testing.expectEqualStrings("enter", keyOf("  enter          switch into the worktree").?);
+    try std.testing.expectEqualStrings("space, enter", keyOf("  space, enter   switch into the worktree").?);
 
     // Headers, continuation lines, and prose notes have no key column.
     try std.testing.expect(keyOf("Global") == null); // header (col 0)

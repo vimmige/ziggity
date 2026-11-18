@@ -922,10 +922,41 @@ pub const Git = struct {
     }
 
     pub fn loadTags(self: *Git) ![]model.Tag {
-        var result = try self.exec(&.{ "tag", "--sort=-creatordate", "--format=%(refname:short)%00%(contents:subject)" });
+        var result = try self.exec(&.{ "tag", "--sort=-creatordate", "--format=%(refname:strip=2)%00%(contents:subject)%00%(objectname)" });
         defer result.deinit(self.allocator);
         if (!result.ok()) return self.allocator.alloc(model.Tag, 0);
-        return parseTags(self.allocator, result.stdout);
+        const tags = try parseTags(self.allocator, result.stdout);
+        if (tags.len == 0) return tags;
+        // Git selects the current branch's remote, or origin without one.
+        const remote = runWithLockRetry(self.allocator, self.io, .{
+            .argv = &.{ "git", "--no-optional-locks", "ls-remote", "--tags", "--refs" },
+            .cwd = .{ .path = self.root },
+            .environ_map = self.environ,
+            .stdout_limit = .limited(16 * 1024 * 1024),
+            .stderr_limit = .limited(4 * 1024 * 1024),
+            .timeout = .{ .deadline = .fromNow(self.io, .{ .raw = .fromSeconds(3), .clock = .awake }) },
+        }) catch return tags;
+        defer self.allocator.free(remote.stdout);
+        defer self.allocator.free(remote.stderr);
+        if (remote.term != .exited or remote.term.exited != 0) return tags;
+        var refs = std.StringHashMap([]const u8).init(self.allocator);
+        defer refs.deinit();
+        var lines = std.mem.tokenizeScalar(u8, remote.stdout, '\n');
+        while (lines.next()) |line| {
+            var fields = std.mem.tokenizeAny(u8, line, "\t\r");
+            const hash = fields.next() orelse continue;
+            const ref = fields.next() orelse continue;
+            if (std.mem.startsWith(u8, ref, "refs/tags/")) {
+                refs.put(ref["refs/tags/".len..], hash) catch return tags;
+            }
+        }
+        for (tags) |*tag| {
+            tag.status = if (refs.get(tag.name)) |hash|
+                if (std.mem.eql(u8, tag.hash, hash)) .pushed else .different
+            else
+                .unpushed;
+        }
+        return tags;
     }
 
     pub fn loadWorktrees(self: *Git) ![]model.Worktree {
@@ -2663,9 +2694,10 @@ pub fn parseTags(allocator: std.mem.Allocator, bytes: []const u8) ![]model.Tag {
         const subject = fields.next() orelse "";
         var tag = model.Tag{
             .name = try allocator.dupe(u8, name),
-            .subject = try allocator.dupe(u8, subject),
         };
         errdefer tag.deinit(allocator);
+        tag.subject = try allocator.dupe(u8, subject);
+        tag.hash = try allocator.dupe(u8, fields.next() orelse "");
         try tags.append(allocator, tag);
     }
 
@@ -2705,7 +2737,7 @@ pub fn parseWorktrees(allocator: std.mem.Allocator, bytes: []const u8, current_r
             .is_current = std.mem.eql(u8, wt_path, current_root),
         };
         errdefer wt.deinit(allocator);
-        try worktrees.append(allocator, wt);
+        try worktrees.insert(allocator, if (wt.is_current) 0 else worktrees.items.len, wt);
     }
 
     return worktrees.toOwnedSlice(allocator);
@@ -3124,17 +3156,17 @@ test "parse worktrees marks the current one and shortens branches" {
         "worktree /repo\nHEAD aaaa\nbranch refs/heads/main\n\n" ++
         "worktree /repo-wt\nHEAD bbbb\nbranch refs/heads/feature\n\n" ++
         "worktree /repo-detached\nHEAD cccc\ndetached\n";
-    const worktrees = try parseWorktrees(std.testing.allocator, bytes, "/repo");
+    const worktrees = try parseWorktrees(std.testing.allocator, bytes, "/repo-wt");
     defer {
         for (worktrees) |*wt| wt.deinit(std.testing.allocator);
         std.testing.allocator.free(worktrees);
     }
 
     try std.testing.expectEqual(@as(usize, 3), worktrees.len);
-    try std.testing.expectEqualStrings("/repo", worktrees[0].path);
-    try std.testing.expectEqualStrings("main", worktrees[0].branch);
+    try std.testing.expectEqualStrings("/repo-wt", worktrees[0].path);
+    try std.testing.expectEqualStrings("feature", worktrees[0].branch);
     try std.testing.expect(worktrees[0].is_current);
-    try std.testing.expectEqualStrings("feature", worktrees[1].branch);
+    try std.testing.expectEqualStrings("main", worktrees[1].branch);
     try std.testing.expect(!worktrees[1].is_current);
     try std.testing.expectEqualStrings("(detached)", worktrees[2].branch);
 }

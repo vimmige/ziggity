@@ -167,7 +167,7 @@ options. Destructive actions route through clear, explicit menus.
 
 `ctrl+r` opens the recent repositories switcher: every repo you have opened
 before, aligned as name, branch, and path. `j` and `k` or the wheel move the
-highlight, `H` and `L` pan long paths, `enter` switches in place, and `d`
+highlight, `H` and `L` pan long paths, `space` switches in place, and `d`
 removes an entry.
 
 ![Recent repositories switcher](screenshots/19-recent-repos.png)

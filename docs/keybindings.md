@@ -109,14 +109,14 @@ the written reference. Every binding is remappable, see
   Local/Remotes/Tags · Commits/Reflog) or the staging side
 - `enter`: open the selection; on a commit (Commits, Reflog or Divergence),
   drill into its changed files; on a working-tree file, open the staging view.
-  On a remote, open its branches; on a worktree, switch into it
+  On a remote, open its branches; on a worktree, switch into it (also `space`)
 - `enter` on a file opens the staging view: `j` and `k` by line, `J` and `K`
   (or shift+arrows) jump to the next/previous hunk, `v` range, `space` stage
   the line(s) or hunk, `d` discard the line(s) or hunk instead, `[` and `]`
   switch side, `\` split view, `|` side-by-side review of the active side, `c`
   and `A` commit or amend, `esc` back
-- `space`: stage in Files, unstage in Staged · checkout a branch · apply a stash (by
-  focus)
+- `space`: stage in Files, unstage in Staged · switch worktrees · checkout a branch ·
+  apply a stash (by focus)
 - `e`: open the file under view in your editor (Files, a commit's files, the
   staging or patch view, or a working tree file's diff; see
   [Editor](configuration.md#editor-e))

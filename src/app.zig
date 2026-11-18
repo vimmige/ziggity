@@ -5544,7 +5544,7 @@ pub const App = struct {
                     // Files tab: stage the file. Submodules: init/update it.
                     .files, .staged => switch (self.fileTab()) {
                         .files => try staging_mod.toggleSelectedFileStaged(self),
-                        .worktrees => {},
+                        .worktrees => try self.enterSelectedWorktree(),
                         .submodules => try self.updateSelectedSubmodule(),
                     },
                     // In the sub-commits drill, space on a file adds it to the
@@ -5836,7 +5836,7 @@ pub const App = struct {
                         commitgraph_mod.selectRow(self, self.commit_graph_scroll + self.dialog_sel_anchor_row);
                     } else if (self.mode == .recent_repos) {
                         // A click only selects the row under the cursor; switching
-                        // always requires enter.
+                        // always requires space.
                         self.recentSelectRow(self.recent_scroll + self.dialog_sel_anchor_row);
                     }
                     self.clearDialogSelection();
@@ -7547,7 +7547,7 @@ pub const App = struct {
         try self.setMessage("bulk submodule actions", .{});
     }
 
-    /// `enter` on another worktree: switch the whole app into it. The
+    /// `space` / `enter` on another worktree: switch the whole app into it. The
     /// current worktree just says so.
     pub fn enterSelectedWorktree(self: *App) !void {
         const wt = self.selectedWorktree() orelse {
@@ -7746,7 +7746,7 @@ pub const App = struct {
             self.recent_hscroll +|= horizontal_scroll_step;
             return;
         }
-        if (self.isEnterKey(key)) return self.switchToRecent();
+        if (km.select.matches(key)) return self.switchToRecent();
         // `d` removes the highlighted entry from the list (nothing on disk).
         if (key.matches('d', .{})) return self.removeSelectedRecent();
     }
@@ -7769,7 +7769,7 @@ pub const App = struct {
         }
     }
 
-    /// `enter` / click on the selected row: switch to the highlighted repo in
+    /// `space` on the selected row: switch to the highlighted repo in
     /// place. A live repo re-roots; a dead entry raises the "remove from recent
     /// list?" confirmation instead.
     pub fn switchToRecent(self: *App) !void {
@@ -8004,7 +8004,7 @@ pub const App = struct {
 
         self.focus = .files;
         self.main_origin = .files;
-        self.files_tab = .files;
+        self.files_tab = if (!push and self.files_tab == .worktrees) .worktrees else .files;
         self.branches_tab = .local;
         self.commits_tab = .commits;
         self.mode = .normal;
@@ -8192,8 +8192,7 @@ pub const App = struct {
             return patch_mod.openPatchLineView(self);
         }
         if (self.focus.isFilePanel()) {
-            // The Worktrees / Submodules tabs aren't a working-tree file list:
-            // <enter> switches the whole app into the selected worktree/submodule.
+            // Worktrees and submodules switch into the selected repo.
             if (self.fileTab() == .worktrees) return self.enterSelectedWorktree();
             if (self.fileTab() == .submodules) return self.enterSelectedSubmodule();
             // In tree view, <enter> on a directory collapses/expands it.
@@ -13266,17 +13265,17 @@ pub const App = struct {
     pub const Refresh = struct {
         pub const files = ScopeSet.init(.{ .files = true, .status = true });
         pub const commit = ScopeSet.init(.{ .files = true, .status = true, .commits = true, .branches = true });
-        pub const checkout = ScopeSet.init(.{ .files = true, .status = true, .commits = true, .branches = true });
+        pub const checkout = ScopeSet.init(.{ .files = true, .status = true, .commits = true, .branches = true, .tags = true });
         pub const branches = ScopeSet.init(.{ .branches = true });
         pub const branches_commits = ScopeSet.init(.{ .branches = true, .commits = true });
         pub const tags = ScopeSet.init(.{ .tags = true, .commits = true, .branches = true });
-        pub const remotes = ScopeSet.init(.{ .remotes = true });
+        pub const remotes = ScopeSet.init(.{ .remotes = true, .tags = true });
         pub const stash = ScopeSet.init(.{ .files = true, .status = true, .stash = true });
         pub const worktrees = ScopeSet.init(.{ .worktrees = true });
         // Adding a worktree also creates a branch, so refresh both lists.
         pub const worktree_add = ScopeSet.init(.{ .worktrees = true, .branches = true });
         pub const submodules = ScopeSet.init(.{ .files = true, .submodules = true });
-        pub const upstream = ScopeSet.init(.{ .branches = true, .status = true });
+        pub const upstream = ScopeSet.init(.{ .branches = true, .status = true, .tags = true });
         pub const all = ScopeSet.full;
     };
 
@@ -13656,6 +13655,14 @@ pub const App = struct {
         restoreSelKey(self.data.remote_branches, &self.remote_index, keys.remote_branch, branchKey);
         restoreSelKey(self.data.tags, &self.tag_index, keys.tag, tagKey);
         restoreSelKey(self.data.worktrees, &self.worktree_index, keys.worktree, worktreeKey);
+        if (keys.worktree == null) {
+            for (self.data.worktrees, 0..) |worktree, i| {
+                if (worktree.is_current) {
+                    self.worktree_index = i;
+                    break;
+                }
+            }
+        }
         restoreSelKey(self.data.submodules, &self.submodule_index, keys.submodule, submoduleKey);
     }
 
@@ -18454,6 +18461,9 @@ test "async initial load deep-copies into gpa and clears the loading state" {
     page_data.current_branch = try page.dupe(u8, "main");
     page_data.commits = try page.alloc(model.Commit, 1);
     page_data.commits[0] = .{ .hash = try page.dupe(u8, "abc"), .short_hash = try page.dupe(u8, "abc"), .author = try page.dupe(u8, "s"), .time = try page.dupe(u8, "now"), .refs = try page.dupe(u8, ""), .subject = try page.dupe(u8, "first") };
+    page_data.worktrees = try page.alloc(model.Worktree, 2);
+    page_data.worktrees[0] = .{ .path = try page.dupe(u8, "/repo"), .branch = try page.dupe(u8, "main"), .is_current = false };
+    page_data.worktrees[1] = .{ .path = try page.dupe(u8, "/repo-w2"), .branch = try page.dupe(u8, "w2"), .is_current = true };
 
     app.applyRepoLoad(page_data, page);
     try std.testing.expect(!app.initial_load_pending);
@@ -18461,7 +18471,12 @@ test "async initial load deep-copies into gpa and clears the loading state" {
     try std.testing.expectEqualStrings("main", app.data.current_branch);
     try std.testing.expectEqual(@as(usize, 1), app.data.commits.len);
     try std.testing.expectEqualStrings("first", app.data.commits[0].subject);
+    try std.testing.expectEqual(@as(usize, 1), app.worktree_index);
     try std.testing.expectEqualStrings("ready", app.message);
+
+    app.worktree_index = 0;
+    app.applyRepoLoad(try app.data.dupe(page), page);
+    try std.testing.expectEqual(@as(usize, 0), app.worktree_index);
 }
 
 test "slow mutation queues off-thread, marks busy, and refuses a second op" {
@@ -18898,8 +18913,16 @@ test "switching worktrees is a flat switch that keeps a real breadcrumb (issue #
     };
     app.data.worktrees = &wts;
     app.worktree_index = 1; // the non-current worktree
+    app.focus = .files;
+    app.files_tab = .worktrees;
 
-    try app.enterSelectedWorktree();
+    try app.handleKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqualStrings("/repo/sub-w2", app.reroot_request.?);
+    try std.testing.expectEqual(model.Focus.files, app.focus);
+    try std.testing.expectEqual(FilesTab.worktrees, app.files_tab);
+    a.free(app.reroot_request.?);
+    app.reroot_request = null;
+    try app.handleKey(.{ .codepoint = ' ' });
 
     // A worktree switch pushes nothing, so the Status path never accumulates a
     // "repo / w2 / repo" breadcrumb. It also does not clear the stack, so a real

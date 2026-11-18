@@ -277,10 +277,13 @@ pub const Remote = struct {
 pub const Tag = struct {
     name: []u8,
     subject: []u8 = &.{},
+    hash: []u8 = &.{},
+    status: enum { none, unpushed, pushed, different } = .none,
 
     pub fn deinit(self: *Tag, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.subject);
+        allocator.free(self.hash);
         self.* = undefined;
     }
 };
@@ -653,7 +656,9 @@ fn dupeTag(a: std.mem.Allocator, t: Tag) std.mem.Allocator.Error!Tag {
     const name = try a.dupe(u8, t.name);
     errdefer a.free(name);
     const subject = try a.dupe(u8, t.subject);
-    return .{ .name = name, .subject = subject };
+    errdefer a.free(subject);
+    const hash = try a.dupe(u8, t.hash);
+    return .{ .name = name, .subject = subject, .hash = hash, .status = t.status };
 }
 
 fn dupeWorktree(a: std.mem.Allocator, w: Worktree) std.mem.Allocator.Error!Worktree {
