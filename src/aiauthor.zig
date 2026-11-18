@@ -157,11 +157,7 @@ pub fn generate(allocator: std.mem.Allocator, git: *git_mod.Git, command: []cons
     };
     defer allocator.free(prompt);
 
-    const slot = switch (field) {
-        .title => "title",
-        .description => "desc",
-    };
-    var res = git.runAiCommand(command, slot, prompt) catch return GenError.AiCommandFailed;
+    var res = git.runAiCommand(command, prompt) catch return GenError.AiCommandFailed;
     defer res.deinit(allocator);
     if (!res.ok()) {
         // The command ran but exited non-zero: carry its first stderr line out so
@@ -433,7 +429,7 @@ pub fn generatePrDoc(allocator: std.mem.Allocator, git: *git_mod.Git, command: [
     const prompt = try buildPrPrompt(allocator, ctx, title_instr, body_instr);
     defer allocator.free(prompt);
 
-    var res = git.runAiCommand(command, "pr", prompt) catch return GenError.AiCommandFailed;
+    var res = git.runAiCommand(command, prompt) catch return GenError.AiCommandFailed;
     defer res.deinit(allocator);
     if (!res.ok()) return GenError.AiCommandFailed;
     const out = std.mem.trim(u8, res.stdout, " \t\r\n");

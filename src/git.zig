@@ -469,33 +469,47 @@ pub const Git = struct {
     /// side). The patch is written to a temp file under the git dir since
     /// `std.process.run` cannot feed stdin.
     pub fn applyPatch(self: *Git, patch: []const u8, reverse: bool) !ExecResult {
-        const patch_path = try self.gitDirPath("ziggity-stage.patch");
-        defer self.allocator.free(patch_path);
-        try std.Io.Dir.writeFile(.cwd(), self.io, .{ .sub_path = patch_path, .data = patch });
-        defer std.Io.Dir.deleteFile(.cwd(), self.io, patch_path) catch {};
+        const patch_path = try self.writeTempFile(patch);
+        defer self.removeTempFile(patch_path);
         if (reverse) {
             return self.exec(&.{ "apply", "--cached", "--reverse", "--whitespace=nowarn", "--", patch_path });
         }
         return self.exec(&.{ "apply", "--cached", "--whitespace=nowarn", "--", patch_path });
     }
 
-    /// Write `patch` to a temp file under the git dir and return its path; the
-    /// caller must delete the file and free the path.
-    fn writeTempPatch(self: *Git, patch: []const u8) ![]u8 {
-        const p = try self.gitDirPath("ziggity-custom.patch");
-        errdefer self.allocator.free(p);
-        try std.Io.Dir.writeFile(.cwd(), self.io, .{ .sub_path = p, .data = patch });
-        return p;
+    fn writeTempFile(self: *Git, data: []const u8) ![]u8 {
+        var random: [16]u8 = undefined;
+        try self.io.randomSecure(&random);
+        const hex = std.fmt.bytesToHex(random, .lower);
+        const prefix = "ziggity-tmp-";
+        var name_buf: [prefix.len + hex.len]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, prefix ++ "{s}", .{hex});
+        const path = try self.gitDirPath(name);
+        const file = std.Io.Dir.cwd().createFile(self.io, path, .{
+            .exclusive = true,
+            .permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o600),
+        }) catch |err| {
+            self.allocator.free(path);
+            return err;
+        };
+        errdefer self.removeTempFile(path);
+        defer file.close(self.io);
+        try file.writeStreamingAll(self.io, data);
+        return path;
+    }
+
+    fn removeTempFile(self: *Git, path: []u8) void {
+        const old = self.io.swapCancelProtection(.blocked);
+        defer _ = self.io.swapCancelProtection(old);
+        std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
+        self.allocator.free(path);
     }
 
     /// Apply a custom patch to the working tree (not the index). `reverse`
     /// un-applies it. Used by the custom-patch "apply to working tree" actions.
     pub fn applyCustomPatch(self: *Git, patch: []const u8, reverse: bool) !ExecResult {
-        const p = try self.writeTempPatch(patch);
-        defer {
-            std.Io.Dir.deleteFile(.cwd(), self.io, p) catch {};
-            self.allocator.free(p);
-        }
+        const p = try self.writeTempFile(patch);
+        defer self.removeTempFile(p);
         if (reverse) {
             return self.exec(&.{ "apply", "--reverse", "--whitespace=nowarn", "--", p });
         }
@@ -509,11 +523,8 @@ pub const Git = struct {
     /// both the index and the working tree, so the change is gone entirely —
     /// mirroring how `space` acts on whichever side is active. Destructive.
     pub fn discardStagingPatch(self: *Git, patch: []const u8, staged: bool) !ExecResult {
-        const p = try self.writeTempPatch(patch);
-        defer {
-            std.Io.Dir.deleteFile(.cwd(), self.io, p) catch {};
-            self.allocator.free(p);
-        }
+        const p = try self.writeTempFile(patch);
+        defer self.removeTempFile(p);
         if (staged) {
             return self.exec(&.{ "apply", "--reverse", "--index", "--whitespace=nowarn", "--", p });
         }
@@ -525,11 +536,8 @@ pub const Git = struct {
     /// rather than a reverse of the (old-side-less) new-file patch. `--index`
     /// updates the index too, so a staged new file is patched in both places.
     pub fn discardForwardPatch(self: *Git, patch: []const u8, staged: bool) !ExecResult {
-        const p = try self.writeTempPatch(patch);
-        defer {
-            std.Io.Dir.deleteFile(.cwd(), self.io, p) catch {};
-            self.allocator.free(p);
-        }
+        const p = try self.writeTempFile(patch);
+        defer self.removeTempFile(p);
         if (staged) {
             return self.exec(&.{ "apply", "--index", "--whitespace=nowarn", "--", p });
         }
@@ -541,15 +549,12 @@ pub const Git = struct {
     /// the index and tree, amend, then continue. If the patch fails to apply
     /// the rebase is aborted; a conflict on continue is left for the user.
     pub fn removePatchFromCommit(self: *Git, base_ref: []const u8, todo: []const u8, patch: []const u8) !ExecResult {
+        const p = try self.writeTempFile(patch);
+        defer self.removeTempFile(p);
+
         var r1 = try self.rebaseTodo(base_ref, todo, null);
         if (!r1.ok()) return r1;
         r1.deinit(self.allocator);
-
-        const p = try self.writeTempPatch(patch);
-        defer {
-            std.Io.Dir.deleteFile(.cwd(), self.io, p) catch {};
-            self.allocator.free(p);
-        }
 
         var ap = try self.exec(&.{ "apply", "--reverse", "--index", "--whitespace=nowarn", "--", p });
         if (!ap.ok()) {
@@ -576,10 +581,8 @@ pub const Git = struct {
     /// accepted as-is (`core.editor=true`) unless `message` is given, in which
     /// case it replaces the message git would have opened (used for reword).
     pub fn rebaseTodo(self: *Git, base_ref: []const u8, todo: []const u8, message: ?[]const u8) !ExecResult {
-        const todo_path = try self.gitDirPath("ziggity-rebase-todo");
-        defer self.allocator.free(todo_path);
-        try std.Io.Dir.writeFile(.cwd(), self.io, .{ .sub_path = todo_path, .data = todo });
-        defer std.Io.Dir.deleteFile(.cwd(), self.io, todo_path) catch {};
+        const todo_path = try self.writeTempFile(todo);
+        defer self.removeTempFile(todo_path);
 
         // The sequence editor copies our todo over git's; the commit-message
         // editor accepts the default (true) or, for reword, supplies our
@@ -588,29 +591,15 @@ pub const Git = struct {
         const seq_editor = try self.copyEditorCommand(todo_path);
         defer self.allocator.free(seq_editor);
 
-        var msg_path: ?[]u8 = null;
-        defer if (msg_path) |p| {
-            std.Io.Dir.deleteFile(.cwd(), self.io, p) catch {};
-            self.allocator.free(p);
-        };
-        const msg_editor = if (message) |msg| blk: {
-            const mp = try self.gitDirPath("ziggity-rebase-msg");
-            errdefer self.allocator.free(mp);
-            try std.Io.Dir.writeFile(.cwd(), self.io, .{ .sub_path = mp, .data = msg });
-            // Build the editor command first; only then hand `mp` to the outer
-            // `defer` by setting `msg_path`. Doing it the other way round would
-            // let both this `errdefer` and the outer `defer` free `mp` if the
-            // editor command allocation failed (double-free).
-            const editor = try self.copyEditorCommand(mp);
-            msg_path = mp;
-            break :blk editor;
-        } else try self.allocator.dupe(u8, "true");
-        defer self.allocator.free(msg_editor);
+        const msg_path = if (message) |msg| try self.writeTempFile(msg) else null;
+        defer if (msg_path) |path| self.removeTempFile(path);
+        const msg_editor = if (msg_path) |path| try self.copyEditorCommand(path) else null;
+        defer if (msg_editor) |command| self.allocator.free(command);
 
         var env = try self.environ.clone(self.allocator);
         defer env.deinit();
         try env.put("GIT_SEQUENCE_EDITOR", seq_editor);
-        try env.put("GIT_EDITOR", msg_editor);
+        try env.put("GIT_EDITOR", msg_editor orelse "true");
 
         const argv = [_][]const u8{ "git", "rebase", "-i", "--autostash", base_ref };
         self.recordCommand(argv[1..]);
@@ -1381,16 +1370,10 @@ pub const Git = struct {
 
     /// Run the configured AI command, feeding `prompt` on stdin and returning its
     /// stdout. The prompt is piped in from a temp file (`cat file | <command>`),
-    /// which handles pipelines and avoids any stdin/stdout deadlock. `slot`
-    /// (e.g. "title"/"desc") separates concurrent requests' temp files. ziggity
-    /// treats the command as a black box: prompt in, completion out.
-    pub fn runAiCommand(self: *Git, command: []const u8, slot: []const u8, prompt: []const u8) !ExecResult {
-        const name = try std.fmt.allocPrint(self.allocator, "ziggity-ai-{s}", .{slot});
-        defer self.allocator.free(name);
-        const path = try self.gitDirPath(name);
-        defer self.allocator.free(path);
-        try std.Io.Dir.writeFile(.cwd(), self.io, .{ .sub_path = path, .data = prompt });
-        defer std.Io.Dir.deleteFile(.cwd(), self.io, path) catch {};
+    /// which handles pipelines and avoids any stdin/stdout deadlock.
+    pub fn runAiCommand(self: *Git, command: []const u8, prompt: []const u8) !ExecResult {
+        const path = try self.writeTempFile(prompt);
+        defer self.removeTempFile(path);
 
         var full: std.ArrayList(u8) = .empty;
         defer full.deinit(self.allocator);
