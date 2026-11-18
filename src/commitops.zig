@@ -671,7 +671,7 @@ pub fn autosquashDownToRef(app: *App, ref_in: []const u8) !void {
         try app.setMessage("finish the in-progress operation first (m)", .{});
         return;
     }
-    const base = app.git.mergeBaseWith(ref) catch {
+    const base = app.git.mergeBaseWith("HEAD", ref) catch {
         try app.setMessage("no common base with {s}", .{ref});
         return;
     };

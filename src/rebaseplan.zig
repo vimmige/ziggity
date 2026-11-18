@@ -65,16 +65,18 @@ pub fn start(app: *App, from_root: bool) !void {
     git.log_grep = null;
     git.log_author = null;
     git.log_path = null;
+    const head = app.data.commits_head;
+    const head_hash = head[0 .. std.mem.indexOfScalar(u8, head, '\n') orelse head.len];
     const fork = if (from_root) blk: {
         const branch = try git.defaultBranch();
         defer app.allocator.free(branch);
-        break :blk git.mergeBaseWith(branch) catch {
+        break :blk git.mergeBaseWith(head_hash, branch) catch {
             try app.setMessage("no common base with {s}", .{branch});
             return;
         };
     } else null;
     defer if (fork) |base| app.allocator.free(base);
-    const range = if (fork) |base| try std.fmt.allocPrint(app.allocator, "{s}..HEAD", .{base}) else null;
+    const range = if (fork) |base| try std.fmt.allocPrint(app.allocator, "{s}..{s}", .{ base, head_hash }) else null;
     defer if (range) |ref| app.allocator.free(ref);
     const commits = if (range) |ref| try git.loadCommits(ref, null) else app.data.commits;
     defer if (from_root) model.deinitCommits(app.allocator, commits);
@@ -85,25 +87,32 @@ pub fn start(app: *App, from_root: bool) !void {
     const i = if (from_root) commits.len - 1 else @min(app.commit_index, commits.len - 1);
 
     free(app); // drop any stale plan
-    var entries = try app.allocator.alloc(Entry, i + 1);
-    var built: usize = 0;
-    errdefer {
-        for (entries[0..built]) |e| freeEntry(app.allocator, e);
-        app.allocator.free(entries);
+    {
+        const plan_base = if (fork) |base|
+            try app.allocator.dupe(u8, base)
+        else
+            try std.fmt.allocPrint(app.allocator, "{s}^", .{commits[i].hash});
+        errdefer app.allocator.free(plan_base);
+        const plan_head = try app.allocator.dupe(u8, app.data.commits_head);
+        errdefer app.allocator.free(plan_head);
+        const entries = try app.allocator.alloc(Entry, i + 1);
+        var built: usize = 0;
+        errdefer {
+            for (entries[0..built]) |e| freeEntry(app.allocator, e);
+            app.allocator.free(entries);
+        }
+        while (built <= i) : (built += 1) {
+            const c = commits[built];
+            const hash = try app.allocator.dupe(u8, c.hash);
+            errdefer app.allocator.free(hash);
+            const short_hash = try app.allocator.dupe(u8, c.short_hash);
+            errdefer app.allocator.free(short_hash);
+            entries[built] = .{ .hash = hash, .short_hash = short_hash, .subject = try app.allocator.dupe(u8, c.subject) };
+        }
+        app.rebase_plan_base = plan_base;
+        app.rebase_plan_head = plan_head;
+        app.rebase_plan = entries;
     }
-    while (built <= i) : (built += 1) {
-        const c = commits[built];
-        entries[built] = .{
-            .hash = try app.allocator.dupe(u8, c.hash),
-            .short_hash = try app.allocator.dupe(u8, c.short_hash),
-            .subject = try app.allocator.dupe(u8, c.subject),
-        };
-    }
-    app.rebase_plan_base = if (fork) |base|
-        try app.allocator.dupe(u8, base)
-    else
-        try std.fmt.allocPrint(app.allocator, "{s}^", .{commits[i].hash});
-    app.rebase_plan = entries;
     app.rebase_plan_index = i;
     app.rebase_plan_anchor = null;
     app.mode = .rebase_plan;
@@ -259,12 +268,14 @@ fn execute(app: *App) !void {
 
     const base_ref = try app.allocator.dupe(u8, app.rebase_plan_base);
     defer app.allocator.free(base_ref);
+    const head = try app.allocator.dupe(u8, app.rebase_plan_head);
+    defer app.allocator.free(head);
 
     // Exit plan mode before queuing; the mutation owns its own copies.
     free(app);
     app.mode = .normal;
     return app.requestMutation(
-        .{ .rebase_todo = .{ .base_ref = base_ref, .todo = todo, .message = null } },
+        .{ .rebase_todo = .{ .base_ref = base_ref, .todo = todo, .message = null, .expected_head = head } },
         .{ .gerund = "rebasing", .command = "git rebase -i" },
         "interactive rebase done",
         .{},
@@ -279,6 +290,8 @@ pub fn cancel(app: *App) void {
 
 /// Free the plan and its owned strings. Safe to call when no plan is active.
 pub fn free(app: *App) void {
+    app.allocator.free(app.rebase_plan_head);
+    app.rebase_plan_head = &.{};
     if (app.rebase_plan) |plan| {
         for (plan) |e| freeEntry(app.allocator, e);
         app.allocator.free(plan);

@@ -454,6 +454,7 @@ pub const RepoData = struct {
     worktrees: []Worktree = &.{},
     submodules: []Submodule = &.{},
     commits: []Commit = &.{},
+    commits_head: []u8 = &.{},
     reflog: []Commit = &.{},
     stash: []StashEntry = &.{},
 
@@ -479,6 +480,7 @@ pub const RepoData = struct {
         allocator.free(self.submodules);
         for (self.commits) |*commit| commit.deinit(allocator);
         allocator.free(self.commits);
+        allocator.free(self.commits_head);
         for (self.reflog) |*entry| entry.deinit(allocator);
         allocator.free(self.reflog);
         for (self.stash) |*entry| entry.deinit(allocator);
@@ -537,10 +539,12 @@ pub const RepoData = struct {
         self.submodules = submodules;
     }
 
-    pub fn replaceCommits(self: *RepoData, allocator: std.mem.Allocator, commits: []Commit) void {
+    pub fn replaceCommits(self: *RepoData, allocator: std.mem.Allocator, commits: []Commit, head: []u8) void {
         for (self.commits) |*c| c.deinit(allocator);
         allocator.free(self.commits);
         self.commits = commits;
+        allocator.free(self.commits_head);
+        self.commits_head = head;
     }
 
     pub fn replaceReflog(self: *RepoData, allocator: std.mem.Allocator, reflog: []Commit) void {
@@ -576,6 +580,7 @@ pub const RepoData = struct {
         out.worktrees = try dupeList(Worktree, allocator, self.worktrees, dupeWorktree);
         out.submodules = try dupeList(Submodule, allocator, self.submodules, dupeSubmodule);
         out.commits = try dupeList(Commit, allocator, self.commits, dupeCommit);
+        out.commits_head = try allocator.dupe(u8, self.commits_head);
         out.reflog = try dupeList(Commit, allocator, self.reflog, dupeCommit);
         out.stash = try dupeList(StashEntry, allocator, self.stash, dupeStash);
         return out;

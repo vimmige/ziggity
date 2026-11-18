@@ -767,6 +767,24 @@ pub const Git = struct {
         return self.allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \t\r\n"));
     }
 
+    /// Commit and full symbolic ref together, so branches at the same commit
+    /// still have different identities. The first line is always the hash.
+    pub fn historyHead(self: *Git) ![]u8 {
+        return self.output(&.{ "rev-parse", "HEAD", "--symbolic-full-name", "HEAD" });
+    }
+
+    pub fn loadHeadCommits(self: *Git, limit: usize) !struct { head: []u8, commits: []model.Commit } {
+        const head = self.historyHead() catch |err| switch (err) {
+            GitError.CommandFailed => return .{ .head = &.{}, .commits = &.{} },
+            else => return err,
+        };
+        errdefer self.allocator.free(head);
+        const hash = head[0 .. std.mem.indexOfScalar(u8, head, '\n') orelse head.len];
+        const commits = try self.loadCommits(hash, limit);
+        self.markPushStatus(commits);
+        return .{ .head = head, .commits = commits };
+    }
+
     /// A cheap fingerprint of HEAD plus every ref, for the background
     /// external-change poll. `git show-ref --head` lists `<sha> <ref>` for HEAD
     /// and all refs without touching the working tree, so it is far cheaper than
@@ -1073,11 +1091,11 @@ pub const Git = struct {
         return std.fmt.allocPrint(allocator, "{s} {s}", .{ epoch, tz });
     }
 
-    /// The merge base of HEAD and `ref` (their common ancestor, the fork point),
+    /// The merge base of `head` and `ref` (their common ancestor, the fork point),
     /// used to bound an autosquash to the commits your branch added since `ref`.
     /// Errors when there is no common ancestor or `ref` doesn't resolve. Owned.
-    pub fn mergeBaseWith(self: *Git, ref: []const u8) ![]u8 {
-        var res = try self.exec(&.{ "merge-base", "HEAD", ref });
+    pub fn mergeBaseWith(self: *Git, head: []const u8, ref: []const u8) ![]u8 {
+        var res = try self.exec(&.{ "merge-base", head, ref });
         defer res.deinit(self.allocator);
         if (!res.ok()) return error.NoMergeBase;
         const hash = std.mem.trim(u8, res.stdout, " \t\r\n");

@@ -1400,6 +1400,7 @@ const RepoLoadCtx = struct {
     worktrees: ?[]model.Worktree = null,
     submodules: ?[]model.Submodule = null,
     commits: ?[]model.Commit = null,
+    commits_head: []u8 = &.{},
     reflog: ?[]model.Commit = null,
     stash: ?[]model.StashEntry = null,
 
@@ -1440,7 +1441,9 @@ fn loadSubmodulesW(ctx: *RepoLoadCtx) void {
 }
 fn loadCommitsW(ctx: *RepoLoadCtx) void {
     var g = ctx.git();
-    ctx.commits = g.loadCommits("HEAD", ctx.commit_limit) catch null;
+    const history = g.loadHeadCommits(ctx.commit_limit) catch return;
+    ctx.commits = history.commits;
+    ctx.commits_head = history.head;
 }
 fn loadReflogW(ctx: *RepoLoadCtx) void {
     var g = ctx.git();
@@ -1501,6 +1504,7 @@ pub fn loadRepoDataAsync(gpa: std.mem.Allocator, io: std.Io, environ: *std.proce
     data.worktrees = ctx.worktrees orelse &.{};
     data.submodules = ctx.submodules orelse &.{};
     data.commits = ctx.commits orelse &.{};
+    data.commits_head = ctx.commits_head;
     data.reflog = ctx.reflog orelse &.{};
     data.stash = ctx.stash orelse &.{};
     return data;
@@ -1594,8 +1598,9 @@ pub fn loadScopesAsync(gpa: std.mem.Allocator, io: std.Io, environ: *std.process
         } else |_| {}
     }
     if (scopes.contains(.commits)) {
-        if (wgit.loadCommits("HEAD", commit_limit)) |c| {
-            d.commits = c;
+        if (wgit.loadHeadCommits(commit_limit)) |history| {
+            d.commits = history.commits;
+            d.commits_head = history.head;
             loaded.insert(.commits);
         } else |_| {}
     }
@@ -1695,7 +1700,7 @@ pub const Mutation = union(enum) {
     amend_continue_rebase,
     apply_custom_patch: struct { patch: []const u8, reverse: bool },
     remove_patch_from_commit: struct { base_ref: []const u8, todo: []const u8, patch: []const u8 },
-    rebase_todo: struct { base_ref: []const u8, todo: []const u8, message: ?[]const u8 },
+    rebase_todo: struct { base_ref: []const u8, todo: []const u8, message: ?[]const u8, expected_head: []const u8 = &.{} },
     /// A coalesced batch of stage/unstage work, so rapid space-toggles and the
     /// stage/unstage-all key run off the UI thread instead of blocking input on a
     /// synchronous git command. `all` (when set) runs `git add -A` / `git reset`
@@ -1794,7 +1799,20 @@ pub const Mutation = union(enum) {
             .amend_continue_rebase => wgit.amendAndContinueRebase(),
             .apply_custom_patch => |x| wgit.applyCustomPatch(x.patch, x.reverse),
             .remove_patch_from_commit => |x| wgit.removePatchFromCommit(x.base_ref, x.todo, x.patch),
-            .rebase_todo => |x| wgit.rebaseTodo(x.base_ref, x.todo, x.message),
+            .rebase_todo => |x| blk: {
+                if (x.expected_head.len > 0) {
+                    const head = wgit.historyHead() catch null;
+                    defer if (head) |value| gpa.free(value);
+                    if (head == null or !std.mem.eql(u8, head.?, x.expected_head)) {
+                        break :blk .{
+                            .stdout = &.{},
+                            .stderr = try gpa.dupe(u8, "Branch or HEAD changed. Open a new rebase plan."),
+                            .term = .{ .exited = 1 },
+                        };
+                    }
+                }
+                break :blk wgit.rebaseTodo(x.base_ref, x.todo, x.message);
+            },
             .stage_batch => |b| blk: {
                 // All-op baseline first, then per-path overrides; report the
                 // first failure.
@@ -1870,7 +1888,15 @@ pub const Mutation = union(enum) {
             .amend_continue_rebase => .amend_continue_rebase,
             .apply_custom_patch => |x| .{ .apply_custom_patch = .{ .patch = try gpa.dupe(u8, x.patch), .reverse = x.reverse } },
             .remove_patch_from_commit => |x| .{ .remove_patch_from_commit = .{ .base_ref = try gpa.dupe(u8, x.base_ref), .todo = try gpa.dupe(u8, x.todo), .patch = try gpa.dupe(u8, x.patch) } },
-            .rebase_todo => |x| .{ .rebase_todo = .{ .base_ref = try gpa.dupe(u8, x.base_ref), .todo = try gpa.dupe(u8, x.todo), .message = if (x.message) |m| try gpa.dupe(u8, m) else null } },
+            .rebase_todo => |x| blk: {
+                const base_ref = try gpa.dupe(u8, x.base_ref);
+                errdefer gpa.free(base_ref);
+                const todo = try gpa.dupe(u8, x.todo);
+                errdefer gpa.free(todo);
+                const message = try dupeOptStr(gpa, x.message);
+                errdefer if (message) |m| gpa.free(m);
+                break :blk .{ .rebase_todo = .{ .base_ref = base_ref, .todo = todo, .message = message, .expected_head = try gpa.dupe(u8, x.expected_head) } };
+            },
             .stage_batch => |b| .{ .stage_batch = .{ .all = b.all, .add = try dupeStrList(gpa, b.add), .reset = try dupeStrList(gpa, b.reset) } },
         };
     }
@@ -1961,6 +1987,7 @@ pub const Mutation = union(enum) {
             .rebase_todo => |x| {
                 gpa.free(x.base_ref);
                 gpa.free(x.todo);
+                gpa.free(x.expected_head);
                 if (x.message) |m| gpa.free(m);
             },
             .stage_batch => |b| {
@@ -3972,6 +3999,7 @@ pub const App = struct {
     // base, and the cursor. Non-null only while `mode == .rebase_plan`.
     rebase_plan: ?[]rebaseplan_mod.Entry = null,
     rebase_plan_base: []u8 = &.{},
+    rebase_plan_head: []u8 = &.{},
     rebase_plan_index: usize = 0,
     // Range-select within the plan editor: the anchor of a multi-commit
     // selection (null = none). The cursor is `rebase_plan_index`; the selection
@@ -4737,8 +4765,14 @@ pub const App = struct {
             if (model.dupeTags(a, src.tags)) |t| self.data.replaceTags(a, t) else |_| {}
         }
         if (s.contains(.commits)) {
-            if (model.dupeCommits(a, src.commits)) |c| self.data.replaceCommits(a, c) else |_| {}
-            self.rebuildInlineGraph();
+            if (a.dupe(u8, src.commits_head)) |head| {
+                if (model.dupeCommits(a, src.commits)) |c| {
+                    self.data.replaceCommits(a, c, head);
+                    self.rebuildInlineGraph();
+                } else |_| {
+                    a.free(head);
+                }
+            } else |_| {}
         }
         if (s.contains(.reflog)) {
             if (model.dupeCommits(a, src.reflog)) |c| self.data.replaceReflog(a, c) else |_| {}
@@ -5665,8 +5699,15 @@ pub const App = struct {
             .tag_commit => try self.startTagAtCommit(),
             .open_pull_request => try diffmode_mod.openPullRequest(self),
             .move_to_new_branch => try self.startMoveCommitsToNewBranch(),
-            .interactive_rebase => try rebaseplan_mod.start(self, false),
-            .interactive_rebase_root => try rebaseplan_mod.start(self, true),
+            .interactive_rebase, .interactive_rebase_root => {
+                const head = self.git.historyHead() catch null;
+                defer if (head) |value| self.allocator.free(value);
+                if (head == null or !std.mem.eql(u8, head.?, self.data.commits_head)) {
+                    self.refreshViews(Refresh.branches_commits);
+                    return self.setMessage("Commit list is out of date. Try again after it refreshes.", .{});
+                }
+                try rebaseplan_mod.start(self, action == .interactive_rebase_root);
+            },
             .log_menu => try commitgraph_mod.open(self),
             .copy_commit_attr => {
                 if (self.selectedCommit() == null) {
