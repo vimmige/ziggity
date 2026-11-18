@@ -1681,7 +1681,7 @@ pub const Mutation = union(enum) {
     stash_drop: usize,
     stash_drop_many: []const usize,
     rename_stash: struct { index: usize, hash: []const u8, message: []const u8 },
-    undo,
+    undo: git_mod.Git.UndoFingerprint,
     merge: []const u8,
     rebase: []const u8,
     rebase_onto_marked: struct { newbase: []const u8, marked_base: []const u8 },
@@ -1783,7 +1783,7 @@ pub const Mutation = union(enum) {
             .stash_drop => |idx| wgit.stashDrop(idx),
             .stash_drop_many => |indices| wgit.stashDropMany(indices),
             .rename_stash => |x| wgit.renameStash(x.index, x.hash, x.message),
-            .undo => wgit.undoLastOperation(),
+            .undo => |expected| wgit.undoLastOperation(expected),
             .merge => |b| wgit.mergeBranch(b),
             .rebase => |b| wgit.rebaseOnto(b),
             .rebase_onto_marked => |x| wgit.rebaseOntoMarked(x.newbase, x.marked_base),
@@ -1872,7 +1872,7 @@ pub const Mutation = union(enum) {
             .stash_drop => |idx| .{ .stash_drop = idx },
             .stash_drop_many => |indices| .{ .stash_drop_many = try gpa.dupe(usize, indices) },
             .rename_stash => |x| .{ .rename_stash = .{ .index = x.index, .hash = try gpa.dupe(u8, x.hash), .message = try gpa.dupe(u8, x.message) } },
-            .undo => .undo,
+            .undo => |expected| .{ .undo = expected },
             .merge => |b| .{ .merge = try gpa.dupe(u8, b) },
             .rebase => |b| .{ .rebase = try gpa.dupe(u8, b) },
             .rebase_onto_marked => |x| .{ .rebase_onto_marked = .{ .newbase = try gpa.dupe(u8, x.newbase), .marked_base = try gpa.dupe(u8, x.marked_base) } },
@@ -4133,6 +4133,7 @@ pub const App = struct {
     command_log_max_scroll: usize = 0,
     undo_label_buf: [160]u8 = undefined,
     undo_label_len: usize = 0,
+    undo_fingerprint: git_mod.Git.UndoFingerprint = undefined,
     active_menu: ?Menu = null,
     /// App-owned backing for a menu's optional path subtitle, copied on open so
     /// it survives a background file-list refresh while the menu is open.
@@ -12114,23 +12115,26 @@ pub const App = struct {
         return self.requestConfirmation(.discard_all, "confirm discard all changes", .{});
     }
 
-    /// Undo the last history operation by resetting HEAD to its prior reflog
-    /// position. Refused while an operation is in progress or when there are
-    /// tracked changes (which a hard reset would discard).
+    /// Ask about one reflog entry. The worker checks it again before resetting.
     fn startUndoConfirm(self: *App) !void {
         if (self.data.state != .clean) {
-            try self.setMessage("finish the in-progress operation first (m)", .{});
-            return;
+            return self.setMessage("finish the in-progress operation first (m)", .{});
         }
-        if (self.data.stagedCount() + self.data.unstagedCount() > 0) {
-            try self.setMessage("commit or discard changes before undo", .{});
-            return;
+        for (self.data.files) |file| {
+            if (file.tracked or file.has_staged) {
+                return self.setMessage("commit or stash tracked changes before undo", .{});
+            }
         }
-        const subject = self.git.reflogSubject() catch try self.allocator.alloc(u8, 0);
-        defer self.allocator.free(subject);
-        const n = @min(subject.len, self.undo_label_buf.len);
-        @memcpy(self.undo_label_buf[0..n], subject[0..n]);
+        const event = (self.git.reflogUndo() catch return self.setMessage("could not read HEAD reflog", .{})) orelse
+            return self.setMessage("no earlier reflog entry to undo to", .{});
+        defer self.allocator.free(event.raw);
+        if (std.mem.startsWith(u8, event.subject, "checkout:")) {
+            return self.setMessage("undo cannot switch branches. Use checkout", .{});
+        }
+        const n = @min(event.subject.len, self.undo_label_buf.len);
+        @memcpy(self.undo_label_buf[0..n], event.subject[0..n]);
         self.undo_label_len = n;
+        self.undo_fingerprint = event.fingerprint;
 
         return self.requestConfirmation(.undo, "confirm undo", .{});
     }
@@ -12375,7 +12379,7 @@ pub const App = struct {
                 }
                 return self.runMutationScoped(try self.git.removeRemote(name), Refresh.remotes, "removed remote {s}", .{name});
             },
-            .undo => return self.requestMutation(.undo, .{ .gerund = "undoing", .command = "git reset (undo)", .refresh = Refresh.all }, "undone", .{}),
+            .undo => return self.requestMutation(.{ .undo = self.undo_fingerprint }, .{ .gerund = "undoing", .command = "git reset (undo)", .refresh = Refresh.all }, "undone", .{}),
             .force_push => return self.requestAsync(.push_force),
             .force_push_plain => return self.requestAsync(.push_force_plain),
             .delete_index_lock => return self.confirmDeleteIndexLock(),

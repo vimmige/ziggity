@@ -377,6 +377,10 @@ pub const Git = struct {
     }
 
     pub fn exec(self: *Git, args: []const []const u8) !ExecResult {
+        return self.execWithRetry(args, true);
+    }
+
+    fn execWithRetry(self: *Git, args: []const []const u8, retry: bool) !ExecResult {
         self.recordCommand(args);
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(self.allocator);
@@ -393,14 +397,18 @@ pub const Git = struct {
         try argv.append(self.allocator, "--no-optional-locks");
         try argv.appendSlice(self.allocator, args);
 
-        const result = try runWithLockRetry(self.allocator, self.io, .{
+        const options: std.process.RunOptions = .{
             .argv = argv.items,
             .cwd = .{ .path = self.root },
             // Also keep the env (GIT_TERMINAL_PROMPT=0, GIT_OPTIONAL_LOCKS=0).
             .environ_map = self.environ,
             .stdout_limit = .limited(16 * 1024 * 1024),
             .stderr_limit = .limited(4 * 1024 * 1024),
-        });
+        };
+        const result = try if (retry)
+            runWithLockRetry(self.allocator, self.io, options)
+        else
+            std.process.run(self.allocator, self.io, options);
         return .{
             .stdout = result.stdout,
             .stderr = result.stderr,
@@ -2145,34 +2153,110 @@ pub const Git = struct {
         return self.exec(&.{ "cherry-pick", "--abort" });
     }
 
-    /// The subject of the most recent reflog entry (describes the last op).
-    pub fn reflogSubject(self: *Git) ![]u8 {
-        var result = try self.exec(&.{ "reflog", "-1", "--format=%gs" });
-        defer result.deinit(self.allocator);
-        if (!result.ok()) return self.allocator.alloc(u8, 0);
-        return self.allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \t\r\n"));
+    pub const UndoFingerprint = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+
+    const ReflogUndo = struct {
+        raw: []u8,
+        head: []const u8,
+        target: []const u8,
+        subject: []const u8,
+        fingerprint: UndoFingerprint,
+    };
+
+    /// Caller owns the returned raw bytes, which back the parsed fields.
+    pub fn reflogUndo(self: *Git) !?ReflogUndo {
+        const raw = try self.output(&.{ "reflog", "-z", "-2", "--date=raw", "--format=%H%x00%gD%x00%gs", "HEAD" });
+        errdefer self.allocator.free(raw);
+        var fields = std.mem.splitScalar(u8, raw, 0);
+        const head = fields.next() orelse return error.UnexpectedOutput;
+        if (head.len == 0) {
+            self.allocator.free(raw);
+            return null;
+        }
+        _ = fields.next() orelse return error.UnexpectedOutput;
+        const subject = fields.next() orelse return error.UnexpectedOutput;
+        const target = fields.next() orelse return error.UnexpectedOutput;
+        if (target.len == 0) {
+            self.allocator.free(raw);
+            return null;
+        }
+        if ((head.len != 40 and head.len != 64) or target.len != head.len) return error.UnexpectedOutput;
+
+        const ref = try self.output(&.{ "rev-parse", "--symbolic-full-name", "HEAD" });
+        defer self.allocator.free(ref);
+        const current_head = try self.headHash();
+        defer self.allocator.free(current_head);
+        if (!std.mem.eql(u8, head, current_head)) return error.HeadChanged;
+
+        var digest = std.crypto.hash.sha2.Sha256.init(.{});
+        digest.update(raw);
+        digest.update(ref);
+        return .{
+            .raw = raw,
+            .head = head,
+            .target = target,
+            .subject = subject,
+            .fingerprint = digest.finalResult(),
+        };
     }
 
-    /// Undo the last history operation by resetting HEAD to its prior position.
-    ///
-    /// A plain commit or an amend folds your staged changes into the commit, so a
-    /// `--hard` reset would throw those changes away. Detect that from the reflog
-    /// subject and undo with `--soft` instead, which moves HEAD back but keeps the
-    /// index and working tree — the changes reappear staged rather than vanishing.
-    /// Every other operation (merge, rebase, reset, cherry-pick, revert, …) has no
-    /// such uncommitted work to preserve and restores its prior state with `--hard`.
-    pub fn undoLastOperation(self: *Git) !ExecResult {
-        const subject = self.reflogSubject() catch null;
-        defer if (subject) |s| self.allocator.free(s);
-        const mode: []const u8 = if (subject != null and undoKeepsChanges(subject.?)) "--soft" else "--hard";
-        return self.exec(&.{ "reset", mode, "HEAD@{1}" });
+    fn undoRefused(self: *Git, message: []const u8) !ExecResult {
+        return .{ .stdout = &.{}, .stderr = try self.allocator.dupe(u8, message), .term = .{ .exited = 1 } };
+    }
+
+    fn undoOverwritesUntracked(self: *Git, event: ReflogUndo) !bool {
+        // Include ignored paths, which reset --keep can overwrite.
+        const untracked = try self.output(&.{ "ls-files", "--others", "-z" });
+        defer self.allocator.free(untracked);
+        if (untracked.len == 0) return false;
+
+        const added = try self.output(&.{ "diff", "--no-ext-diff", "--name-only", "--diff-filter=A", "--no-renames", "-z", event.head, event.target, "--" });
+        defer self.allocator.free(added);
+        var targets = std.mem.tokenizeScalar(u8, added, 0);
+        while (targets.next()) |target| {
+            var others = std.mem.tokenizeScalar(u8, untracked, 0);
+            while (others.next()) |path| {
+                const other = std.mem.trimEnd(u8, path, "/");
+                const short, const long = if (target.len <= other.len) .{ target, other } else .{ other, target };
+                if (std.ascii.startsWithIgnoreCase(long, short) and
+                    (long.len == short.len or long[short.len] == '/')) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Undo only the operation approved in the dialog.
+    pub fn undoLastOperation(self: *Git, expected: UndoFingerprint) !ExecResult {
+        const event = self.reflogUndo() catch return self.undoRefused("could not verify the reflog. Open undo again");
+        const pending = event orelse return self.undoRefused("reflog changed. Open undo again");
+        defer self.allocator.free(pending.raw);
+        if (!std.mem.eql(u8, &expected, &pending.fingerprint)) return self.undoRefused("HEAD or reflog changed. Open undo again");
+        if (std.mem.startsWith(u8, pending.subject, "checkout:")) return self.undoRefused("undo cannot switch branches. Use checkout");
+        if (self.detectState() != .clean or self.gitPathExists("REVERT_HEAD") or self.gitPathExists("sequencer") or self.isBisecting())
+            return self.undoRefused("finish the in-progress operation before undo");
+
+        const keep_changes = undoKeepsChanges(pending.subject);
+        if (!keep_changes and try self.undoOverwritesUntracked(pending))
+            return self.undoRefused("undo would overwrite an untracked or ignored file. Move it first");
+
+        const tracked = try self.output(&.{ "status", "--porcelain=v1", "--untracked-files=no", "--ignore-submodules=none" });
+        defer self.allocator.free(tracked);
+        if (tracked.len != 0) return self.undoRefused("commit or stash tracked changes before undo");
+
+        const current = (self.reflogUndo() catch return self.undoRefused("could not verify the reflog. Open undo again")) orelse
+            return self.undoRefused("reflog changed. Open undo again");
+        defer self.allocator.free(current.raw);
+        if (!std.mem.eql(u8, &expected, &current.fingerprint)) return self.undoRefused("HEAD or reflog changed. Open undo again");
+
+        // A retry after a lock failure would use an old safety check.
+        return self.execWithRetry(&.{ "reset", if (keep_changes) "--soft" else "--keep", "--no-recurse-submodules", pending.target, "--" }, false);
     }
 
     /// True when undoing the operation described by reflog subject `s` must keep
     /// the working-tree changes it folded in (commit / amend / initial commit),
     /// i.e. reset `--soft`. False for operations that only moved history
     /// (`merge …`, `commit (merge)`, `commit (cherry-pick)`, `revert:`, `reset:`,
-    /// rebase, …), which reset `--hard`.
+    /// rebase, …), which reset `--keep`.
     pub fn undoKeepsChanges(s: []const u8) bool {
         return std.mem.startsWith(u8, s, "commit: ") or
             std.mem.startsWith(u8, s, "commit (amend)") or
