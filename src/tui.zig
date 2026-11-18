@@ -68,6 +68,11 @@ const Event = union(enum) {
     anim_tick,
     fetch_tick,
     external_check_tick,
+    worker_wake,
+    worker_done: WorkerDone,
+};
+
+const WorkerDone = enum(u4) {
     external_check_done,
     bg_fetch_done,
     commit_graph_done,
@@ -77,17 +82,46 @@ const Event = union(enum) {
     mutation_done,
     repo_load_done,
     scoped_load_done,
-    tags_load_done: usize,
+    tags_load_done,
     graph_done,
     pr_status_done,
     ai_title_done,
     ai_desc_done,
     pr_gen_done,
+
+    fn bit(self: WorkerDone) u16 {
+        return @as(u16, 1) << @backingInt(self);
+    }
+};
+
+const WorkerCompletions = struct {
+    loop: *vaxis.Loop(Event),
+    pending: std.atomic.Value(u16) = .init(0),
+
+    fn post(self: *WorkerCompletions, done: WorkerDone) void {
+        // Each worker is single-flight. Store its completion before attempting
+        // to wake the loop: a full input queue already has events to wake it.
+        const previous = self.pending.fetchOr(done.bit(), .release);
+        if (previous == 0) _ = self.loop.tryPostEvent(.worker_wake) catch false;
+    }
+
+    fn take(self: *WorkerCompletions) ?WorkerDone {
+        const pending = self.pending.load(.monotonic);
+        if (pending == 0) return null;
+        // Only the UI thread removes completions.
+        const done: WorkerDone = @fromBackingInt(@intCast(@ctz(pending)));
+        _ = self.pending.fetchAnd(~done.bit(), .acquire);
+        return done;
+    }
+
+    fn discard(self: *WorkerCompletions, done: WorkerDone) void {
+        _ = self.pending.fetchAnd(~done.bit(), .monotonic);
+    }
 };
 
 const AsyncJob = struct {
     io: std.Io,
-    loop: *vaxis.Loop(Event),
+    completions: *WorkerCompletions,
     root: []const u8,
     environ: *std.process.Environ.Map,
     /// When credentials have been entered, an owned clone of `environ` carrying
@@ -174,7 +208,7 @@ fn asyncWorker(job: *AsyncJob) void {
 }
 
 fn postDone(job: *AsyncJob) void {
-    _ = job.loop.tryPostEvent(.command_done) catch false;
+    job.completions.post(.command_done);
 }
 
 /// A preview diff generated off the UI loop. Runs the queued `PreviewJob`'s git
@@ -182,7 +216,7 @@ fn postDone(job: *AsyncJob) void {
 /// posts `.preview_done` so the loop can hand the result back to the app.
 const PreviewRun = struct {
     io: std.Io,
-    loop: *vaxis.Loop(Event),
+    completions: *WorkerCompletions,
     root: []const u8,
     job: app_mod.PreviewJob,
     result: ?[]u8 = null,
@@ -190,7 +224,7 @@ const PreviewRun = struct {
 
 fn previewWorker(pr: *PreviewRun) void {
     pr.result = pr.job.run(async_allocator, pr.io, pr.root) catch null;
-    _ = pr.loop.tryPostEvent(.preview_done) catch false;
+    pr.completions.post(.preview_done);
 }
 
 /// The background working-tree refresh (the 1.5s tick). Gathers `git status`
@@ -198,7 +232,7 @@ fn previewWorker(pr: *PreviewRun) void {
 /// `.worktree_done` so the loop can apply the snapshot on the UI thread.
 const WorktreeRun = struct {
     io: std.Io,
-    loop: *vaxis.Loop(Event),
+    completions: *WorkerCompletions,
     root: []u8,
     git_dir: []const u8,
     environ: *std.process.Environ.Map,
@@ -210,7 +244,7 @@ const WorktreeRun = struct {
 
 fn worktreeWorker(wr: *WorktreeRun) void {
     wr.result = app_mod.WorktreeSnapshot.load(async_allocator, wr.io, wr.environ, wr.root, wr.git_dir, wr.untracked, wr.amend_view) catch null;
-    _ = wr.loop.tryPostEvent(.worktree_done) catch false;
+    wr.completions.post(.worktree_done);
 }
 
 /// The cheap external-change poll (config `external_change_interval_secs`).
@@ -220,7 +254,7 @@ fn worktreeWorker(wr: *WorktreeRun) void {
 /// could not run (treated as "unchanged" by the apply step).
 const ExternalCheckRun = struct {
     io: std.Io,
-    loop: *vaxis.Loop(Event),
+    completions: *WorkerCompletions,
     root: []u8,
     git_dir: []const u8,
     environ: *std.process.Environ.Map,
@@ -236,14 +270,14 @@ fn externalCheckWorker(er: *ExternalCheckRun) void {
         .git_dir = @constCast(er.git_dir),
     };
     er.result = wgit.refsFingerprint();
-    _ = er.loop.tryPostEvent(.external_check_done) catch false;
+    er.completions.post(.external_check_done);
 }
 
 /// The commit-graph viewer's `git log --graph` load, run off the UI loop so a
 /// big repo's graph doesn't block navigation. Posts `.graph_done`.
 const GraphRun = struct {
     io: std.Io,
-    loop: *vaxis.Loop(Event),
+    completions: *WorkerCompletions,
     root: []const u8,
     environ: *std.process.Environ.Map,
     all: bool,
@@ -317,7 +351,7 @@ fn graphWorker(gr: *GraphRun) void {
 }
 
 fn postGraph(gr: *GraphRun) void {
-    _ = gr.loop.tryPostEvent(.graph_done) catch false;
+    gr.completions.post(.graph_done);
 }
 
 /// A quiet periodic `git fetch` run off the UI loop (config `fetch_interval_secs`), so
@@ -327,7 +361,7 @@ fn postGraph(gr: *GraphRun) void {
 /// `.bg_fetch_done` so the loop can refresh the branch/status views.
 const BgFetchRun = struct {
     io: std.Io,
-    loop: *vaxis.Loop(Event),
+    completions: *WorkerCompletions,
     root: []const u8,
     environ: *std.process.Environ.Map,
     /// The `--prune`/`--no-prune` flag forced by `fetch_prune_mode`, or null to
@@ -341,7 +375,7 @@ fn bgFetchWorker(fr: *BgFetchRun) void {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(async_allocator);
     argv.appendSlice(async_allocator, &.{ "git", "--no-optional-locks", "fetch", "--all", "--no-write-fetch-head" }) catch {
-        _ = fr.loop.tryPostEvent(.bg_fetch_done) catch false;
+        fr.completions.post(.bg_fetch_done);
         return;
     };
     if (fr.prune_arg) |p| argv.append(async_allocator, p) catch {};
@@ -355,7 +389,7 @@ fn bgFetchWorker(fr: *BgFetchRun) void {
         async_allocator.free(r.stdout);
         async_allocator.free(r.stderr);
     } else |_| {}
-    _ = fr.loop.tryPostEvent(.bg_fetch_done) catch false;
+    fr.completions.post(.bg_fetch_done);
 }
 
 /// A background refresh of git's commit-graph cache (see `Git.ensureCommitGraph`),
@@ -363,7 +397,7 @@ fn bgFetchWorker(fr: *BgFetchRun) void {
 /// `.commit_graph_done`.
 const CommitGraphRun = struct {
     io: std.Io,
-    loop: *vaxis.Loop(Event),
+    completions: *WorkerCompletions,
     root: []u8,
     git_dir: []const u8,
     environ: *std.process.Environ.Map,
@@ -374,7 +408,7 @@ fn commitGraphWorker(cr: *CommitGraphRun) void {
     g.ensureCommitGraph();
     for (g.command_log.items) |e| async_allocator.free(e);
     g.command_log.deinit(async_allocator);
-    _ = cr.loop.tryPostEvent(.commit_graph_done) catch false;
+    cr.completions.post(.commit_graph_done);
 }
 
 /// A background pull/merge-request status fetch (via the `gh`/`glab` CLI), run
@@ -382,7 +416,7 @@ fn commitGraphWorker(cr: *CommitGraphRun) void {
 /// `.pr_status_done`; the result is applied on the UI thread.
 const PrStatusRun = struct {
     io: std.Io,
-    loop: *vaxis.Loop(Event),
+    completions: *WorkerCompletions,
     root: []u8,
     environ: *std.process.Environ.Map,
     result: ?app_mod.PrStatusSnapshot = null,
@@ -390,7 +424,7 @@ const PrStatusRun = struct {
 
 fn prStatusWorker(pr: *PrStatusRun) void {
     pr.result = app_mod.PrStatusSnapshot.load(async_allocator, pr.io, pr.environ, pr.root);
-    _ = pr.loop.tryPostEvent(.pr_status_done) catch false;
+    pr.completions.post(.pr_status_done);
 }
 
 /// A slow git mutation (merge/rebase/bisect/…) run off the UI loop on a
@@ -398,7 +432,7 @@ fn prStatusWorker(pr: *PrStatusRun) void {
 /// result and refresh on the UI thread.
 const MutationRun = struct {
     io: std.Io,
-    loop: *vaxis.Loop(Event),
+    completions: *WorkerCompletions,
     root: []u8,
     git_dir: []const u8,
     environ: *std.process.Environ.Map,
@@ -410,7 +444,7 @@ const MutationRun = struct {
 
 fn mutationWorker(mr: *MutationRun) void {
     mr.result = mr.mutation.run(async_allocator, mr.io, mr.environ, mr.root, mr.git_dir, mr.amend_view, &mr.checkout_head) catch null;
-    _ = mr.loop.tryPostEvent(.mutation_done) catch false;
+    mr.completions.post(.mutation_done);
 }
 
 /// The one-shot initial repo load (async startup). Loads the full
@@ -418,7 +452,7 @@ fn mutationWorker(mr: *MutationRun) void {
 /// the loop can deep-copy it into the gpa and paint the populated panels.
 const RepoLoadRun = struct {
     io: std.Io,
-    loop: *vaxis.Loop(Event),
+    completions: *WorkerCompletions,
     root: []u8,
     git_dir: []const u8,
     environ: *std.process.Environ.Map,
@@ -432,7 +466,7 @@ const RepoLoadRun = struct {
 
 fn repoLoadWorker(rl: *RepoLoadRun) void {
     rl.result = app_mod.loadRepoDataAsync(async_allocator, rl.io, rl.environ, rl.root, rl.git_dir, rl.branch_sort, rl.log_order, rl.untracked, rl.commit_limit, rl.amend_view);
-    _ = rl.loop.tryPostEvent(.repo_load_done) catch false;
+    rl.completions.post(.repo_load_done);
 }
 
 /// A per-view scoped refresh: loads just the requested slow
@@ -441,7 +475,7 @@ fn repoLoadWorker(rl: *RepoLoadRun) void {
 /// page-allocated copies of the active Commits filter, freed when done.
 const ScopedLoadRun = struct {
     io: std.Io,
-    loop: *vaxis.Loop(Event),
+    completions: *WorkerCompletions,
     root: []u8,
     git_dir: []const u8,
     environ: *std.process.Environ.Map,
@@ -454,7 +488,7 @@ const ScopedLoadRun = struct {
     untracked: git_mod.Git.UntrackedFiles = .all,
     commit_limit: usize = app_mod.commit_load_batch,
     result: ?app_mod.ScopedData = null,
-    tag_request: ?usize = null,
+    tags_only: bool = false,
 
     amend_view: ?git_mod.Git.AmendView = null,
 
@@ -474,7 +508,7 @@ fn scopedLoadWorker(sr: *ScopedLoadRun) void {
         .author = sr.author,
         .path = sr.path,
     }, sr.branch_sort, sr.log_order, sr.untracked, sr.commit_limit, sr.amend_view);
-    _ = sr.loop.tryPostEvent(if (sr.tag_request) |id| .{ .tags_load_done = id } else .scoped_load_done) catch false;
+    sr.completions.post(if (sr.tags_only) .tags_load_done else .scoped_load_done);
 }
 
 /// An off-thread AI commit-authoring request (one per field). Owns its command
@@ -484,7 +518,7 @@ fn scopedLoadWorker(sr: *ScopedLoadRun) void {
 /// worker (they belong to the app's Git), so a closed dialog can't dangle it.
 const AiGenRun = struct {
     io: std.Io,
-    loop: *vaxis.Loop(Event),
+    completions: *WorkerCompletions,
     root: []u8,
     git_dir: []const u8,
     environ: *std.process.Environ.Map,
@@ -536,19 +570,19 @@ fn runAiGen(ag: *AiGenRun) void {
 
 fn aiTitleWorker(ag: *AiGenRun) void {
     runAiGen(ag);
-    _ = ag.loop.tryPostEvent(.ai_title_done) catch false;
+    ag.completions.post(.ai_title_done);
 }
 
 fn aiDescWorker(ag: *AiGenRun) void {
     runAiGen(ag);
-    _ = ag.loop.tryPostEvent(.ai_desc_done) catch false;
+    ag.completions.post(.ai_desc_done);
 }
 
 /// Off-loop PR-description generation: gather `refLog`/`refDiff` for the range,
 /// run `generatePrDoc`, and post `.pr_gen_done`. Result strings are async-owned.
 const PrGenRun = struct {
     io: std.Io,
-    loop: *vaxis.Loop(Event),
+    completions: *WorkerCompletions,
     root: []u8,
     git_dir: []const u8,
     environ: *std.process.Environ.Map,
@@ -598,7 +632,7 @@ fn prGenWorker(pr: *PrGenRun) void {
     } else |_| {
         pr.failed = true;
     }
-    _ = pr.loop.tryPostEvent(.pr_gen_done) catch false;
+    pr.completions.post(.pr_gen_done);
 }
 
 // The ticker always wakes at this fast cadence so the spinner animates smoothly
@@ -685,6 +719,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
     }
     try vx.queryTerminal(writer, .fromSeconds(1));
 
+    var completions: WorkerCompletions = .{ .loop = &loop };
     var async_job: AsyncJob = undefined;
     var async_future: ?std.Io.Future(void) = null;
     defer if (async_future) |*f| {
@@ -779,7 +814,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
     // Load the repo off-thread: the loop's initial winsize event
     // paints the skeleton with "Loading…" placeholders right away, and the
     // panels fill in when `repo_load_done` lands — no startup freeze, no flash.
-    var repo_load_run: RepoLoadRun = .{ .io = io, .loop = &loop, .root = app.git.root, .git_dir = app.git.git_dir, .environ = app.git.environ, .branch_sort = app.git.branch_sort, .log_order = app.git.log_order, .untracked = app.git.untracked_files, .amend_view = app.git.amend_view, .commit_limit = app.commit_limit };
+    var repo_load_run: RepoLoadRun = .{ .io = io, .completions = &completions, .root = app.git.root, .git_dir = app.git.git_dir, .environ = app.git.environ, .branch_sort = app.git.branch_sort, .log_order = app.git.log_order, .untracked = app.git.untracked_files, .amend_view = app.git.amend_view, .commit_limit = app.commit_limit };
     var repo_load_future: ?std.Io.Future(void) = null;
     defer if (repo_load_future) |*f| {
         f.cancel(io);
@@ -800,7 +835,6 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
     };
     var tags_load_run: ScopedLoadRun = undefined;
     var tags_load_future: ?std.Io.Future(void) = null;
-    var tag_request: usize = 0;
     defer if (tags_load_future) |*f| {
         f.cancel(io);
         if (tags_load_run.result) |*r| r.deinit(async_allocator);
@@ -814,7 +848,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
     } else |_| {}
 
     while (app.running) {
-        const event = try loop.nextEvent();
+        const event = if (completions.take()) |done| Event{ .worker_done = done } else try loop.nextEvent();
         // Motion mouse events flood with any-motion tracking; skip re-rendering
         // when nothing changed.
         var render_needed = true;
@@ -833,150 +867,153 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                 app.requestPrStatus();
             },
             .external_check_tick => app.requestExternalChangeCheck(),
-            .external_check_done => {
-                if (ext_check_future) |*f| {
-                    f.await(io);
-                    ext_check_future = null;
-                    app.applyRefsFingerprint(ext_check_run.result);
-                }
-            },
-            .bg_fetch_done => {
-                if (bg_fetch_future) |*f| {
-                    f.await(io);
-                    bg_fetch_future = null;
-                    // New remote-tracking refs: refresh the status summary
-                    // (ahead/behind) and the branch list (its arrows).
-                    app.refreshViews(app_mod.ScopeSet.init(.{ .files = true, .branches = true, .tags = true }));
-                }
-            },
-            .commit_graph_done => {
-                if (commit_graph_future) |*f| {
-                    f.await(io);
-                    commit_graph_future = null;
-                }
-            },
-            .pr_status_done => {
-                if (pr_status_future) |*f| {
-                    f.await(io);
-                    pr_status_future = null;
-                    app.applyPrStatus(pr_status_run.result, async_allocator);
-                    pr_status_run.result = null;
-                }
-            },
             .focus_in => try app.handleFocusIn(),
             .focus_out => app.handleFocusOut(),
             // Bracketed paste: while pasting, key events are literal text, not
             // commands — so a pasted newline can't submit a dialog.
             .paste_start => app.pasting = true,
             .paste_end => app.pasting = false,
-            .command_done => {
-                if (async_future) |*f| {
-                    f.await(io);
-                    async_future = null;
-                    async_job.freeTargets();
-                    try app.completeAsync(async_job.op, async_job.result, async_allocator);
-                    async_job.result = null;
-                }
-            },
-            .preview_done => {
-                if (preview_future) |*f| {
-                    f.await(io);
-                    preview_future = null;
-                    app.completePreview(preview_run.job, preview_run.result, async_allocator);
-                    preview_run.result = null;
-                }
-            },
-            .worktree_done => {
-                if (worktree_future) |*f| {
-                    f.await(io);
-                    worktree_future = null;
-                    // A failed background refresh is non-critical; the next tick
-                    // retries. applyWorktreeSnapshot frees the snapshot either way.
-                    app.applyWorktreeSnapshot(worktree_run.result, worktree_run.generation, async_allocator) catch {};
-                    worktree_run.result = null;
-                }
-            },
-            .mutation_done => {
-                if (mutation_future) |*f| {
-                    f.await(io);
-                    mutation_future = null;
-                    if (mutation_run.checkout_head) |head| {
-                        defer async_allocator.free(head);
-                        // The checkout already queues history, so mark its HEAD as seen.
-                        if (head.len > 0) app.recordHead(head);
+            .worker_wake => continue,
+            .worker_done => |done| switch (done) {
+                .external_check_done => {
+                    if (ext_check_future) |*f| {
+                        f.await(io);
+                        ext_check_future = null;
+                        app.applyRefsFingerprint(ext_check_run.result);
                     }
-                    try app.completeMutation(mutation_run.mutation, mutation_run.result, async_allocator);
-                    mutation_run.result = null;
-                }
-            },
-            .repo_load_done => {
-                if (repo_load_future) |*f| {
-                    f.await(io);
-                    repo_load_future = null;
-                    app.applyRepoLoad(repo_load_run.result, async_allocator);
-                    repo_load_run.result = null;
-                }
-            },
-            .scoped_load_done => {
-                if (scoped_load_future) |*f| {
-                    f.await(io);
-                    scoped_load_future = null;
-                    app.applyScopedLoad(scoped_load_run.result, async_allocator);
-                    scoped_load_run.result = null;
-                    scoped_load_run.freeFilters();
-                }
-            },
-            .tags_load_done => |id| {
-                if (id == tag_request and tags_load_future != null) {
-                    tags_load_future.?.await(io);
-                    tags_load_future = null;
-                    app.applyTags(tags_load_run.result, async_allocator);
-                    tags_load_run.result = null;
-                }
-            },
-            .graph_done => {
-                if (graph_future) |*f| {
-                    f.await(io);
-                    graph_future = null;
-                    // Paint each author name (0x1f-sentinel-wrapped by the log
-                    // format) in its own palette colour before the graph is stored.
-                    if (graph_run.result) |raw| {
-                        if (recolorGraphAuthors(async_allocator, raw)) |colored| {
-                            async_allocator.free(raw);
-                            graph_run.result = colored;
-                        } else |_| {}
+                },
+                .bg_fetch_done => {
+                    if (bg_fetch_future) |*f| {
+                        f.await(io);
+                        bg_fetch_future = null;
+                        // New remote-tracking refs: refresh the status summary
+                        // (ahead/behind) and the branch list (its arrows).
+                        app.refreshViews(app_mod.ScopeSet.init(.{ .files = true, .branches = true, .tags = true }));
                     }
-                    commitgraph_mod.complete(app, graph_run.result, graph_run.parents, graph_run.generation, async_allocator);
-                    graph_run.result = null;
-                    graph_run.parents = null;
-                }
-            },
-            .ai_title_done => {
-                if (ai_title_future) |*f| {
-                    f.await(io);
-                    ai_title_future = null;
-                    app.applyAiResult(.title, ai_title_run.dialog_generation, ai_title_run.revision, ai_title_run.staged_signature, if (ai_title_run.failed) null else ai_title_run.result, ai_title_run.error_detail) catch {};
-                    ai_title_run.free();
-                    render_needed = true;
-                }
-            },
-            .ai_desc_done => {
-                if (ai_desc_future) |*f| {
-                    f.await(io);
-                    ai_desc_future = null;
-                    app.applyAiResult(.description, ai_desc_run.dialog_generation, ai_desc_run.revision, ai_desc_run.staged_signature, if (ai_desc_run.failed) null else ai_desc_run.result, ai_desc_run.error_detail) catch {};
-                    ai_desc_run.free();
-                    render_needed = true;
-                }
-            },
-            .pr_gen_done => {
-                if (pr_gen_future) |*f| {
-                    f.await(io);
-                    pr_gen_future = null;
-                    app.applyPrDoc(pr_gen_run.generation, if (pr_gen_run.failed) null else pr_gen_run.title, if (pr_gen_run.failed) null else pr_gen_run.body) catch {};
-                    pr_gen_run.free();
-                    render_needed = true;
-                }
+                },
+                .commit_graph_done => {
+                    if (commit_graph_future) |*f| {
+                        f.await(io);
+                        commit_graph_future = null;
+                    }
+                },
+                .pr_status_done => {
+                    if (pr_status_future) |*f| {
+                        f.await(io);
+                        pr_status_future = null;
+                        app.applyPrStatus(pr_status_run.result, async_allocator);
+                        pr_status_run.result = null;
+                    }
+                },
+                .command_done => {
+                    if (async_future) |*f| {
+                        f.await(io);
+                        async_future = null;
+                        async_job.freeTargets();
+                        try app.completeAsync(async_job.op, async_job.result, async_allocator);
+                        async_job.result = null;
+                    }
+                },
+                .preview_done => {
+                    if (preview_future) |*f| {
+                        f.await(io);
+                        preview_future = null;
+                        app.completePreview(preview_run.job, preview_run.result, async_allocator);
+                        preview_run.result = null;
+                    }
+                },
+                .worktree_done => {
+                    if (worktree_future) |*f| {
+                        f.await(io);
+                        worktree_future = null;
+                        // A failed background refresh is non-critical; the next tick
+                        // retries. applyWorktreeSnapshot frees the snapshot either way.
+                        app.applyWorktreeSnapshot(worktree_run.result, worktree_run.generation, async_allocator) catch {};
+                        worktree_run.result = null;
+                    }
+                },
+                .mutation_done => {
+                    if (mutation_future) |*f| {
+                        f.await(io);
+                        mutation_future = null;
+                        if (mutation_run.checkout_head) |head| {
+                            defer async_allocator.free(head);
+                            // The checkout already queues history, so mark its HEAD as seen.
+                            if (head.len > 0) app.recordHead(head);
+                        }
+                        try app.completeMutation(mutation_run.mutation, mutation_run.result, async_allocator);
+                        mutation_run.result = null;
+                    }
+                },
+                .repo_load_done => {
+                    if (repo_load_future) |*f| {
+                        f.await(io);
+                        repo_load_future = null;
+                        app.applyRepoLoad(repo_load_run.result, async_allocator);
+                        repo_load_run.result = null;
+                    }
+                },
+                .scoped_load_done => {
+                    if (scoped_load_future) |*f| {
+                        f.await(io);
+                        scoped_load_future = null;
+                        app.applyScopedLoad(scoped_load_run.result, async_allocator);
+                        scoped_load_run.result = null;
+                        scoped_load_run.freeFilters();
+                    }
+                },
+                .tags_load_done => {
+                    if (tags_load_future) |*f| {
+                        f.await(io);
+                        tags_load_future = null;
+                        app.applyTags(tags_load_run.result, async_allocator);
+                        tags_load_run.result = null;
+                    }
+                },
+                .graph_done => {
+                    if (graph_future) |*f| {
+                        f.await(io);
+                        graph_future = null;
+                        // Paint each author name (0x1f-sentinel-wrapped by the log
+                        // format) in its own palette colour before the graph is stored.
+                        if (graph_run.result) |raw| {
+                            if (recolorGraphAuthors(async_allocator, raw)) |colored| {
+                                async_allocator.free(raw);
+                                graph_run.result = colored;
+                            } else |_| {}
+                        }
+                        commitgraph_mod.complete(app, graph_run.result, graph_run.parents, graph_run.generation, async_allocator);
+                        graph_run.result = null;
+                        graph_run.parents = null;
+                    }
+                },
+                .ai_title_done => {
+                    if (ai_title_future) |*f| {
+                        f.await(io);
+                        ai_title_future = null;
+                        app.applyAiResult(.title, ai_title_run.dialog_generation, ai_title_run.revision, ai_title_run.staged_signature, if (ai_title_run.failed) null else ai_title_run.result, ai_title_run.error_detail) catch {};
+                        ai_title_run.free();
+                        render_needed = true;
+                    }
+                },
+                .ai_desc_done => {
+                    if (ai_desc_future) |*f| {
+                        f.await(io);
+                        ai_desc_future = null;
+                        app.applyAiResult(.description, ai_desc_run.dialog_generation, ai_desc_run.revision, ai_desc_run.staged_signature, if (ai_desc_run.failed) null else ai_desc_run.result, ai_desc_run.error_detail) catch {};
+                        ai_desc_run.free();
+                        render_needed = true;
+                    }
+                },
+                .pr_gen_done => {
+                    if (pr_gen_future) |*f| {
+                        f.await(io);
+                        pr_gen_future = null;
+                        app.applyPrDoc(pr_gen_run.generation, if (pr_gen_run.failed) null else pr_gen_run.title, if (pr_gen_run.failed) null else pr_gen_run.body) catch {};
+                        pr_gen_run.free();
+                        render_needed = true;
+                    }
+                },
             },
         }
 
@@ -1012,6 +1049,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
             if (preview_future) |*f| {
                 f.await(io);
                 preview_future = null;
+                completions.discard(.preview_done);
                 if (preview_run.result) |r| async_allocator.free(r);
                 preview_run.result = null;
                 // The in-flight job is page-allocated (`buildPreviewJob`) and
@@ -1021,29 +1059,34 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
             if (worktree_future) |*f| {
                 f.await(io);
                 worktree_future = null;
+                completions.discard(.worktree_done);
                 if (worktree_run.result) |*r| r.deinit(async_allocator);
                 worktree_run.result = null;
             }
             if (bg_fetch_future) |*f| {
                 f.await(io);
                 bg_fetch_future = null;
+                completions.discard(.bg_fetch_done);
             }
             // The worker borrows the old root. A first write can take tens of
             // seconds on a huge repo, so cancel rather than wait; it's a cache.
             if (commit_graph_future) |*f| {
                 f.cancel(io);
                 commit_graph_future = null;
+                completions.discard(.commit_graph_done);
             }
             app.commit_graph_requested = false;
             if (pr_status_future) |*f| {
                 f.await(io);
                 pr_status_future = null;
+                completions.discard(.pr_status_done);
                 if (pr_status_run.result) |*r| r.deinit(async_allocator);
                 pr_status_run.result = null;
             }
             if (scoped_load_future) |*f| {
                 f.await(io);
                 scoped_load_future = null;
+                completions.discard(.scoped_load_done);
                 if (scoped_load_run.result) |*r| r.deinit(async_allocator);
                 scoped_load_run.result = null;
                 scoped_load_run.freeFilters();
@@ -1052,12 +1095,14 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
             if (tags_load_future) |*f| {
                 f.cancel(io);
                 tags_load_future = null;
+                completions.discard(.tags_load_done);
                 if (tags_load_run.result) |*r| r.deinit(async_allocator);
                 app.applyTags(null, async_allocator);
             }
             if (repo_load_future) |*f| {
                 f.await(io);
                 repo_load_future = null;
+                completions.discard(.repo_load_done);
                 if (repo_load_run.result) |*r| r.deinit(async_allocator);
                 repo_load_run.result = null;
             }
@@ -1070,7 +1115,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
             // On a successful switch the app marks an initial load pending; start
             // it against the new root. (A failed switch leaves the app unchanged.)
             if (app.initial_load_pending) {
-                repo_load_run = .{ .io = io, .loop = &loop, .root = app.git.root, .git_dir = app.git.git_dir, .environ = app.git.environ, .branch_sort = app.git.branch_sort, .log_order = app.git.log_order, .untracked = app.git.untracked_files, .amend_view = app.git.amend_view, .commit_limit = app.commit_limit };
+                repo_load_run = .{ .io = io, .completions = &completions, .root = app.git.root, .git_dir = app.git.git_dir, .environ = app.git.environ, .branch_sort = app.git.branch_sort, .log_order = app.git.log_order, .untracked = app.git.untracked_files, .amend_view = app.git.amend_view, .commit_limit = app.commit_limit };
                 repo_load_future = io.concurrent(repoLoadWorker, .{&repo_load_run}) catch blk: {
                     app.applyRepoLoad(null, async_allocator);
                     break :blk null;
@@ -1084,7 +1129,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
             if (app.async_requested) |op| {
                 app.async_requested = null;
                 app.async_active = true;
-                async_job = .{ .io = io, .loop = &loop, .root = app.git.root, .environ = app.git.environ, .op = op };
+                async_job = .{ .io = io, .completions = &completions, .root = app.git.root, .environ = app.git.environ, .op = op };
                 // A first push of an upstream-less branch carries the target
                 // (copied: the worker must not borrow app state it outlives).
                 if (op == .push_set_upstream or op == .push_tag) {
@@ -1122,7 +1167,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
         // so intermediate items are skipped rather than each spawning git.
         if (preview_future == null) {
             if (app.takePreviewJob()) |job| {
-                preview_run = .{ .io = io, .loop = &loop, .root = app.git.root, .job = job };
+                preview_run = .{ .io = io, .completions = &completions, .root = app.git.root, .job = job };
                 preview_future = io.concurrent(previewWorker, .{&preview_run}) catch blk: {
                     app.completePreview(job, null, async_allocator);
                     break :blk null;
@@ -1137,7 +1182,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
             if (app.takeWorktreeRefresh()) |generation| {
                 worktree_run = .{
                     .io = io,
-                    .loop = &loop,
+                    .completions = &completions,
                     .root = app.git.root,
                     .git_dir = app.git.git_dir,
                     .environ = app.git.environ,
@@ -1157,7 +1202,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
         if (ext_check_future == null and app.takeExternalChangeCheck()) {
             ext_check_run = .{
                 .io = io,
-                .loop = &loop,
+                .completions = &completions,
                 .root = app.git.root,
                 .git_dir = app.git.git_dir,
                 .environ = app.git.environ,
@@ -1174,7 +1219,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
             if (commitgraph_mod.takeLoad(app)) |req| {
                 graph_run = .{
                     .io = io,
-                    .loop = &loop,
+                    .completions = &completions,
                     .root = app.git.root,
                     .environ = app.git.environ,
                     .all = req.all,
@@ -1195,14 +1240,14 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
         // user's own network op is in flight (they'd contend / double-prompt).
         if (bg_fetch_future == null and app.bg_fetch_requested and !app.async_active) {
             app.bg_fetch_requested = false;
-            bg_fetch_run = .{ .io = io, .loop = &loop, .root = app.git.root, .environ = app.git.environ, .prune_arg = app.config.fetch_prune_mode.arg() };
+            bg_fetch_run = .{ .io = io, .completions = &completions, .root = app.git.root, .environ = app.git.environ, .prune_arg = app.config.fetch_prune_mode.arg() };
             bg_fetch_future = io.concurrent(bgFetchWorker, .{&bg_fetch_run}) catch null;
         }
 
         // Start a queued background commit-graph refresh off the loop.
         if (commit_graph_future == null and app.commit_graph_requested) {
             app.commit_graph_requested = false;
-            commit_graph_run = .{ .io = io, .loop = &loop, .root = app.git.root, .git_dir = app.git.git_dir, .environ = app.git.environ };
+            commit_graph_run = .{ .io = io, .completions = &completions, .root = app.git.root, .git_dir = app.git.git_dir, .environ = app.git.environ };
             commit_graph_future = io.concurrent(commitGraphWorker, .{&commit_graph_run}) catch null;
         }
 
@@ -1210,7 +1255,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
         // loop. Independent of `git fetch`, and single-in-flight.
         if (pr_status_future == null and app.pr_status_requested) {
             app.pr_status_requested = false;
-            pr_status_run = .{ .io = io, .loop = &loop, .root = app.git.root, .environ = app.git.environ };
+            pr_status_run = .{ .io = io, .completions = &completions, .root = app.git.root, .environ = app.git.environ };
             pr_status_future = io.concurrent(prStatusWorker, .{&pr_status_run}) catch null;
         }
 
@@ -1223,7 +1268,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
         // input gate keeps another mutation from being requested meanwhile.
         if (mutation_future == null) {
             if (app.takeMutation()) |mutation| {
-                mutation_run = .{ .io = io, .loop = &loop, .root = app.git.root, .git_dir = app.git.git_dir, .environ = app.git.environ, .mutation = mutation, .amend_view = app.git.amend_view, .result = null };
+                mutation_run = .{ .io = io, .completions = &completions, .root = app.git.root, .git_dir = app.git.git_dir, .environ = app.git.environ, .mutation = mutation, .amend_view = app.git.amend_view, .result = null };
                 mutation_future = io.concurrent(mutationWorker, .{&mutation_run}) catch blk: {
                     try app.completeMutation(mutation, null, async_allocator);
                     break :blk null;
@@ -1240,7 +1285,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                 const filters = app.logFilters();
                 scoped_load_run = .{
                     .io = io,
-                    .loop = &loop,
+                    .completions = &completions,
                     .root = app.git.root,
                     .git_dir = app.git.git_dir,
                     .environ = app.git.environ,
@@ -1266,15 +1311,14 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
 
         // Tag status can wait on a remote, so give it a worker of its own.
         if (tags_load_future == null and app.takeTags()) {
-            tag_request +%= 1;
             tags_load_run = .{
                 .io = io,
-                .loop = &loop,
+                .completions = &completions,
                 .root = app.git.root,
                 .git_dir = app.git.git_dir,
                 .environ = app.git.environ,
                 .scopes = app_mod.ScopeSet.init(.{ .tags = true }),
-                .tag_request = tag_request,
+                .tags_only = true,
             };
             tags_load_future = io.concurrent(scopedLoadWorker, .{&tags_load_run}) catch blk: {
                 app.applyTags(null, async_allocator);
@@ -1287,7 +1331,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
             if (app.commit_ai_title_req) |req| {
                 ai_title_run = .{
                     .io = io,
-                    .loop = &loop,
+                    .completions = &completions,
                     .root = app.git.root,
                     .git_dir = app.git.git_dir,
                     .environ = app.git.environ,
@@ -1315,7 +1359,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
             if (app.commit_ai_desc_req) |req| {
                 ai_desc_run = .{
                     .io = io,
-                    .loop = &loop,
+                    .completions = &completions,
                     .root = app.git.root,
                     .git_dir = app.git.git_dir,
                     .environ = app.git.environ,
@@ -1343,7 +1387,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
             if (app.pr_gen_requested) |req| {
                 pr_gen_run = .{
                     .io = io,
-                    .loop = &loop,
+                    .completions = &completions,
                     .root = app.git.root,
                     .git_dir = app.git.git_dir,
                     .environ = app.git.environ,
