@@ -585,7 +585,7 @@ pub const Git = struct {
         // editor accepts the default (true) or, for reword, supplies our
         // message. These must be set via env vars: `-c core.editor` does not
         // reach the reword/squash message subprocess.
-        const seq_editor = try std.fmt.allocPrint(self.allocator, "cp '{s}'", .{todo_path});
+        const seq_editor = try self.copyEditorCommand(todo_path);
         defer self.allocator.free(seq_editor);
 
         var msg_path: ?[]u8 = null;
@@ -600,8 +600,8 @@ pub const Git = struct {
             // Build the editor command first; only then hand `mp` to the outer
             // `defer` by setting `msg_path`. Doing it the other way round would
             // let both this `errdefer` and the outer `defer` free `mp` if the
-            // allocPrint below failed (double-free).
-            const editor = try std.fmt.allocPrint(self.allocator, "cp '{s}'", .{mp});
+            // editor command allocation failed (double-free).
+            const editor = try self.copyEditorCommand(mp);
             msg_path = mp;
             break :blk editor;
         } else try self.allocator.dupe(u8, "true");
@@ -622,6 +622,14 @@ pub const Git = struct {
             .stderr_limit = .limited(4 * 1024 * 1024),
         });
         return .{ .stdout = result.stdout, .stderr = result.stderr, .term = result.term };
+    }
+
+    fn copyEditorCommand(self: *Git, path: []const u8) ![]u8 {
+        var command: std.ArrayList(u8) = .empty;
+        defer command.deinit(self.allocator);
+        try command.appendSlice(self.allocator, "cp ");
+        try appendSingleQuoted(&command, self.allocator, path);
+        return command.toOwnedSlice(self.allocator);
     }
 
     fn gitPathExists(self: *Git, rel: []const u8) bool {
