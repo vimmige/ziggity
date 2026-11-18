@@ -319,8 +319,8 @@ pub fn buildPartialFilePatch(
 
     for (parsed.hunks) |hunk| {
         const hunk_text = diff[hunk.start..hunk.end];
-        const nl = std.mem.indexOfScalar(u8, hunk_text, '\n') orelse continue;
-        const old_start = parseOldStart(hunk_text[0..nl]) orelse continue;
+        const nl = std.mem.indexOfScalar(u8, hunk_text, '\n') orelse return error.InvalidHunk;
+        const old_start = parseOldStart(hunk_text[0..nl]) orelse return error.InvalidHunk;
 
         var body: std.Io.Writer.Allocating = .init(allocator);
         defer body.deinit();

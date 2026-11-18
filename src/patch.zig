@@ -226,27 +226,34 @@ fn applyPatchDirToggle(app: *App, hash: []const u8, dir: []const u8) !void {
     try app.setMessage("added {s} to patch ({d} files)", .{ what, app.patch_paths.items.len });
 }
 
-/// Concatenate the source commit's per-file diffs into one applyable patch. A
-/// file with a line selection contributes only its included lines.
-pub fn buildPatchBytes(app: *App) ![]u8 {
-    const source = app.patch_source orelse return error.NoPatch;
+/// Build the patch or report why it cannot be used.
+pub fn buildPatchBytes(app: *App) !?[]u8 {
+    const source = app.patch_source orelse {
+        try app.setMessage("build a patch from a commit's files first", .{});
+        return null;
+    };
     var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(app.allocator);
+    defer out.deinit(app.allocator);
     for (app.patch_paths.items, 0..) |path, idx| {
-        const diff = try app.git.diffForCommitFile(source, path, app.config.diff_context);
+        const diff = app.git.diffForCommitFile(source, path, app.config.diff_context) catch |err| {
+            try app.setMessage("could not load diff for {s} ({s})", .{ path, @errorName(err) });
+            return null;
+        };
         defer app.allocator.free(diff);
         if (app.patch_line_sel.items[idx]) |sel| {
-            var parsed = diff_mod.parse(app.allocator, diff) catch {
-                try out.appendSlice(app.allocator, diff);
-                continue;
+            var parsed = diff_mod.parse(app.allocator, diff) catch |err| {
+                try app.setMessage("could not read patch lines for {s} ({s})", .{ path, @errorName(err) });
+                return null;
             };
             defer parsed.deinit(app.allocator);
-            const part = diff_mod.buildPartialFilePatch(app.allocator, diff, parsed, sel) catch |err| switch (err) {
-                error.EmptySelection => continue, // nothing selected from this file
-                else => {
-                    try out.appendSlice(app.allocator, diff); // e.g. no-newline hunk
-                    continue;
-                },
+            const part = diff_mod.buildPartialFilePatch(app.allocator, diff, parsed, sel) catch |err| {
+                const recovery = switch (err) {
+                    error.NoNewlineHunk => "missing newline. Select the whole file",
+                    error.EmptySelection => "no changed lines selected. Reselect lines",
+                    else => "could not build line patch. Reselect lines",
+                };
+                try app.setMessage("{s} ({s})", .{ recovery, path });
+                return null;
             };
             defer app.allocator.free(part);
             try out.appendSlice(app.allocator, part);
@@ -254,7 +261,11 @@ pub fn buildPatchBytes(app: *App) ![]u8 {
             try out.appendSlice(app.allocator, diff);
         }
     }
-    return out.toOwnedSlice(app.allocator);
+    if (out.items.len == 0) {
+        try app.setMessage("patch has no changes. Select changed files or lines", .{});
+        return null;
+    }
+    return try out.toOwnedSlice(app.allocator);
 }
 
 /// Number of `\n`-separated lines in `text` (for sizing inclusion arrays).

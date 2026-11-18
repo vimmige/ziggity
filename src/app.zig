@@ -11846,10 +11846,7 @@ pub const App = struct {
             },
             .patch_apply, .patch_apply_reverse => {
                 const reverse = action == .patch_apply_reverse;
-                const patch = patch_mod.buildPatchBytes(self) catch {
-                    try self.setMessage("no patch to apply", .{});
-                    return;
-                };
+                const patch = (try patch_mod.buildPatchBytes(self)) orelse return;
                 defer self.allocator.free(patch);
                 const cmd = if (reverse) "git apply --reverse" else "git apply";
                 const summary = if (reverse) "applied patch in reverse" else "applied patch to working tree";
@@ -12020,10 +12017,7 @@ pub const App = struct {
             return;
         }
 
-        const patch = patch_mod.buildPatchBytes(self) catch {
-            try self.setMessage("could not build the patch", .{});
-            return;
-        };
+        const patch = (try patch_mod.buildPatchBytes(self)) orelse return;
         defer self.allocator.free(patch);
 
         const base_ref = try std.fmt.allocPrint(self.allocator, "{s}^", .{commits[i].hash});
