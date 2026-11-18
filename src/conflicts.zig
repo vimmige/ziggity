@@ -172,8 +172,13 @@ pub fn open(app: *App, path: []const u8) !void {
         try app.enterMain();
         return app.setMessage("no conflict markers in {s}; mark resolved explicitly from Files (space)", .{path});
     }
-    close(app); // clear any previous session
-    app.conflict_path = try app.allocator.dupe(u8, path);
+    const owned_path = app.allocator.dupe(u8, path) catch |err| {
+        app.allocator.free(content);
+        app.allocator.free(parsed);
+        return err;
+    };
+    close(app);
+    app.conflict_path = owned_path;
     app.conflict_content = content;
     app.conflicts = parsed;
     app.conflict_index = 0;
@@ -189,9 +194,15 @@ pub fn close(app: *App) void {
     app.conflict_content = &.{};
     app.allocator.free(app.conflicts);
     app.conflicts = &.{};
-    for (app.conflict_undo.items) |c| app.allocator.free(c);
-    app.conflict_undo.clearRetainingCapacity();
+    clearUndo(app);
     app.conflict_index = 0;
+}
+
+fn clearUndo(app: *App) void {
+    for (app.conflict_undo.items) |c| {
+        app.allocator.free(c);
+    }
+    app.conflict_undo.clearRetainingCapacity();
 }
 
 pub fn cancel(app: *App) !void {
@@ -210,49 +221,101 @@ pub fn move(app: *App, down: bool) void {
     }
 }
 
-/// Resolve the current conflict with `choice`: rewrite the file, push the old
-/// content for undo, and re-parse. When the last conflict is resolved, stage
-/// the file and return to the Files panel.
-pub fn pick(app: *App, choice: Choice) !void {
-    if (app.conflicts.len == 0) return;
-    const idx = @min(app.conflict_index, app.conflicts.len - 1);
-    const new_content = try resolveContent(app.allocator, app.conflict_content, app.conflicts[idx], choice);
-    errdefer app.allocator.free(new_content);
-    app.git.writeWorkingFile(app.conflict_path, new_content) catch {
-        app.allocator.free(new_content);
-        try app.setMessage("could not write {s}", .{app.conflict_path});
-        return;
+/// Return false after refreshing a stale session, leaving the new file alone.
+fn checkCurrentContent(app: *App) !bool {
+    const content = app.git.readWorkingFile(app.conflict_path) catch {
+        try app.setMessage("could not read {s}", .{app.conflict_path});
+        return false;
     };
-    try app.conflict_undo.append(app.allocator, app.conflict_content); // old content owns the stack slot
-    app.conflict_content = new_content;
-    try reparse(app);
+    if (std.mem.eql(u8, content, app.conflict_content)) {
+        app.allocator.free(content);
+        return true;
+    }
+
+    const parsed = parse(app.allocator, content) catch |err| {
+        app.allocator.free(content);
+        return err;
+    };
+    app.allocator.free(app.conflict_content);
+    setContent(app, content, parsed);
+    clearUndo(app);
+    if (parsed.len == 0) {
+        try cancel(app);
+        try app.setMessage("file changed outside ziggity. Mark resolved from Files (space)", .{});
+    } else {
+        try app.setMessage("file changed outside ziggity. Conflicts reloaded", .{});
+    }
+    return false;
+}
+
+fn writeReplacement(app: *App, content: []const u8) !bool {
+    const io = app.git.io;
+    const path = try std.fmt.allocPrint(app.allocator, "{s}/{s}", .{ app.git.root, app.conflict_path });
+    defer app.allocator.free(path);
+    const dir = std.Io.Dir.cwd();
+    const original = try dir.openFile(io, path, .{ .mode = .read_write, .follow_symlinks = false, .allow_directory = false });
+    defer original.close(io);
+    const stat = try original.stat(io);
+    if (stat.kind != .file) return error.NotRegularFile;
+
+    var replacement = try dir.createFileAtomic(io, path, .{ .replace = true });
+    defer replacement.deinit(io);
+    try replacement.file.writeStreamingAll(io, content);
+    try replacement.file.setPermissions(io, stat.permissions);
+    if (!try checkCurrentContent(app)) return false;
+    const current = try dir.statFile(io, path, .{ .follow_symlinks = false });
+    if (current.kind != .file or current.inode != stat.inode) return error.FileReplaced;
+    try replacement.replace(io);
+    return true;
+}
+
+/// Resolve the current conflict with `choice` and stage after the last pick.
+pub fn pick(app: *App, choice: Choice) !void {
+    if (!try checkCurrentContent(app) or app.conflicts.len == 0) return;
+    const idx = @min(app.conflict_index, app.conflicts.len - 1);
+    const content = try resolveContent(app.allocator, app.conflict_content, app.conflicts[idx], choice);
+    var installed = false;
+    defer if (!installed) app.allocator.free(content);
+    const parsed = try parse(app.allocator, content);
+    defer if (!installed) app.allocator.free(parsed);
+    try app.conflict_undo.ensureUnusedCapacity(app.allocator, 1);
+    const written = writeReplacement(app, content) catch {
+        return app.setMessage("could not write {s}", .{app.conflict_path});
+    };
+    if (!written) return;
+
+    app.conflict_undo.appendAssumeCapacity(app.conflict_content);
+    setContent(app, content, parsed);
+    installed = true;
     if (app.conflicts.len == 0) return finish(app);
     try app.setMessage("{d} conflict(s) left in {s}", .{ app.conflicts.len, app.conflict_path });
 }
 
-/// Undo the last pick: restore the previous content and re-parse.
 pub fn undo(app: *App) !void {
-    if (app.conflict_undo.items.len == 0) {
-        try app.setMessage("nothing to undo", .{});
-        return;
-    }
-    const prev = app.conflict_undo.pop().?;
+    if (!try checkCurrentContent(app)) return;
+    const prev = app.conflict_undo.getLastOrNull() orelse {
+        return app.setMessage("nothing to undo", .{});
+    };
+    const parsed = try parse(app.allocator, prev);
+    var installed = false;
+    defer if (!installed) app.allocator.free(parsed);
+    const written = writeReplacement(app, prev) catch {
+        return app.setMessage("could not undo pick in {s}", .{app.conflict_path});
+    };
+    if (!written) return;
+
+    _ = app.conflict_undo.pop();
     app.allocator.free(app.conflict_content);
-    app.conflict_content = prev;
-    app.git.writeWorkingFile(app.conflict_path, prev) catch {};
-    try reparse(app);
+    setContent(app, prev, parsed);
+    installed = true;
     try app.setMessage("undid pick — {d} conflict(s) left", .{app.conflicts.len});
 }
 
-fn reparse(app: *App) !void {
-    const parsed = try parse(app.allocator, app.conflict_content);
+fn setContent(app: *App, content: []u8, parsed: []Conflict) void {
+    app.conflict_content = content;
     app.allocator.free(app.conflicts);
     app.conflicts = parsed;
-    if (app.conflicts.len > 0 and app.conflict_index >= app.conflicts.len) {
-        app.conflict_index = app.conflicts.len - 1;
-    } else if (app.conflicts.len == 0) {
-        app.conflict_index = 0;
-    }
+    app.conflict_index = @min(app.conflict_index, parsed.len -| 1);
 }
 
 /// All conflicts resolved: stage the file and leave the view.
