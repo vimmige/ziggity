@@ -78,6 +78,7 @@ the written reference. Every binding is remappable, see
   On Ghostty for Linux, use version 1.4 or later and set
   `gtk-horizontal-tab-scroll = false` to forward touchpad swipes to Ziggity.
 - `tab`: focus the Diff panel from any side panel (press again to return).
+  `j` / `k` or arrows move the line highlight.
   `enter` there opens the same files or view as in the originating panel,
   including the conflict resolver for conflicted files.
 - `z`: maximize the Diff panel to full screen; the side panels hide and the
@@ -85,11 +86,14 @@ the written reference. Every binding is remappable, see
   main panel is a special case handled only by `z`, never by `+`/`-`
 - `|`: open the full-screen side-by-side review of the current diff (old file
   left, new file right, lines aligned, file line numbers down each side, changed
-  words emphasized). Inside it `j`/`k` (or `PageUp`/`PageDown`, `Home`/`End`)
-  scroll, `J`/`K` jump to the next/previous change, bringing its header to the top
+  words emphasized). `j`/`k` or arrows move the line highlight. The selected
+  hunk follows the highlighted line as it moves or scrolls into another hunk.
+  `PageUp`/`PageDown` and `Home`/`End` scroll. `J`/`K` jump to the next/previous
+  change, bringing its header to the top
   (the current change is framed in a rounded panel titled with its hunk header,
-  and that header stays pinned while you scroll the hunk), `space` recentres on
-  the selected hunk after you scroll away, `d` discards the whole current hunk, `=`
+  and that header stays pinned while you scroll the hunk), `space` jumps to
+  the start of the selected hunk, `d` discards the whole current hunk
+  when the line cursor is inside it, and `=`
   fills in the rest of a single file around its changes (each change stays its own
   boxed hunk), `^w` soft-wraps both columns kept line for line, `H`/`L` pan, and
   `esc` returns. A terminal too narrow for two columns falls back to the unified view (see

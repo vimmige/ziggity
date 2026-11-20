@@ -1772,6 +1772,11 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
         return;
     }
 
+    if (app.mode == .diff_review) {
+        refreshOnDiffChange(vx, app);
+        return drawDiffReview(root, app);
+    }
+
     // The footer wraps its hints onto extra rows when they overflow (see
     // `footer_hint_rows`). Its height is stable across navigation (sized to the
     // busiest panel, not the focused one), so only a resize reflows the body;
@@ -2003,7 +2008,6 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
         .recent_repos => drawRecentReposPopup(root, app),
         .conflict_resolve => drawConflicts(root, app),
         .pr_preview => drawPrPreviewPopup(root, app),
-        .diff_review => drawDiffReview(root, app),
         else => {},
     }
 }
@@ -2017,10 +2021,12 @@ fn drawDiffReview(root: vaxis.Window, app: *app_mod.App) void {
     const st = styles();
     const footer_row: u16 = root.height -| 1;
     const body_h: u16 = footer_row;
-    // Paint over everything the normal layout drew (side panels, footer) so the
-    // review reads as its own full-screen view rather than a panel on top.
     var clear_row: u16 = 0;
     while (clear_row < root.height) : (clear_row += 1) fillRow(root, clear_row, st.normal);
+    app.resizeReview(root.width - 2, body_h - 2);
+    app.applyReviewPendingScroll();
+    app.main_scroll = @min(app.main_scroll, app.maxMainScroll());
+    app.main_hscroll = @min(app.main_hscroll, app.maxMainHScroll());
     const scroll: ScrollInfo = .{ .len = app.mainContentLines(), .pos = app.main_scroll };
     // Title carries the change count and which one the `J`/`K` cursor is on, since
     // the review has no message bar to report it. It must live in a module buffer
@@ -2035,12 +2041,17 @@ fn drawDiffReview(root: vaxis.Window, app: *app_mod.App) void {
     const wrap_tag: []const u8 = if (app.wrap_diff) "  \u{21A9} wrap" else "";
     const title = std.fmt.bufPrint(&main_title_wrap_buf, "{s}{s}{s}", .{ base_title, full_tag, wrap_tag }) catch base_title;
     const main = panel(root, 0, 0, root.width, body_h, title, true, scroll);
-    app.main_view_width = main.width;
-    app.main_view_height = main.height;
-    app.applyReviewPendingScroll(); // now that the view size is known
-    app.main_scroll = @min(app.main_scroll, app.maxMainScroll());
-    app.main_hscroll = @min(app.main_hscroll, app.maxMainHScroll());
     if (app.splitActive()) drawSideBySide(main, app) else drawDiffContent(main, app, app.activeMainText(), .main);
+    if (app.reviewCursorRow()) |cursor_row| {
+        const row: u16 = @intCast(cursor_row - app.main_scroll);
+        for (0..main.width) |x| {
+            const col: u16 = @intCast(x);
+            var cell = main.readCell(col, row) orelse continue;
+            if (cell.style.bg != .default) continue;
+            applySel(&cell.style, .active);
+            main.writeCell(col, row, cell);
+        }
+    }
     // The hints after "J/K change" are conditional: "= whole file" when a single
     // file can be expanded, and "d discard hunk" only for uncommitted changes.
     const whole = if (app.reviewWholeFileAvailable())
@@ -2048,7 +2059,7 @@ fn drawDiffReview(root: vaxis.Window, app: *app_mod.App) void {
     else
         "";
     const discard = if (app.reviewDiscardOffered()) "  d discard hunk" else "";
-    const footer = std.fmt.bufPrint(&review_footer_buf, "  j/k scroll  J/K change  space refocus{s}{s}  ^w wrap  H/L pan  esc back  q quit", .{ whole, discard }) catch "  j/k scroll  J/K change  space refocus  ^w wrap  H/L pan  esc back  q quit";
+    const footer = std.fmt.bufPrint(&review_footer_buf, "  j/k line  J/K change{s}  space hunk start{s}  ^w wrap  H/L pan  esc back  q quit", .{ discard, whole }) catch "  j/k line  J/K change  space hunk start  ^w wrap  H/L pan  esc back  q quit";
     print(root, footer_row, 0, footer, st.bottom_accent);
 }
 
@@ -2368,7 +2379,7 @@ const help_lines = [_][]const u8{
     "  L, shift+right   scroll the focused panel right (long rows)",
     "  ctrl+w         wrap long lines in the diff panels instead of scrolling",
     "  |              open the full-screen side-by-side review of the diff",
-    "                 (read-only: j/k scroll, J/K next/prev change, ^w wrap,",
+    "                 (read-only: j/k line, J/K next/prev change, ^w wrap,",
     "                 H/L pan, esc back)",
     "  [              previous tab (or staging side)",
     "  ]              next tab (or staging side)",
@@ -5306,9 +5317,15 @@ fn drawDiffContent(win: vaxis.Window, app: *const app_mod.App, text: []const u8,
     // Hunk cursor (the narrow-terminal fallback for the review): show the selected
     // hunk's `@@` header line in reverse video, matching the side-by-side view.
     const sel_header = if (pane == .main) selectedHunkHeaderLine(app) else null;
+    const cursor = app.diffCursorLine();
     const baseFor = struct {
-        fn f(b: vaxis.Style, header: ?usize, line: usize) vaxis.Style {
-            return reverseIf(b, header != null and line == header.?);
+        fn f(w: vaxis.Window, row: u16, b: vaxis.Style, header: ?usize, selected: ?usize, line: usize) vaxis.Style {
+            var style = reverseIf(b, header == line);
+            if (selected == line) {
+                applySel(&style, .active);
+                fillRow(w, row, style);
+            }
+            return style;
         }
     }.f;
 
@@ -5320,7 +5337,7 @@ fn drawDiffContent(win: vaxis.Window, app: *const app_mod.App, text: []const u8,
             if (vidx >= rows.len) break;
             const wr = rows[vidx];
             const line = text[wr.start..wr.end];
-            const lb = baseFor(base, sel_header, wr.line);
+            const lb = baseFor(win, screen_row, base, sel_header, cursor, wr.line);
             const em = emphFor(emph_lines, wr.line);
             const sg = segSel(selColsFor(sel, wr.line), wr.vis_start, wr.vis_end);
             printAnsiEmph(win, screen_row, line, lb, sg.lo, sg.hi, wr.vis_start, em.spans, wordBg(em), wr.vis_end - wr.vis_start, false);
@@ -5342,7 +5359,7 @@ fn drawDiffContent(win: vaxis.Window, app: *const app_mod.App, text: []const u8,
             const start = offs[abs_line];
             const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
             const line = text[start..end];
-            const lb = baseFor(base, sel_header, abs_line);
+            const lb = baseFor(win, row, base, sel_header, cursor, abs_line);
             const em = emphFor(emph_lines, abs_line);
             const sg = segSel(selColsFor(sel, abs_line), h_off, h_off +| win.width);
             printAnsiEmph(win, row, line, lb, sg.lo, sg.hi, h_off, em.spans, wordBg(em), std.math.maxInt(u16), false);
@@ -5358,7 +5375,7 @@ fn drawDiffContent(win: vaxis.Window, app: *const app_mod.App, text: []const u8,
     while (row < win.height) : (row += 1) {
         const line = lines.next() orelse break;
         const abs_line = app.main_scroll + row;
-        const lb = baseFor(base, sel_header, abs_line);
+        const lb = baseFor(win, row, base, sel_header, cursor, abs_line);
         const em = emphFor(emph_lines, abs_line);
         const sg = segSel(selColsFor(sel, abs_line), h_off, h_off +| win.width);
         printAnsiEmph(win, row, line, lb, sg.lo, sg.hi, h_off, em.spans, wordBg(em), std.math.maxInt(u16), false);
