@@ -5041,11 +5041,15 @@ pub const App = struct {
             if (self.config.keymap.screen_mode_prev.matches(key)) return self.cycleScreenMode(false);
         }
         if (navigation_mode) {
-            const down = key.matches('j', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{ .ctrl = true });
-            const up = key.matches('k', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{ .ctrl = true });
+            const mods: vaxis.Key.Modifiers = .{ .ctrl = true, .shift = key.mods.shift };
+            const down = key.matchesAny(&.{ 'j', vaxis.Key.down }, mods);
+            const up = key.matchesAny(&.{ 'k', vaxis.Key.up }, mods);
             if (down or up) {
                 for (0..5) |_| {
-                    try self.handleKey(.{ .codepoint = if (down) vaxis.Key.down else vaxis.Key.up });
+                    try self.handleKey(.{
+                        .codepoint = if (down) vaxis.Key.down else vaxis.Key.up,
+                        .mods = .{ .shift = mods.shift },
+                    });
                 }
                 return;
             }
@@ -14338,6 +14342,40 @@ test "fileDiffArgv pairs renames and sets rename/submodule flags" {
     }
     try std.testing.expectEqualStrings("file.zig", argv2[argv2.len - 1]);
     for (argv2) |a| try std.testing.expect(!std.mem.eql(u8, a, "--staged"));
+}
+
+test "ctrl+shift extends commit ranges by five rows with arrows or j/k" {
+    var app = try testApp(std.testing.allocator, &.{});
+    defer deinitTestApp(&app);
+
+    const commit: model.Commit = .{
+        .hash = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .short_hash = @constCast("aaaaaaa"),
+        .author = @constCast("S"),
+        .time = @constCast("now"),
+        .refs = @constCast(""),
+        .subject = @constCast("commit"),
+    };
+    var commits: [8]model.Commit = @splat(commit);
+    app.data.commits = &commits;
+    app.focus = .commits;
+
+    var parser: vaxis.Parser = .{};
+    for ([_][2][]const u8{
+        .{ "\x1b[1;6A", "\x1b[1;6B" },
+        .{ "\x1b[107:75;6u", "\x1b[106:74;6u" },
+    }) |keys| {
+        app.clearRange();
+        app.commit_index = 6;
+        try app.handleKey((try parser.parse(keys[0], null)).event.?.key_press);
+        try std.testing.expectEqual(@as(usize, 1), app.commit_index);
+        try std.testing.expectEqual(@as(?usize, 6), app.range_anchor);
+        try std.testing.expectEqual(@as(usize, 6), app.rangeCount());
+
+        try app.handleKey((try parser.parse(keys[1], null)).event.?.key_press);
+        try std.testing.expectEqual(@as(usize, 6), app.commit_index);
+        try std.testing.expectEqual(@as(?usize, 6), app.range_anchor);
+    }
 }
 
 test "help dialog selection clamps at the bottom and resumes up immediately" {
