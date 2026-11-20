@@ -73,7 +73,10 @@ the written reference. Every binding is remappable, see
 - `j` / `k` or arrows: move selection · `h` / `l` or arrows: cycle side
   panels
 - `H` / `L`: scroll the focused panel left and right (diff, or a list wider
-  than the panel)
+  than the panel). Sideways mouse or touchpad scrolling pans the diff, list,
+  or side-by-side review under the pointer when the terminal reports it.
+  On Ghostty for Linux, use version 1.4 or later and set
+  `gtk-horizontal-tab-scroll = false` to forward touchpad swipes to Ziggity.
 - `tab`: focus the Diff panel from any side panel (press again to return).
   `enter` there opens the same files or view as in the originating panel,
   including the conflict resolver for conflicted files.

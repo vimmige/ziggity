@@ -5082,8 +5082,8 @@ pub const App = struct {
                     .toggle_main => return if (self.focus == .main) self.leaveMain() else self.enterMain(),
                     .toggle_fullscreen => return self.toggleDiffFullscreen(),
                     .toggle_wrap => return self.toggleWrapDiff(),
-                    .scroll_left => return self.scrollFocusedHorizontal(-1),
-                    .scroll_right => return self.scrollFocusedHorizontal(1),
+                    .scroll_left => return self.scrollPanelHorizontal(self.focus, -1),
+                    .scroll_right => return self.scrollPanelHorizontal(self.focus, 1),
                     else => {},
                 }
                 if (self.focus == .main) {
@@ -5572,8 +5572,8 @@ pub const App = struct {
             .focus_right => if (!self.staging_active) try self.focusNext(),
             // H/L pan the focused panel horizontally (main diff or a side list)
             // so rows wider than the panel can be read. No-op when content fits.
-            .scroll_left => self.scrollFocusedHorizontal(-1),
-            .scroll_right => self.scrollFocusedHorizontal(1),
+            .scroll_left => self.scrollPanelHorizontal(self.focus, -1),
+            .scroll_right => self.scrollPanelHorizontal(self.focus, 1),
             // Tab toggles focus into the Diff (main) panel and back to the side
             // panel it came from. In the staging view it closes it (back to the
             // Files panel); `[`/`]` switch the staged/unstaged side there. Unlike
@@ -5798,6 +5798,13 @@ pub const App = struct {
         // summary/body, and wheel scrolling of the body.
         if (self.mode == .commit_prompt) return self.handleCommitMouse(mouse);
 
+        // Vaxis 0.6 names horizontal wheel reports 66 (left) and 67 (right) in reverse.
+        const wheel_dir: i32 = switch (mouse.button) {
+            .wheel_right => -1,
+            .wheel_left => 1,
+            else => 0,
+        };
+
         // The side-by-side review scrolls the diff with the wheel, like the Diff
         // panel does in normal mode.
         if (self.mode == .diff_review) {
@@ -5811,6 +5818,10 @@ pub const App = struct {
                     },
                     .wheel_down => {
                         try self.scrollMain(1);
+                        return true;
+                    },
+                    .wheel_left, .wheel_right => {
+                        self.scrollPanelHorizontal(.main, wheel_dir);
                         return true;
                     },
                     // A left press may begin a text selection (when it lands in one
@@ -6094,6 +6105,7 @@ pub const App = struct {
             // left alone too).
             .wheel_up => try self.wheelScroll(rect.focus, false),
             .wheel_down => try self.wheelScroll(rect.focus, true),
+            .wheel_left, .wheel_right => self.scrollPanelHorizontal(rect.focus, wheel_dir),
             else => return false,
         }
         return true;
@@ -9539,17 +9551,17 @@ pub const App = struct {
         self.main_hscroll = @min(self.main_hscroll, self.maxMainHScroll());
     }
 
-    /// Pan the focused panel horizontally by one step in `dir` (-1 left, +1
+    /// Pan a panel horizontally by one step in `dir` (-1 left, +1
     /// right): the main diff, or a side list. Each bounds its offset by the
     /// content/inner widths captured at the last render. A no-op for the Status
     /// panel and whenever the content already fits.
-    fn scrollFocusedHorizontal(self: *App, dir: i32) void {
+    fn scrollPanelHorizontal(self: *App, panel: model.Focus, dir: i32) void {
         const delta: i32 = horizontal_scroll_step;
-        if (self.focus == .main) {
+        if (panel == .main) {
             self.scrollMainHorizontal(if (dir < 0) -delta else delta);
             return;
         }
-        const lv = self.listView(self.focus) orelse return;
+        const lv = self.listView(panel) orelse return;
         const view: u16 = if (lv.view_w == 0) 80 else lv.view_w;
         const max: u16 = lv.content_width -| view;
         if (dir < 0) lv.hscroll -|= horizontal_scroll_step else lv.hscroll +|= horizontal_scroll_step;
@@ -14576,13 +14588,13 @@ test "horizontal scroll steps uniformly and stays bounded by the content" {
     app.focus = .main;
 
     const step = horizontal_scroll_step;
-    app.scrollFocusedHorizontal(1);
+    app.scrollPanelHorizontal(.main, 1);
     try std.testing.expectEqual(step, app.main_hscroll);
-    app.scrollFocusedHorizontal(1);
+    app.scrollPanelHorizontal(.main, 1);
     try std.testing.expectEqual(@as(u16, step * 2), app.main_hscroll);
-    for (0..50) |_| app.scrollFocusedHorizontal(1); // run into the bound
+    for (0..50) |_| app.scrollPanelHorizontal(.main, 1); // run into the bound
     try std.testing.expectEqual(@as(u16, 26), app.main_hscroll); // 90 - 64
-    for (0..50) |_| app.scrollFocusedHorizontal(-1);
+    for (0..50) |_| app.scrollPanelHorizontal(.main, -1);
     try std.testing.expectEqual(@as(u16, 0), app.main_hscroll);
 
     // A list panel pans its own offset, bounded by its recorded widths.
@@ -14590,16 +14602,16 @@ test "horizontal scroll steps uniformly and stays bounded by the content" {
     const lv = app.listView(.commits).?;
     lv.content_width = 50;
     lv.view_w = 20;
-    app.scrollFocusedHorizontal(1);
+    app.scrollPanelHorizontal(.commits, 1);
     try std.testing.expectEqual(step, lv.hscroll);
-    for (0..50) |_| app.scrollFocusedHorizontal(1);
+    for (0..50) |_| app.scrollPanelHorizontal(.commits, 1);
     try std.testing.expectEqual(@as(u16, 30), lv.hscroll); // 50 - 20
     app.resetListHScroll(.commits);
     try std.testing.expectEqual(@as(u16, 0), lv.hscroll);
 
     // Status has no list view -> H/L are a no-op (no crash).
     app.focus = .status;
-    app.scrollFocusedHorizontal(1);
+    app.scrollPanelHorizontal(.status, 1);
 }
 
 test "pushNeedsForce detects diverged-remote rejections only" {
@@ -17504,8 +17516,9 @@ test "mouse wheel scrolls the panel under the cursor without changing focus" {
     app.main_scroll = 0;
     // Give the diff enough lines (in a short view) that scrolling is valid.
     app.allocator.free(app.diff);
-    app.diff = try app.allocator.dupe(u8, "1\n2\n3\n4\n5\n");
+    app.diff = try app.allocator.dupe(u8, "1\n2\n3\n4\n" ++ @as([45]u8, @splat('x')) ++ "\n");
     app.main_view_height = 2;
+    app.main_view_width = 40;
 
     // Wheel over the diff: scrolls it; focus stays on commits.
     _ = try app.handleMouse(.{ .col = 30, .row = 10, .button = .wheel_down, .mods = .{}, .type = .press });
@@ -17522,6 +17535,31 @@ test "mouse wheel scrolls the panel under the cursor without changing focus" {
     // Wheel over an unfocused panel (files): does NOT steal focus.
     _ = try app.handleMouse(.{ .col = 5, .row = 7, .button = .wheel_down, .mods = .{}, .type = .press });
     try std.testing.expectEqual(model.Focus.commits, app.focus);
+
+    // Feed terminal reports through the parser to check both directions.
+    var parser: vaxis.Parser = .{};
+    const right_over_diff = (try parser.parse("\x1b[<67;31;11M", null)).event.?.mouse;
+    const left_over_diff = (try parser.parse("\x1b[<66;31;11M", null)).event.?.mouse;
+    try std.testing.expect(try app.handleMouse(right_over_diff));
+    try std.testing.expectEqual(@as(u16, 5), app.main_hscroll);
+    try std.testing.expect(try app.handleMouse(left_over_diff));
+    try std.testing.expectEqual(@as(u16, 0), app.main_hscroll);
+    try std.testing.expectEqual(@as(usize, 1), app.main_scroll);
+
+    const files = app.listView(.files).?;
+    files.view_w = 20;
+    files.content_width = 24;
+    const right_over_files = (try parser.parse("\x1b[<67;6;8M", null)).event.?.mouse;
+    try std.testing.expect(try app.handleMouse(right_over_files));
+    try std.testing.expectEqual(@as(u16, 4), files.hscroll);
+    try std.testing.expectEqual(model.Focus.commits, app.focus);
+
+    app.mode = .diff_review;
+    try std.testing.expect(try app.handleMouse(right_over_diff));
+    try std.testing.expectEqual(@as(u16, 5), app.main_hscroll);
+    app.wrap_diff = true;
+    try std.testing.expect(try app.handleMouse(right_over_diff));
+    try std.testing.expectEqual(@as(u16, 0), app.main_hscroll);
 }
 
 test "clicking a checkout suggestion highlights it" {
