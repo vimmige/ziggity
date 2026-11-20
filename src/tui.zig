@@ -23,7 +23,6 @@ const config_mod = @import("config.zig");
 const conflicts_mod = @import("conflicts.zig");
 const credentials_mod = @import("credentials.zig");
 const diffmode_mod = @import("diffmode.zig");
-const donut_mod = @import("donut.zig");
 const filetree = @import("filetree.zig");
 const git_mod = @import("git.zig");
 const graphlanes_mod = @import("graphlanes.zig");
@@ -65,7 +64,6 @@ const Event = union(enum) {
     paste_end,
     refresh_tick,
     spinner_tick,
-    anim_tick,
     fetch_tick,
     external_check_tick,
     worker_wake,
@@ -867,7 +865,6 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
             // Fast tick while something works off-thread: advance the loading
             // spinner only. The worktree refresh rides the slower `.refresh_tick`.
             .spinner_tick => app.spinner_frame +%= 1,
-            .anim_tick => app.advanceDonut(io),
             .fetch_tick => {
                 app.bg_fetch_requested = true;
                 // Refresh PR status on the same cadence as the background fetch.
@@ -1424,8 +1421,6 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
         // Speed the ticker up (to animate the spinner + repaint) while a
         // foreground op runs OR a preview is still loading off-thread.
         app.busy_flag.store(app.foregroundBusy() or app.preview_loading or app.commitAiGenerating() or app.pr_gen_active, .release);
-        // Reflect whether the about-splash animation wants continuous ticks.
-        app.animate_flag.store(app.wantsAnimation(), .release);
 
         // Wall-clock time for the branches "time ago" column (unix seconds).
         app.now_unix = @intCast(@divFloor(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
@@ -1546,10 +1541,6 @@ fn refreshTickerRun(state: *RefreshTicker) void {
         // worktree refresh rides the slower cadence below, so a long preview load
         // can't turn every tick into a `git status` + file-list re-sort).
         if (busy) _ = state.loop.tryPostEvent(.spinner_tick) catch false;
-        // The about-splash donut animates on every fast tick while shown.
-        if (state.app.animate_flag.load(.acquire)) {
-            _ = state.loop.tryPostEvent(.anim_tick) catch false;
-        }
         // The periodic working-tree refresh fires at the configured cadence
         // whether busy or idle: a long preview load neither starves it (it still
         // fires each interval) nor spams it (never per fast tick). A timed tick
@@ -1948,6 +1939,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
 
     // The main/diff panel is hidden in global full mode (main_w == 0).
     if (main_w > 0) {
+        const status_output = app.showStatusOutput();
         const main_title = if (app.staging_patch_mode)
             "Building patch (esc back)"
         else if (app.staging_active)
@@ -1974,7 +1966,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
                 const staging_tabs = [_][]const u8{ "Unstaged", "Staged" };
                 break :blk tabbedPanel(root, side_w, 0, main_w, body_h, null, &staging_tabs, @as(usize, if (app.staging_staged_view) 1 else 0), wrap_tag, app.focus == .main, scroll);
             } else blk: {
-                const frame = panelBorder(root, side_w, 0, main_w, body_h, app.focus == .main, scroll);
+                const frame = panelBorder(root, side_w, 0, main_w, body_h, app.focus == .main, if (status_output) null else scroll);
                 if (main_w >= 4 and body_h >= 3) {
                     drawDiffTitle(frame.raw, title_shown, if (app.diff_base != null) styles().warning else if (app.focus == .main) styles().active_title else styles().title);
                 }
@@ -1982,10 +1974,8 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
             };
             app.main_view_height = main.height;
             app.main_view_width = main.width;
-            if (app.showAboutSplash()) drawAbout(main, app) else {
-                refreshOnDiffChange(vx, app);
-                drawDiff(main, app);
-            }
+            refreshOnDiffChange(vx, app);
+            if (status_output) drawStatusOutput(root, main, app) else drawDiff(main, app);
         }
     }
     // Indent the footer by one column so it lines up with the panel content
@@ -4701,7 +4691,7 @@ fn drawStash(win: vaxis.Window, app: *const app_mod.App) void {
     }
 }
 
-// --- Status-panel "about" splash (banner + repo info + a rotating donut) ---
+// --- Status preview header ---
 
 /// 5-row block-font glyphs (each 5 columns, `#` = filled) for the banner word.
 fn bannerGlyph(c: u8) [5][]const u8 {
@@ -4750,9 +4740,7 @@ fn centerCol(width: u16, content: u16) u16 {
 /// Draw a centred, *selectable* splash text line on `row` and advance `row`.
 /// The text is left-padded to its centred column into an App-owned buffer and
 /// drawn via `drawDialogRow`, which registers it in the dialog-selection grid so
-/// a mouse drag can copy it (banner rows and the donut are left unregistered, so
-/// only these lines are selectable). Padding keeps the grid's column mapping
-/// aligned with what's on screen.
+/// a mouse drag can copy it. Padding aligns the grid columns with the text.
 fn aboutLine(win: vaxis.Window, app: *app_mod.App, row: *u16, slot: *usize, text: []const u8, style: vaxis.Style) void {
     defer row.* += 1;
     if (row.* >= win.height or slot.* >= app.about_bufs.len) return;
@@ -4818,11 +4806,11 @@ fn currentYear(now_unix: i64) u16 {
     return es.getEpochDay().calculateYearDay().year;
 }
 
-fn drawAbout(win: vaxis.Window, app: *app_mod.App) void {
+fn drawStatusOutput(root: vaxis.Window, pane: vaxis.Window, app: *app_mod.App) void {
     const st = styles();
-    if (win.width == 0 or win.height == 0) return;
-    // Register this frame's selection grid over the panel; rows left unset stay
-    // empty (non-selectable), so only the text lines below can be copied.
+    if (pane.width == 0 or pane.height == 0) return;
+    const win = pane.child(.{ .height = pane.height -| 3 });
+    // Limit selection to the header's text rows.
     app.beginDialogGrid(@intCast(@max(win.x_off, 0)), @intCast(@max(win.y_off, 0)), win.height);
     var row: u16 = 1;
     var slot: usize = 0;
@@ -4872,51 +4860,14 @@ fn drawAbout(win: vaxis.Window, app: *app_mod.App) void {
     aboutLine(win, app, &row, &slot, std.fmt.bufPrint(&sbuf, "{d} changed  ({d} staged, {d} unstaged)", .{ app.data.files.len, app.data.stagedCount(), app.data.unstagedCount() }) catch "", st.normal);
     aboutLine(win, app, &row, &slot, std.fmt.bufPrint(&sbuf, "{d} branches  {d} stashes", .{ app.data.branches.len, app.data.stash.len }) catch "", st.normal);
 
-    // The donut fills whatever vertical space is left (unregistered rows).
-    const donut_top = row + 1;
-    if (win.height > donut_top + 6) {
-        drawDonut(win, donut_top, win.width, win.height - donut_top, app.anim_frame);
-    }
-}
-
-const donut_max_w = 200;
-const donut_max_h = 80;
-// Frame-local scratch for donut_mod.render (UI thread only): shade level per
-// cell (0 = empty) and the z-buffer. Sized generously; larger panels clamp.
-var donut_cell: [donut_max_w * donut_max_h]u8 = undefined;
-var donut_depth: [donut_max_w * donut_max_h]f32 = undefined;
-
-fn shadeColor(level: usize) u8 {
-    // A dim-blue -> cyan -> white ramp, all basic ANSI (palette-safe).
-    return if (level < 3) 4 else if (level < 6) 6 else if (level < 9) 14 else 15;
-}
-
-/// Compute one donut frame (via `donut_mod`) and blit it into the panel at
-/// `(0, y0)` sized `w x h` (panel-relative columns/rows). The shade math lives in
-/// `donut.zig`; here we only map levels to a glyph + colour and write cells.
-fn drawDonut(win: vaxis.Window, y0: u16, w: u16, h: u16, frame: usize) void {
-    const cw: usize = @min(@as(usize, w), donut_max_w);
-    const ch: usize = @min(@as(usize, h), donut_max_h);
-    if (cw < 8 or ch < 6) return;
-    const cells = cw * ch;
-    donut_mod.render(frame, cw, ch, donut_depth[0..cells], donut_cell[0..cells]);
-
-    // ASCII shades map through the static table so the grapheme reference is
-    // stable for vaxis (which stores it by reference until the flush).
-    var yy: usize = 0;
-    while (yy < ch) : (yy += 1) {
-        var xx: usize = 0;
-        while (xx < cw) : (xx += 1) {
-            const level = donut_cell[yy * cw + xx];
-            if (level == 0) continue;
-            const col: u16 = @intCast(xx);
-            const rr: u16 = y0 + @as(u16, @intCast(yy));
-            if (rr >= win.height or col >= win.width) continue;
-            win.writeCell(col, rr, .{
-                .char = .{ .grapheme = ascii_table[donut_mod.shades[level - 1]][0..1], .width = 1 },
-                .style = .{ .fg = .{ .index = shadeColor(level - 1) }, .bold = true },
-            });
-        }
+    const output = pane.child(.{ .y_off = @min(row + 1, win.height) });
+    app.main_view_height = output.height;
+    app.main_scroll = @min(app.main_scroll, app.maxMainScroll());
+    if (app.shell_output.len == 0) {
+        print(output, 0, 0, "Latest output from >, git commit, or git commit --amend.", st.muted);
+    } else {
+        drawDiffContent(output, app, app.shell_output, .main);
+        drawScrollbarRange(root, @intCast(output.x_off + output.width), @intCast(output.y_off), output.height, app.mainContentLines(), app.main_scroll, app.focus == .main);
     }
 }
 
@@ -4975,7 +4926,7 @@ fn wordEmphasis(gpa: std.mem.Allocator, text: []const u8) []worddiff.Emph {
     return lines;
 }
 
-fn emphFor(lines: []worddiff.Emph, idx: usize) worddiff.Emph {
+fn emphFor(lines: []const worddiff.Emph, idx: usize) worddiff.Emph {
     return if (idx < lines.len) lines[idx] else .{};
 }
 
@@ -4989,13 +4940,14 @@ pub fn deinitWordCache() void {
 }
 
 fn refreshOnDiffChange(vx: *vaxis.Vaxis, app: *const app_mod.App) void {
-    const addr = @intFromPtr(app.diff.ptr);
+    const text = if (app.showStatusOutput()) app.shell_output else app.diff;
+    const addr = @intFromPtr(text.ptr);
     const spinner = app.previewSpinnerVisible();
-    if (addr == last_diff_addr and app.diff.len == last_diff_len and
+    if (addr == last_diff_addr and text.len == last_diff_len and
         app.main_scroll == last_diff_scroll and app.main_hscroll == last_diff_hscroll and
         spinner == last_diff_spinner) return;
     last_diff_addr = addr;
-    last_diff_len = app.diff.len;
+    last_diff_len = text.len;
     last_diff_scroll = app.main_scroll;
     last_diff_hscroll = app.main_hscroll;
     last_diff_spinner = spinner;
@@ -5311,7 +5263,7 @@ fn wordBg(em: worddiff.Emph) u8 {
 /// selection are mapped onto each rendered segment.
 fn drawDiffContent(win: vaxis.Window, app: *const app_mod.App, text: []const u8, pane: app_mod.SelPane) void {
     const base = styles().normal;
-    const emph_lines = wordEmphasis(app.allocator, text);
+    const emph_lines = if (app.showStatusOutput()) &.{} else wordEmphasis(app.allocator, text);
     const sel = app.diffSelectionRangeFor(pane);
 
     // Hunk cursor (the narrow-terminal fallback for the review): show the selected

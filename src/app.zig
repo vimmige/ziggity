@@ -181,11 +181,6 @@ pub const EditorRequest = struct {
 /// `keep` snapshots the changes into a stash but leaves the working tree as-is.
 pub const StashKind = enum { all, untracked, staged, unstaged, file, keep };
 
-/// Wall-clock milliseconds per donut animation frame. Matches the ticker's
-/// spinner cadence, so the rotation runs at the same speed as before but is now
-/// driven by elapsed time (see `App.advanceDonut`) instead of tick count.
-const donut_frame_ms: i96 = 80;
-
 pub const TextPromptKind = enum {
     shell,
     new_branch,
@@ -4069,6 +4064,7 @@ pub const App = struct {
     op_command: []u8 = &.{},
     op_summary: []u8 = &.{},
     op_output: []u8 = &.{},
+    shell_output: []u8 = &.{},
     op_ok: bool = true,
     op_running: bool = false,
     op_scroll: usize = 0,
@@ -4392,20 +4388,6 @@ pub const App = struct {
     mutation_gerund: []const u8 = "working",
     busy_flag: std.atomic.Value(bool) = .init(false),
     spinner_frame: usize = 0,
-    // Drives the Status-panel "about" splash animation (the rotating donut).
-    // `anim_frame` is derived from accumulated *active* monotonic time (see
-    // `advanceDonut`), NOT the count of `.anim_tick` events — so a dropped or
-    // bursted tick can't make the donut stall or fast-forward, only skip a
-    // frame. Each tick adds the (capped) time since the previous tick to
-    // `anim_accum_ns`, so a long gap — lost focus, hidden splash, a blocked
-    // loop — resumes the spin where it left off instead of jumping. `animate_flag`
-    // tells the ticker thread to keep posting ticks while the splash is on
-    // screen and focused; `anim_last_ns` is the previous tick's monotonic
-    // instant (0 = not yet stamped).
-    anim_frame: usize = 0,
-    anim_last_ns: i96 = 0,
-    anim_accum_ns: i96 = 0,
-    animate_flag: std.atomic.Value(bool) = .init(false),
     // Persistent storage for the about-splash's selectable text lines: the
     // dialog-grid selection keeps row slices by reference and reads them on a
     // later mouse-release, so they can't be transient render-time buffers.
@@ -4430,18 +4412,8 @@ pub const App = struct {
         return pt.row == self.about_url_row and pt.col >= self.about_url_lo and pt.col < self.about_url_hi;
     }
 
-    /// The main panel shows the "about" splash (banner + repo info + animation)
-    /// whenever the Status panel is the content being inspected and no other view
-    /// (staging, diffing) has taken over the main area.
-    pub fn showAboutSplash(self: *const App) bool {
+    pub fn showStatusOutput(self: *const App) bool {
         return self.contentFocus() == .status and !self.staging_active and self.diff_base == null;
-    }
-
-    /// Whether the ticker should keep animating: the splash is visible, we're at
-    /// the top level (no dialog), and the terminal has focus (no CPU spent
-    /// animating a hidden/backgrounded window).
-    pub fn wantsAnimation(self: *const App) bool {
-        return self.showAboutSplash() and self.mode == .normal and self.terminal_focused;
     }
 
     pub fn init(
@@ -4565,6 +4537,7 @@ pub const App = struct {
         self.allocator.free(self.op_command);
         self.allocator.free(self.op_summary);
         self.allocator.free(self.op_output);
+        self.allocator.free(self.shell_output);
         self.commit_buffer.deinit(self.allocator);
         self.commit_body_buffer.deinit(self.allocator);
         self.allocator.free(self.commit_preserved_subject);
@@ -5333,7 +5306,7 @@ pub const App = struct {
         for (self.config.custom_commands[0..self.config.custom_count]) |*cc| {
             if (cc.binding.matches(key)) {
                 if (self.foregroundBusy()) return self.setMessage("operation in progress...", .{});
-                return self.runCustomCommand(cc.command());
+                return self.runCustomCommand(cc.command(), false);
             }
         }
 
@@ -6066,9 +6039,8 @@ pub const App = struct {
 
         // The Status-panel "about" splash reuses the dialog-grid selection: drag
         // over its text lines to select, release to copy. Its rows are registered
-        // in `drawAbout`; the banner and animated donut rows are left empty, so
-        // only the info lines are selectable.
-        if (self.showAboutSplash()) {
+        // in `drawStatusOutput` only for the selectable header text.
+        if (self.showStatusOutput()) {
             const c: u16 = if (mouse.col < 0) 0 else @intCast(mouse.col);
             const rw: u16 = if (mouse.row < 0) 0 else @intCast(mouse.row);
             switch (mouse.type) {
@@ -6113,7 +6085,6 @@ pub const App = struct {
                     return true;
                 },
             }
-            return false;
         }
 
         // Character-precise text selection: left-drag selects, release copies to
@@ -6839,29 +6810,6 @@ pub const App = struct {
             count += 1;
         }
         return null;
-    }
-
-    /// Advance the about-splash donut, accumulating the *active* time since the
-    /// previous tick. Rotation is a function of that accumulated time — not the
-    /// number of `.anim_tick` events delivered — so irregular tick delivery
-    /// (drops under load, bursts after the loop unblocks) can't distort the spin
-    /// speed. The per-tick step is capped so a long gap — the terminal losing
-    /// focus, the splash being hidden, or the loop blocking on a git op — doesn't
-    /// count as elapsed animation and fast-forward the donut on resume; instead
-    /// it continues from where it left off.
-    pub fn advanceDonut(self: *App, io: std.Io) void {
-        const now: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
-        defer self.anim_last_ns = now;
-        if (self.anim_last_ns == 0) return; // first tick: just stamp the clock
-        var delta = now - self.anim_last_ns;
-        if (delta <= 0) return;
-        // A gap longer than a few frame periods means we were paused (lost focus,
-        // splash hidden, loop blocked), not merely jittery — clamp it so the spin
-        // resumes rather than jumping ahead by the whole idle duration.
-        const max_step: i96 = donut_frame_ms * std.time.ns_per_ms * 3;
-        if (delta > max_step) delta = max_step;
-        self.anim_accum_ns += delta;
-        self.anim_frame = @intCast(@divFloor(self.anim_accum_ns, donut_frame_ms * std.time.ns_per_ms));
     }
 
     pub fn handleRefreshTick(self: *App) !void {
@@ -8111,6 +8059,7 @@ pub const App = struct {
         self.resetCommitAiState();
         a.free(self.diff);
         self.diff = a.dupe(u8, "") catch &.{};
+        self.replaceShellOutput(&.{});
 
         a.free(self.file_filter);
         self.file_filter = a.dupe(u8, "") catch &.{};
@@ -8898,6 +8847,7 @@ pub const App = struct {
     /// In the review with `=` on, it is the whole-file (full-context) diff built
     /// from the same source.
     pub fn activeMainText(self: *const App) []const u8 {
+        if (self.showStatusOutput()) return self.shell_output;
         if (self.mode == .diff_review and self.review_whole_file and self.review_whole_diff.len > 0)
             return self.review_whole_diff;
         return if (self.staging_active) self.staging_diff else self.diff;
@@ -8936,7 +8886,7 @@ pub const App = struct {
     fn openDiffReview(self: *App) !void {
         if (self.staging_patch_mode)
             return self.setMessage("finish the custom patch before a side-by-side review", .{});
-        if (self.splitRows().rows.len == 0)
+        if (self.showStatusOutput() or self.splitRows().rows.len == 0)
             return self.setMessage("no diff here to review side by side", .{});
         self.review_saved_scroll = self.main_scroll;
         self.review_saved_hscroll = self.main_hscroll;
@@ -9408,7 +9358,7 @@ pub const App = struct {
 
     pub fn diffCursorLine(self: *const App) ?usize {
         if ((self.mode != .normal and self.mode != .rebase_plan) or self.focus != .main or
-            self.staging_active or self.showAboutSplash() or self.diff.len == 0 or self.previewSpinnerVisible()) return null;
+            self.staging_active or self.showStatusOutput() or self.diff.len == 0 or self.previewSpinnerVisible()) return null;
 
         // Keep the highlight visible when the wheel or a resize moves the viewport.
         const top = self.topSourceLine();
@@ -9757,7 +9707,7 @@ pub const App = struct {
     fn mainContentWidth(self: *const App) u16 {
         // Cached: the clamp in the render loop calls this every frame, and a fresh
         // full-text scan there made scrolling a large diff clunky.
-        return cachedMaxVisibleWidth(if (self.staging_active) self.staging_diff else self.diff);
+        return cachedMaxVisibleWidth(if (self.showStatusOutput()) self.shell_output else self.paneText(.main));
     }
 
     /// Largest horizontal offset that still keeps the widest line's end at (or
@@ -11008,7 +10958,7 @@ pub const App = struct {
                 self.mode = .normal;
                 self.text_prompt_kind = null;
                 defer self.input_buffer.clearRetainingCapacity();
-                self.runCustomCommand(value) catch |err| {
+                self.runCustomCommand(value, true) catch |err| {
                     self.op_running = false;
                     self.mode = .normal;
                     try self.setMessage("shell command failed: {s}", .{@errorName(err)});
@@ -12738,7 +12688,7 @@ pub const App = struct {
         }
 
         switch (self.contentFocus()) {
-            .status => return self.setCheapPreview(try self.statusPreview()),
+            .status => return self.setCheapPreview(&.{}),
             .files, .staged, .main => {
                 // The Files panel's Worktrees / Submodules tabs show an info card
                 // for the selected entry rather than a diff.
@@ -13174,36 +13124,6 @@ pub const App = struct {
         // `exe_path` sentinel length, see the field doc.) `t` above is
         // worker-owned (`gpa`).
         job.deinit(page_alloc);
-    }
-
-    fn statusPreview(self: *App) ![]u8 {
-        var aw: std.Io.Writer.Allocating = .init(self.allocator);
-        errdefer aw.deinit();
-        const writer = &aw.writer;
-        try writer.print("On branch {s}\n", .{self.data.current_branch});
-        if (self.data.upstream) |upstream| {
-            const ahead = self.data.ahead orelse 0;
-            const behind = self.data.behind orelse 0;
-            try writer.print("Tracking {s}\n", .{upstream});
-            if (ahead == 0 and behind == 0) {
-                try writer.writeAll("Up to date with upstream.\n");
-            } else {
-                if (ahead > 0) try writer.print("{d} commit(s) to push (ahead).\n", .{ahead});
-                if (behind > 0) try writer.print("{d} commit(s) to pull (behind).\n", .{behind});
-            }
-        } else {
-            try writer.writeAll("No upstream configured.\n");
-        }
-        try writer.print("\n{d} changed files: {d} staged, {d} unstaged\n", .{
-            self.data.files.len,
-            self.data.stagedCount(),
-            self.data.unstagedCount(),
-        });
-        try writer.print("{d} local branches, {d} stash entries\n", .{
-            self.data.branches.len,
-            self.data.stash.len,
-        });
-        return aw.toOwnedSlice();
     }
 
     /// Queue a network op for the TUI loop to run off-thread. Single in-flight.
@@ -13701,6 +13621,15 @@ pub const App = struct {
         if (result_opt) |result| {
             var mutable = result;
             defer mutable.deinit(gpa);
+            const commit_command = switch (job) {
+                .commit => |commit| if (commit.no_verify) "git commit --no-verify" else "git commit",
+                .amend => "git commit --amend --no-edit",
+                .amend_message => "git commit --amend",
+                else => "",
+            };
+            if (commit_command.len > 0 and (result.stdout.len > 0 or result.stderr.len > 0)) {
+                self.captureTerminalOutput(commit_command, result) catch {};
+            }
             if (mutable.ok()) {
                 if (std.meta.activeTag(job) != .stage_batch) self.git.amend_view = null;
                 // The commit landed: drop the preserved draft that submitCommit
@@ -13805,12 +13734,13 @@ pub const App = struct {
         }
     }
 
-    fn runCustomCommand(self: *App, command: []const u8) !void {
+    fn runCustomCommand(self: *App, command: []const u8, from_shell_prompt: bool) !void {
         var run_buf: [256]u8 = undefined;
         const shown = std.fmt.bufPrint(&run_buf, "$ {s}", .{command}) catch command;
         try self.beginOp(shown);
         var result = try self.git.runShell(command);
         defer result.deinit(self.allocator);
+        if (from_shell_prompt) try self.captureTerminalOutput(command, result);
         // Custom commands are usually run to read output, so by default show it
         // in the dialog; `command_output = silent` makes them follow the same
         // result_dialog policy as git actions.
@@ -13826,6 +13756,30 @@ pub const App = struct {
             try self.reportFailure("command failed", if (result.stderr.len > 0) result.stderr else result.stdout);
         }
         self.refreshViews(Refresh.all);
+    }
+
+    fn captureTerminalOutput(self: *App, command: []const u8, result: git_mod.ExecResult) !void {
+        const stdout = std.mem.trimEnd(u8, result.stdout, "\r\n");
+        const stderr = std.mem.trimEnd(u8, result.stderr, "\r\n");
+        const output = try std.fmt.allocPrint(self.allocator, "$ {s}\n{s}{s}{s}", .{
+            command, stdout, if (stdout.len > 0 and stderr.len > 0) "\n" else "", stderr,
+        });
+        self.replaceShellOutput(output);
+        if (self.showStatusOutput()) {
+            self.main_scroll = 0;
+            self.main_hscroll = 0;
+        }
+    }
+
+    fn replaceShellOutput(self: *App, output: []u8) void {
+        if (self.shell_output.len > 0) {
+            // The layout caches use buffer addresses, which can be reused.
+            deinitLineIndexCache();
+            deinitWrapCache();
+            width_cache = @splat(.{});
+        }
+        self.allocator.free(self.shell_output);
+        self.shell_output = output;
     }
 
     pub fn setMessage(self: *App, comptime fmt: []const u8, args: anytype) !void {
@@ -20233,6 +20187,78 @@ test "staging the last change falls back to the change above (e2e)" {
     try std.testing.expect(std.mem.indexOf(u8, app.staging_diff, "+TOP") != null);
 }
 
+test "built-in commit shows both streams from a failing pre-commit hook" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [160]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try testGitEnv(&env, path);
+    try testRunSetup(a, io, &env, path,
+        \\set -e
+        \\git init -q
+        \\git config user.email t@t
+        \\git config user.name t
+        \\echo staged > file.txt
+        \\git add file.txt
+        \\printf '#!/bin/sh\necho hook-output\necho hook-error >&2\nexit 1\n' > .git/hooks/pre-commit
+        \\chmod +x .git/hooks/pre-commit
+    );
+
+    var files = [_]model.FileStatus{};
+    var app = try testApp(a, &files);
+    defer deinitTestApp(&app);
+    app.git = try git_mod.Git.initAt(a, io, &env, path);
+    defer app.git.deinit();
+    app.focus = .files;
+    try app.requestMutation(.{ .commit = .{ .message = "test", .no_verify = false } }, .{ .command = "git commit" }, "commit created", .{});
+    const job = app.takeMutation().?;
+    var checkout_head: ?[]u8 = null;
+    const result = try job.run(a, io, app.git.environ, app.git.root, app.git.git_dir, null, &checkout_head);
+    try app.completeMutation(job, result, a);
+    try std.testing.expect(!app.op_ok);
+    app.focus = .status;
+    try app.updatePreview();
+    try std.testing.expectEqualStrings("$ git commit\nhook-output\nhook-error", app.activeMainText());
+}
+
+test "shell prompt output remains available in Status after switching panels" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [160]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try testGitEnv(&env, path);
+    try testRunSetup(a, io, &env, path, "git init -q");
+
+    var files = [_]model.FileStatus{};
+    var app = try testApp(a, &files);
+    defer deinitTestApp(&app);
+    app.git = try git_mod.Git.initAt(a, io, &env, path);
+    defer app.git.deinit();
+    app.focus = .files;
+    try app.startTextPrompt(.shell);
+    const command = "printf 'standard output\\n'; printf 'standard error\\n' >&2; exit 7";
+    try app.input_buffer.appendSlice(a, command);
+    try app.submitTextPrompt();
+    try std.testing.expect(app.focus == .files);
+    const expected = "$ " ++ command ++ "\nstandard output\nstandard error";
+    app.focus = .status;
+    try app.updatePreview();
+    try std.testing.expectEqualStrings(expected, app.activeMainText());
+    app.focus = .files;
+    try app.updatePreview();
+    app.focus = .status;
+    try app.updatePreview();
+    try std.testing.expectEqualStrings(expected, app.activeMainText());
+}
+
 test "the staging view picks up an external edit on the next refresh (e2e)" {
     const a = std.testing.allocator;
     const tio = std.testing.io;
@@ -20366,6 +20392,7 @@ fn deinitTestApp(app: *App) void {
     app.allocator.free(app.op_command);
     app.allocator.free(app.op_summary);
     app.allocator.free(app.op_output);
+    app.allocator.free(app.shell_output);
     if (app.clipboard_request) |c| app.allocator.free(c);
     app.clearPrRequest();
     app.allocator.free(app.pr_doc_title);
