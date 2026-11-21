@@ -5134,24 +5134,6 @@ fn drawHunkBoxBottom(win: vaxis.Window, row: u16, right_edge_x: u16) void {
     print(win, row, right_edge_x, box_br, accent);
 }
 
-/// The diff line of the cursor hunk's `@@` header while the review is open, else
-/// null. Used by the narrow-terminal unified fallback, which has no room for the
-/// box and marks the selection by showing that header row in reverse video.
-fn selectedHunkHeaderLine(app: *const app_mod.App) ?usize {
-    if (app.mode != .diff_review) return null;
-    const r = app.currentDiffHunkRange() orelse return null;
-    return r.start;
-}
-
-/// `style` with reverse video turned on when `on`: the terminal swaps its own
-/// fg/bg, so the result is always readable whatever the theme or terminal.
-fn reverseIf(style: vaxis.Style, on: bool) vaxis.Style {
-    if (!on) return style;
-    var s = style;
-    s.reverse = true;
-    return s;
-}
-
 /// Draw one side-by-side cell (unwrapped) into its column window: the full diff
 /// line (leading `+`/`-`/space marker included), clipped to `[h_off, h_off+width)`
 /// and coloured by kind, with the changed words emphasized. A blank (padding)
@@ -5283,13 +5265,10 @@ fn drawDiffContent(win: vaxis.Window, app: *const app_mod.App, text: []const u8,
     const emph_lines = if (app.showStatusOutput()) &.{} else wordEmphasis(app.allocator, text);
     const sel = app.diffSelectionRangeFor(pane);
 
-    // Hunk cursor (the narrow-terminal fallback for the review): show the selected
-    // hunk's `@@` header line in reverse video, matching the side-by-side view.
-    const sel_header = if (pane == .main) selectedHunkHeaderLine(app) else null;
     const cursor = app.diffCursorLine();
     const baseFor = struct {
-        fn f(w: vaxis.Window, row: u16, b: vaxis.Style, header: ?usize, selected: ?usize, line: usize) vaxis.Style {
-            var style = reverseIf(b, header == line);
+        fn f(w: vaxis.Window, row: u16, b: vaxis.Style, selected: ?usize, line: usize) vaxis.Style {
+            var style = b;
             if (selected == line) {
                 applySel(&style, .active);
                 fillRow(w, row, style);
@@ -5306,7 +5285,7 @@ fn drawDiffContent(win: vaxis.Window, app: *const app_mod.App, text: []const u8,
             if (vidx >= rows.len) break;
             const wr = rows[vidx];
             const line = text[wr.start..wr.end];
-            const lb = baseFor(win, screen_row, base, sel_header, cursor, wr.line);
+            const lb = baseFor(win, screen_row, base, cursor, wr.line);
             const em = emphFor(emph_lines, wr.line);
             const sg = segSel(selColsFor(sel, wr.line), wr.vis_start, wr.vis_end);
             printAnsiEmph(win, screen_row, line, lb, sg.lo, sg.hi, wr.vis_start, em.spans, wordBg(em), wr.vis_end - wr.vis_start, false);
@@ -5328,7 +5307,7 @@ fn drawDiffContent(win: vaxis.Window, app: *const app_mod.App, text: []const u8,
             const start = offs[abs_line];
             const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
             const line = text[start..end];
-            const lb = baseFor(win, row, base, sel_header, cursor, abs_line);
+            const lb = baseFor(win, row, base, cursor, abs_line);
             const em = emphFor(emph_lines, abs_line);
             const sg = segSel(selColsFor(sel, abs_line), h_off, h_off +| win.width);
             printAnsiEmph(win, row, line, lb, sg.lo, sg.hi, h_off, em.spans, wordBg(em), std.math.maxInt(u16), false);
@@ -5344,7 +5323,7 @@ fn drawDiffContent(win: vaxis.Window, app: *const app_mod.App, text: []const u8,
     while (row < win.height) : (row += 1) {
         const line = lines.next() orelse break;
         const abs_line = app.main_scroll + row;
-        const lb = baseFor(win, row, base, sel_header, cursor, abs_line);
+        const lb = baseFor(win, row, base, cursor, abs_line);
         const em = emphFor(emph_lines, abs_line);
         const sg = segSel(selColsFor(sel, abs_line), h_off, h_off +| win.width);
         printAnsiEmph(win, row, line, lb, sg.lo, sg.hi, h_off, em.spans, wordBg(em), std.math.maxInt(u16), false);
@@ -6484,6 +6463,49 @@ fn dimmed(base: vaxis.Style) vaxis.Style {
     s.fg = .default;
     s.dim = true;
     return s;
+}
+
+test "narrow review highlights the cursor without reversing the hunk header" {
+    const allocator = std.testing.allocator;
+    defer app_mod.deinitHunkLinesCache();
+    defer app_mod.deinitLineIndexCache();
+    defer app_mod.deinitSplitRowsCache();
+    defer app_mod.deinitSplitWrapCache();
+    defer app_mod.deinitWrapCache();
+    defer deinitWordCache();
+    var screen = try vaxis.Screen.init(allocator, .{ .cols = 100, .rows = 10, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(allocator);
+    const root: vaxis.Window = .{
+        .screen = &screen,
+        .width = screen.width,
+        .height = screen.height,
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+    };
+    var diff = "diff --git a/x b/x\n\x1b[36m@@ -1,2 +1,2 @@\x1b[m\n context\n-old\n+new\n".*;
+    for ([_]bool{ false, true }) |wrap| {
+        var app: app_mod.App = .{
+            .allocator = allocator,
+            .git = undefined,
+            .config = .{},
+            .mode = .diff_review,
+            .diff = &diff,
+            .main_view_width = 98,
+            .main_view_height = 7,
+            .review_line_cursor = 2,
+            .wrap_diff = wrap,
+        };
+        try std.testing.expect(app.splitActive());
+        const narrow = root.child(.{ .width = 60 });
+        drawDiffReview(narrow, &app);
+        try std.testing.expect(!app.splitActive());
+        try std.testing.expectEqualStrings("@", narrow.readCell(1, 2).?.char.grapheme);
+        try std.testing.expectEqualStrings("-", narrow.readCell(1, 4).?.char.grapheme);
+        try std.testing.expectEqual(vaxis.Color{ .index = ui_theme.selected_bg }, narrow.readCell(1, 4).?.style.bg);
+        try std.testing.expect(!narrow.readCell(1, 2).?.style.reverse);
+    }
 }
 
 test "recencyStr rounds like git --date=relative" {
