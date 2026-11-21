@@ -45,13 +45,17 @@ pub const ExecBatch = struct {
     /// Takes ownership of result. A non-null result ends the batch.
     pub fn add(self: *ExecBatch, allocator: std.mem.Allocator, result: ExecResult) ?ExecResult {
         if (!result.ok()) return self.finish(allocator, result);
+        self.record(allocator, result);
+        return null;
+    }
+
+    fn record(self: *ExecBatch, allocator: std.mem.Allocator, result: ExecResult) void {
         var owned = result;
         defer owned.deinit(allocator);
         _ = appendStream(&self.stdout, allocator, result.prior_stdout);
         _ = appendStream(&self.stdout, allocator, result.stdout);
         _ = appendStream(&self.stderr, allocator, result.prior_stderr);
         _ = appendStream(&self.stderr, allocator, result.stderr);
-        return null;
     }
 
     pub fn finish(self: *ExecBatch, allocator: std.mem.Allocator, result: ExecResult) ExecResult {
@@ -2592,9 +2596,9 @@ pub const Git = struct {
         // cannot make us restore the wrong entry. `--index` preserves the
         // staged/unstaged split; if it can't, a plain apply still restores the
         // files.
-        var applied = try self.exec(&.{ "stash", "apply", "--index", after });
+        const applied = try self.exec(&.{ "stash", "apply", "--index", after });
         if (applied.ok()) return batch.finish(self.allocator, applied);
-        applied.deinit(self.allocator);
+        batch.record(self.allocator, applied);
         return batch.finish(self.allocator, try self.exec(&.{ "stash", "apply", after }));
     }
 
@@ -2645,9 +2649,9 @@ pub const Git = struct {
         }
         // 3. Restore the staged changes (now stash@{1}) to the index. `--index`
         // preserves the staged/unstaged split; a plain pop is the fallback.
-        var restore = try self.exec(&.{ "stash", "pop", "--index", "stash@{1}" });
+        const restore = try self.exec(&.{ "stash", "pop", "--index", "stash@{1}" });
         if (restore.ok()) return batch.finish(self.allocator, restore);
-        restore.deinit(self.allocator);
+        batch.record(self.allocator, restore);
         return batch.finish(self.allocator, try self.exec(&.{ "stash", "pop", "stash@{1}" }));
     }
 
@@ -4011,6 +4015,18 @@ test "stashKeeping restores the same working state it stashed" {
     defer stash_list.deinit(a);
     try std.testing.expect(stash_list.ok());
     try std.testing.expect(std.mem.indexOf(u8, stash_list.stdout, "keep") != null);
+}
+
+test "batch retains a failed attempt without changing fallback success" {
+    const allocator = std.testing.allocator;
+    var batch: ExecBatch = .{};
+    defer batch.deinit(allocator);
+    batch.record(allocator, .{ .stdout = &.{}, .stderr = try allocator.dupe(u8, "index not restored\n"), .term = .{ .exited = 1 } });
+    var result = batch.finish(allocator, .{ .stdout = &.{}, .stderr = &.{}, .term = .{ .exited = 0 } });
+    defer result.deinit(allocator);
+    try std.testing.expect(result.ok());
+    try std.testing.expectEqualStrings("index not restored\n", result.prior_stderr);
+    try std.testing.expectEqualStrings("", result.stderr);
 }
 
 test "batch keeps prior stderr separate from a stdout-only failure" {
