@@ -2432,6 +2432,7 @@ const HunkLinesEntry = struct {
     used: u64 = 0,
     gpa: ?std.mem.Allocator = null,
     lines: []usize = &.{},
+    ends: []usize = &.{},
 };
 var hunk_lines_cache: [3]HunkLinesEntry = .{ .{}, .{}, .{} };
 var hunk_lines_clock: u64 = 0;
@@ -2454,20 +2455,21 @@ fn withoutLeadingAnsi(line: []const u8) []const u8 {
 
 /// Line indices of the preview's hunk headers, built once and cached by identity.
 pub fn diffHunkLines(gpa: std.mem.Allocator, diff: []const u8) []const usize {
-    if (diff.len == 0) return hunk_lines_empty[0..];
+    return cachedHunkLines(gpa, diff).lines;
+}
+
+fn cachedHunkLines(gpa: std.mem.Allocator, diff: []const u8) HunkLinesEntry {
+    if (diff.len == 0) return .{};
     const addr = @intFromPtr(diff.ptr);
     hunk_lines_clock +%= 1;
     for (&hunk_lines_cache) |*e| {
         if (e.gpa != null and e.addr == addr and e.len == diff.len) {
             e.used = hunk_lines_clock;
-            return e.lines;
+            return e.*;
         }
     }
-    const built = buildHunkLines(gpa, diff) catch return hunk_lines_empty[0..];
-    if (built.len == 0) {
-        gpa.free(built);
-        return hunk_lines_empty[0..];
-    }
+    const built = buildHunkLines(gpa, diff) catch return .{};
+    if (built.lines.len == 0) return .{};
     var victim: *HunkLinesEntry = &hunk_lines_cache[0];
     for (&hunk_lines_cache) |*e| {
         if (e.gpa == null) {
@@ -2476,30 +2478,46 @@ pub fn diffHunkLines(gpa: std.mem.Allocator, diff: []const u8) []const usize {
         }
         if (e.used < victim.used) victim = e;
     }
-    if (victim.gpa) |g| g.free(victim.lines);
-    victim.* = .{ .addr = addr, .len = diff.len, .used = hunk_lines_clock, .gpa = gpa, .lines = built };
-    return built;
+    if (victim.gpa) |g| {
+        g.free(victim.lines);
+        g.free(victim.ends);
+    }
+    victim.* = .{ .addr = addr, .len = diff.len, .used = hunk_lines_clock, .gpa = gpa, .lines = built.lines, .ends = built.ends };
+    return victim.*;
 }
 
-fn buildHunkLines(gpa: std.mem.Allocator, diff: []const u8) ![]usize {
-    var list: std.ArrayList(usize) = .empty;
-    errdefer list.deinit(gpa);
+fn buildHunkLines(gpa: std.mem.Allocator, diff: []const u8) !struct { lines: []usize, ends: []usize } {
+    var lines: std.ArrayList(usize) = .empty;
+    defer lines.deinit(gpa);
+    var ends: std.ArrayList(usize) = .empty;
+    defer ends.deinit(gpa);
     var line_no: usize = 0;
     var ls: usize = 0;
     while (ls <= diff.len) {
         const le = std.mem.indexOfScalarPos(u8, diff, ls, '\n') orelse diff.len;
-        if (lineIsHunkHeader(diff[ls..le])) try list.append(gpa, line_no);
+        const line = withoutLeadingAnsi(diff[ls..le]);
+        const header = std.mem.startsWith(u8, line, "@@");
+        if (lines.items.len > ends.items.len and
+            (header or line.len == 0 or std.mem.indexOfScalar(u8, " +-\\", line[0]) == null))
+            try ends.append(gpa, line_no);
+        if (header) try lines.append(gpa, line_no);
         line_no += 1;
         if (le == diff.len) break;
         ls = le + 1;
     }
-    return list.toOwnedSlice(gpa);
+    if (lines.items.len > ends.items.len) try ends.append(gpa, line_no);
+    const starts = try lines.toOwnedSlice(gpa);
+    errdefer gpa.free(starts);
+    return .{ .lines = starts, .ends = try ends.toOwnedSlice(gpa) };
 }
 
 /// Release the hunk-header line cache (module-level). Called from tui teardown.
 pub fn deinitHunkLinesCache() void {
     for (&hunk_lines_cache) |*e| {
-        if (e.gpa) |g| g.free(e.lines);
+        if (e.gpa) |g| {
+            g.free(e.lines);
+            g.free(e.ends);
+        }
         e.* = .{};
     }
 }
@@ -2954,6 +2972,21 @@ test "diffHunkLines finds hunk headers whether plain or ANSI-coloured" {
     try std.testing.expectEqual(@as(usize, 2), lines.len);
     try std.testing.expectEqual(@as(usize, 1), lines[0]);
     try std.testing.expectEqual(@as(usize, 5), lines[1]);
+}
+
+test "narrow review leaves file headers outside the preceding hunk" {
+    const allocator = std.testing.allocator;
+    var app = try testApp(allocator, &.{});
+    defer deinitTestApp(&app);
+    allocator.free(app.diff);
+    app.diff = try allocator.dupe(u8, "@@ -1 +1 @@\n-a\n+b\n\\ No newline at end of file\ndiff --git a/y b/y\n--- a/y\n+++ b/y\n@@ -2 +2 @@\n-c\n+d\n");
+    app.mode = .diff_review;
+    app.main_view_width = 60;
+    try std.testing.expectEqual(@as(?usize, 0), app.changeHunkAtRow(3));
+    for (4..7) |row| try std.testing.expectEqual(@as(?usize, null), app.changeHunkAtRow(row));
+    try std.testing.expectEqual(@as(?usize, 1), app.changeHunkAtRow(7));
+    try std.testing.expectEqual(@as(?usize, 1), app.changeHunkAtRow(9));
+    try std.testing.expectEqual(@as(?usize, null), app.changeHunkAtRow(10));
 }
 
 test "review line navigation skips separators and selects the hunk it enters" {
@@ -9602,22 +9635,22 @@ pub const App = struct {
     }
 
     /// The change-hunk index whose frame (its header through its spacer) contains
-    /// view row `row`, or null when the row is a between-hunk common line. Scans up
-    /// to the enclosing header, stopping at another hunk's spacer.
+    /// view row `row`, or null when the row is a between-hunk common line.
     fn changeHunkAtRow(self: *const App, row: usize) ?usize {
         const changes = self.reviewHunkLines();
         if (!self.splitActive()) {
             if (row >= self.mainVisualRows()) return null;
-            const text = self.activeMainText();
-            const offsets = lineOffsets(self.allocator, text);
-            var i = self.sourceLineAtVisualRow(row);
-            if (i >= offsets.len) return null;
-            while (true) : (i -= 1) {
-                const end = std.mem.indexOfScalarPos(u8, text, offsets[i], '\n') orelse text.len;
-                const line = withoutLeadingAnsi(text[offsets[i]..end]);
-                if (std.mem.startsWith(u8, line, "@@")) return std.mem.indexOfScalar(usize, changes, i);
-                if (i == 0 or line.len == 0 or std.mem.indexOfScalar(u8, " +-\\", line[0]) == null) return null;
-            }
+            const hunks = cachedHunkLines(self.allocator, self.activeMainText());
+            const line = self.sourceLineAtVisualRow(row);
+            const order = struct {
+                fn compare(target: usize, item: usize) std.math.Order {
+                    return std.math.order(target, item);
+                }
+            }.compare;
+            const hunk = std.sort.upperBound(usize, hunks.ends, line, order);
+            if (hunk == hunks.lines.len or line < hunks.lines[hunk]) return null;
+            if (!self.review_whole_file) return hunk;
+            return std.sort.binarySearch(usize, changes, hunks.lines[hunk], order);
         }
         if (self.wrap_diff) {
             const vrows = self.splitWrapRows();
