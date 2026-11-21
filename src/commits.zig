@@ -83,8 +83,8 @@ pub fn startCommitPrompt(app: *App, no_verify: bool) !void {
     if (app.config.aiConfigured()) {
         const subj_empty = std.mem.trim(u8, app.commit_buffer.items, " \t\r\n").len == 0;
         const body_empty = std.mem.trim(u8, app.commit_body_buffer.items, " \t\r\n").len == 0;
-        if (app.config.auto_generate_commit_title and subj_empty) try app.requestAiGeneration(.title);
-        if (app.config.auto_generate_commit_description and body_empty) try app.requestAiGeneration(.description);
+        if (app.config.auto_generate_commit_title and subj_empty) try app.requestAiGeneration(.title, false);
+        if (app.config.auto_generate_commit_description and body_empty) try app.requestAiGeneration(.description, false);
     }
 }
 
@@ -354,7 +354,7 @@ pub fn handleCommitPromptKey(app: *App, key: vaxis.Key) !void {
     if (key.matches('g', .{ .ctrl = true })) {
         if (app.config.aiConfigured()) {
             const field: @import("aiauthor.zig").Field = if (app.commit_field == .subject) .title else .description;
-            try app.requestAiGeneration(field);
+            try app.requestAiGeneration(field, true);
         }
         return;
     }

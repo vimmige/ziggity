@@ -12,10 +12,14 @@ pub const ExecResult = struct {
     stdout: []u8,
     stderr: []u8,
     term: std.process.Child.Term,
+    prior_stdout: []u8 = &.{},
+    prior_stderr: []u8 = &.{},
 
     pub fn deinit(self: *ExecResult, allocator: std.mem.Allocator) void {
         allocator.free(self.stdout);
         allocator.free(self.stderr);
+        allocator.free(self.prior_stdout);
+        allocator.free(self.prior_stderr);
         self.* = undefined;
     }
 
@@ -24,6 +28,53 @@ pub const ExecResult = struct {
             .exited => |code| code == 0,
             else => false,
         };
+    }
+};
+
+/// Keep completed steps for the output pane without changing the result used
+/// to classify the final step's success or failure.
+pub const ExecBatch = struct {
+    stdout: std.ArrayList(u8) = .empty,
+    stderr: std.ArrayList(u8) = .empty,
+
+    pub fn deinit(self: *ExecBatch, allocator: std.mem.Allocator) void {
+        self.stdout.deinit(allocator);
+        self.stderr.deinit(allocator);
+    }
+
+    /// Takes ownership of result. A non-null result ends the batch.
+    pub fn add(self: *ExecBatch, allocator: std.mem.Allocator, result: ExecResult) ?ExecResult {
+        if (!result.ok()) return self.finish(allocator, result);
+        var owned = result;
+        defer owned.deinit(allocator);
+        _ = appendStream(&self.stdout, allocator, result.prior_stdout);
+        _ = appendStream(&self.stdout, allocator, result.stdout);
+        _ = appendStream(&self.stderr, allocator, result.prior_stderr);
+        _ = appendStream(&self.stderr, allocator, result.stderr);
+        return null;
+    }
+
+    pub fn finish(self: *ExecBatch, allocator: std.mem.Allocator, result: ExecResult) ExecResult {
+        var owned = result;
+        owned.prior_stdout = takeStream(&self.stdout, allocator, result.prior_stdout);
+        owned.prior_stderr = takeStream(&self.stderr, allocator, result.prior_stderr);
+        return owned;
+    }
+
+    fn appendStream(stream: *std.ArrayList(u8), allocator: std.mem.Allocator, bytes: []const u8) bool {
+        if (bytes.len == 0) return true;
+        const separator = stream.items.len != 0 and stream.items[stream.items.len - 1] != '\n';
+        stream.ensureUnusedCapacity(allocator, bytes.len + @intFromBool(separator)) catch return false;
+        if (separator) stream.appendAssumeCapacity('\n');
+        stream.appendSliceAssumeCapacity(bytes);
+        return true;
+    }
+
+    fn takeStream(stream: *std.ArrayList(u8), allocator: std.mem.Allocator, tail: []u8) []u8 {
+        if (stream.items.len == 0 or !appendStream(stream, allocator, tail)) return tail;
+        const bytes = stream.toOwnedSlice(allocator) catch return tail;
+        allocator.free(tail);
+        return bytes;
     }
 };
 
@@ -574,27 +625,23 @@ pub const Git = struct {
         const p = try self.writeTempFile(patch);
         defer self.removeTempFile(p);
 
-        var r1 = try self.rebaseTodo(base_ref, todo, null, expected_head);
-        if (!r1.ok()) return r1;
-        r1.deinit(self.allocator);
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
+        if (batch.add(self.allocator, try self.rebaseTodo(base_ref, todo, null, expected_head))) |failure| return failure;
 
-        var ap = try self.exec(&.{ "apply", "--reverse", "--index", "--whitespace=nowarn", "--", p });
-        if (!ap.ok()) {
-            var abort = self.rebaseAbort() catch return ap;
+        if (try self.runStep(&batch, &.{ "apply", "--reverse", "--index", "--whitespace=nowarn", "--", p })) |failure| {
+            var abort = self.rebaseAbort() catch return failure;
             abort.deinit(self.allocator);
-            return ap;
+            return failure;
         }
-        ap.deinit(self.allocator);
 
-        var amend = try self.exec(&.{ "commit", "--amend", "--no-edit" });
-        if (!amend.ok()) {
-            var abort = self.rebaseAbort() catch return amend;
+        if (try self.runStep(&batch, &.{ "commit", "--amend", "--no-edit" })) |failure| {
+            var abort = self.rebaseAbort() catch return failure;
             abort.deinit(self.allocator);
-            return amend;
+            return failure;
         }
-        amend.deinit(self.allocator);
 
-        return self.rebaseContinue();
+        return batch.finish(self.allocator, try self.rebaseContinue());
     }
 
     /// Run a non-interactive `git rebase -i <base_ref>` with a caller-supplied
@@ -761,10 +808,12 @@ pub const Git = struct {
 
     /// Resolve a conflicted file by keeping our side (or theirs), then stage it.
     pub fn resolveConflict(self: *Git, path: []const u8, take_theirs: bool) !ExecResult {
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
         const side = if (take_theirs) "--theirs" else "--ours";
-        if (try self.runStep(&.{ "--literal-pathspecs", "checkout", side, "--", path })) |failure| return failure;
-        if (try self.runStep(&.{ "--literal-pathspecs", "add", "--", path })) |failure| return failure;
-        return self.successResult();
+        if (try self.runStep(&batch, &.{ "--literal-pathspecs", "checkout", side, "--", path })) |failure| return failure;
+        if (try self.runStep(&batch, &.{ "--literal-pathspecs", "add", "--", path })) |failure| return failure;
+        return batch.finish(self.allocator, try self.successResult());
     }
 
     pub fn mergeContinue(self: *Git) !ExecResult {
@@ -811,10 +860,10 @@ pub const Git = struct {
     /// Amend the commit a rebase has stopped at (the `edit` step) with whatever
     /// is currently staged, keeping its message, then resume the rebase.
     pub fn amendAndContinueRebase(self: *Git) !ExecResult {
-        var amend = try self.exec(&.{ "commit", "--amend", "--no-edit" });
-        if (!amend.ok()) return amend;
-        amend.deinit(self.allocator);
-        return self.rebaseContinue();
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
+        if (try self.runStep(&batch, &.{ "commit", "--amend", "--no-edit" })) |failure| return failure;
+        return batch.finish(self.allocator, try self.rebaseContinue());
     }
 
     pub fn loadStatusSummary(self: *Git) !model.StatusSummary {
@@ -1137,19 +1186,19 @@ pub const Git = struct {
     /// Point the submodule at a new URL (in `.gitmodules`) and sync it into the
     /// active config.
     pub fn setSubmoduleUrl(self: *Git, path: []const u8, url: []const u8) !ExecResult {
-        var r = try self.exec(&.{ "--literal-pathspecs", "submodule", "set-url", "--", path, url });
-        if (!r.ok()) return r;
-        r.deinit(self.allocator);
-        return self.exec(&.{ "--literal-pathspecs", "submodule", "sync", "--", path });
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
+        if (try self.runStep(&batch, &.{ "--literal-pathspecs", "submodule", "set-url", "--", path, url })) |failure| return failure;
+        return batch.finish(self.allocator, try self.exec(&.{ "--literal-pathspecs", "submodule", "sync", "--", path }));
     }
 
     /// Remove a submodule: deinit it, then `git rm` (which also drops its
     /// `.gitmodules` entry from the index).
     pub fn removeSubmodule(self: *Git, path: []const u8) !ExecResult {
-        var r = try self.exec(&.{ "--literal-pathspecs", "submodule", "deinit", "-f", "--", path });
-        if (!r.ok()) return r;
-        r.deinit(self.allocator);
-        return self.exec(&.{ "--literal-pathspecs", "rm", "-f", "--", path });
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
+        if (try self.runStep(&batch, &.{ "--literal-pathspecs", "submodule", "deinit", "-f", "--", path })) |failure| return failure;
+        return batch.finish(self.allocator, try self.exec(&.{ "--literal-pathspecs", "rm", "-f", "--", path }));
     }
 
     pub const SubmoduleBulk = enum { init_all, update_all, update_recursive, deinit_all };
@@ -1756,25 +1805,27 @@ pub const Git = struct {
     }
 
     pub fn discardFile(self: *Git, file: model.FileStatus) !ExecResult {
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
         if (file.isRename()) {
-            if (try self.resetFilePaths(file)) |failure| return failure;
+            if (try self.resetFilePaths(&batch, file)) |failure| return failure;
             if (file.previous_path) |previous| {
-                if (try self.runStep(&.{ "--literal-pathspecs", "checkout", self.stagingBaseRef() orelse "HEAD", "--", previous })) |failure| return failure;
+                if (try self.runStep(&batch, &.{ "--literal-pathspecs", "checkout", self.stagingBaseRef() orelse "HEAD", "--", previous })) |failure| return failure;
             }
-            if (try self.runStep(&.{ "--literal-pathspecs", "clean", "-fd", "--", file.path })) |failure| return failure;
-            return self.successResult();
+            if (try self.runStep(&batch, &.{ "--literal-pathspecs", "clean", "-fd", "--", file.path })) |failure| return failure;
+            return batch.finish(self.allocator, try self.successResult());
         }
 
         if (!file.tracked or file.added) {
             if (file.has_staged) {
-                if (try self.resetFilePaths(file)) |failure| return failure;
+                if (try self.resetFilePaths(&batch, file)) |failure| return failure;
             }
-            if (try self.runStep(&.{ "--literal-pathspecs", "clean", "-fd", "--", file.path })) |failure| return failure;
-            return self.successResult();
+            if (try self.runStep(&batch, &.{ "--literal-pathspecs", "clean", "-fd", "--", file.path })) |failure| return failure;
+            return batch.finish(self.allocator, try self.successResult());
         }
 
-        if (try self.runStep(&.{ "--literal-pathspecs", "checkout", self.stagingBaseRef() orelse "HEAD", "--", file.path })) |failure| return failure;
-        return self.successResult();
+        if (try self.runStep(&batch, &.{ "--literal-pathspecs", "checkout", self.stagingBaseRef() orelse "HEAD", "--", file.path })) |failure| return failure;
+        return batch.finish(self.allocator, try self.successResult());
     }
 
     /// Discard only the unstaged (working-tree) changes for a file, keeping any
@@ -1784,9 +1835,11 @@ pub const Git = struct {
     }
 
     pub fn discardAll(self: *Git) !ExecResult {
-        if (try self.runStep(&.{ "reset", "--hard", "HEAD" })) |failure| return failure;
-        if (try self.runStep(&.{ "clean", "-fd" })) |failure| return failure;
-        return self.successResult();
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
+        if (try self.runStep(&batch, &.{ "reset", "--hard", "HEAD" })) |failure| return failure;
+        if (try self.runStep(&batch, &.{ "clean", "-fd" })) |failure| return failure;
+        return batch.finish(self.allocator, try self.successResult());
     }
 
     pub fn commit(self: *Git, message: []const u8, no_verify: bool) !ExecResult {
@@ -2006,12 +2059,12 @@ pub const Git = struct {
     /// new branch at HEAD (carrying the commits), then reset `original` back to
     /// its upstream. The caller guarantees `original` has an upstream.
     pub fn moveCommitsToNewBranch(self: *Git, name: []const u8, original: []const u8) !ExecResult {
-        var r = try self.exec(&.{ "checkout", "-b", name });
-        if (!r.ok()) return r;
-        r.deinit(self.allocator);
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
+        if (try self.runStep(&batch, &.{ "checkout", "-b", name })) |failure| return failure;
         const upstream = try std.fmt.allocPrint(self.allocator, "{s}@{{u}}", .{original});
         defer self.allocator.free(upstream);
-        return self.exec(&.{ "branch", "-f", original, upstream });
+        return batch.finish(self.allocator, try self.exec(&.{ "branch", "-f", original, upstream }));
     }
 
     pub fn setRemoteUrl(self: *Git, name: []const u8, url: []const u8) !ExecResult {
@@ -2209,38 +2262,37 @@ pub const Git = struct {
     /// Check out `onto` first when set (so a paste can target a branch other
     /// than the current one). Returns the failed checkout result for the caller
     /// to surface, or null when there was nothing to do / the checkout succeeded.
-    fn checkoutForPaste(self: *Git, onto: ?[]const u8) !?ExecResult {
+    fn checkoutForPaste(self: *Git, batch: *ExecBatch, onto: ?[]const u8) !?ExecResult {
         const branch = onto orelse return null;
-        var res = try self.checkout(branch);
-        if (res.ok()) {
-            res.deinit(self.allocator);
-            return null;
-        }
-        return res;
+        return batch.add(self.allocator, try self.checkout(branch));
     }
 
     pub fn cherryPickMany(self: *Git, onto: ?[]const u8, hashes: []const []const u8) !ExecResult {
-        if (try self.checkoutForPaste(onto)) |failed| return failed;
-        if (hashes.len == 0) return self.successResult();
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
+        if (try self.checkoutForPaste(&batch, onto)) |failed| return failed;
+        if (hashes.len == 0) return batch.finish(self.allocator, try self.successResult());
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(self.allocator);
         try args.append(self.allocator, "cherry-pick");
         try args.appendSlice(self.allocator, hashes);
-        return self.exec(args.items);
+        return batch.finish(self.allocator, try self.exec(args.items));
     }
 
     /// Cherry-pick with `--no-commit`: apply the commits' changes to the index
     /// and working tree without creating any commit. On a clean apply the user
     /// commits (or amends) the result themselves; a conflict stops mid-pick.
     pub fn cherryPickManyNoCommit(self: *Git, onto: ?[]const u8, hashes: []const []const u8) !ExecResult {
-        if (try self.checkoutForPaste(onto)) |failed| return failed;
-        if (hashes.len == 0) return self.successResult();
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
+        if (try self.checkoutForPaste(&batch, onto)) |failed| return failed;
+        if (hashes.len == 0) return batch.finish(self.allocator, try self.successResult());
         var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(self.allocator);
         try args.append(self.allocator, "cherry-pick");
         try args.append(self.allocator, "--no-commit");
         try args.appendSlice(self.allocator, hashes);
-        return self.exec(args.items);
+        return batch.finish(self.allocator, try self.exec(args.items));
     }
 
     /// Cherry-pick the commits into the index with `--no-commit`, then commit the
@@ -2249,10 +2301,10 @@ pub const Git = struct {
     /// hits a conflict the commit is skipped and the conflict is returned for the
     /// user to resolve.
     pub fn cherryPickManyCommit(self: *Git, onto: ?[]const u8, hashes: []const []const u8, message: []const u8) !ExecResult {
-        var applied = try self.cherryPickManyNoCommit(onto, hashes);
-        if (!applied.ok()) return applied;
-        applied.deinit(self.allocator);
-        return self.exec(&.{ "commit", "-m", message });
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
+        if (batch.add(self.allocator, try self.cherryPickManyNoCommit(onto, hashes))) |failure| return failure;
+        return batch.finish(self.allocator, try self.exec(&.{ "commit", "-m", message }));
     }
 
     pub fn cherryPickContinue(self: *Git) !ExecResult {
@@ -2434,24 +2486,22 @@ pub const Git = struct {
         const sorted = try self.allocator.dupe(usize, indices);
         defer self.allocator.free(sorted);
         std.mem.sort(usize, sorted, {}, std.sort.desc(usize));
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
         for (sorted) |idx| {
-            var r = try self.stashDrop(idx);
-            if (!r.ok()) return r;
-            r.deinit(self.allocator);
+            if (batch.add(self.allocator, try self.stashDrop(idx))) |failure| return failure;
         }
-        return self.successResult();
+        return batch.finish(self.allocator, try self.successResult());
     }
 
     /// Rename a stash: drop the entry and re-store its commit `hash` under the new
     /// `message` (git has no in-place rename). The renamed stash returns to the
     /// top of the list.
     pub fn renameStash(self: *Git, index: usize, hash: []const u8, message: []const u8) !ExecResult {
-        const selector = try std.fmt.allocPrint(self.allocator, "stash@{{{d}}}", .{index});
-        defer self.allocator.free(selector);
-        var r = try self.exec(&.{ "stash", "drop", selector });
-        if (!r.ok()) return r;
-        r.deinit(self.allocator);
-        return self.exec(&.{ "stash", "store", "-m", message, hash });
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
+        if (batch.add(self.allocator, try self.stashDrop(index))) |failure| return failure;
+        return batch.finish(self.allocator, try self.exec(&.{ "stash", "store", "-m", message, hash }));
     }
 
     // The stash-create commands take an optional message. A null (or empty)
@@ -2484,14 +2534,17 @@ pub const Git = struct {
         // Unstage the deletion so it becomes an ordinary unstaged deletion, which
         // stashes cleanly — popping the entry restores the file the same way
         // regardless of which side the deletion sat on.
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
         if (try self.pathStagedForDeletion(path)) {
-            var unstaged = try self.exec(&.{ "--literal-pathspecs", "restore", "--staged", "--", path });
-            if (!unstaged.ok()) return unstaged; // caller owns and reports it
-            unstaged.deinit(self.allocator);
+            if (try self.runStep(&batch, &.{ "--literal-pathspecs", "restore", "--staged", "--", path })) |failure| return failure;
         }
 
-        if (message) |m| return self.exec(&.{ "--literal-pathspecs", "stash", "push", "--include-untracked", "-m", m, "--", path });
-        return self.exec(&.{ "--literal-pathspecs", "stash", "push", "--include-untracked", "--", path });
+        const result = if (message) |m|
+            try self.exec(&.{ "--literal-pathspecs", "stash", "push", "--include-untracked", "-m", m, "--", path })
+        else
+            try self.exec(&.{ "--literal-pathspecs", "stash", "push", "--include-untracked", "--", path });
+        return batch.finish(self.allocator, result);
     }
 
     /// True when `path` is staged for
@@ -2520,20 +2573,18 @@ pub const Git = struct {
         const before = try self.stashTop();
         defer self.allocator.free(before);
 
-        var pushed = if (message) |m|
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
+        const pushed = if (message) |m|
             try self.exec(&.{ "stash", "push", "--include-untracked", "-m", m })
         else
             try self.exec(&.{ "stash", "push", "--include-untracked" });
-        if (!pushed.ok()) return pushed; // caller owns and reports the error
+        if (batch.add(self.allocator, pushed)) |failure| return failure;
 
         // A clean tree pushes nothing, so the stash ref is unchanged.
         const after = try self.stashTop();
         defer self.allocator.free(after);
-        if (std.mem.eql(u8, before, after)) {
-            pushed.deinit(self.allocator);
-            return null;
-        }
-        pushed.deinit(self.allocator);
+        if (std.mem.eql(u8, before, after)) return null;
 
         // Restore the working tree + index from the stash we just made (keeping
         // it). Apply the exact hash we just created rather than implicit
@@ -2542,9 +2593,9 @@ pub const Git = struct {
         // staged/unstaged split; if it can't, a plain apply still restores the
         // files.
         var applied = try self.exec(&.{ "stash", "apply", "--index", after });
-        if (applied.ok()) return applied;
+        if (applied.ok()) return batch.finish(self.allocator, applied);
         applied.deinit(self.allocator);
-        return try self.exec(&.{ "stash", "apply", after });
+        return batch.finish(self.allocator, try self.exec(&.{ "stash", "apply", after }));
     }
 
     /// "Stash unstaged changes only": keep the staged changes in the index and
@@ -2575,30 +2626,29 @@ pub const Git = struct {
             }
         }
         // Both staged and unstaged present: the three-step dance.
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
         // 1. Stash the staged changes aside (temporary).
-        var s1 = try self.exec(&.{ "stash", "push", "--staged", "-m", "ziggity: keep staged" });
-        if (!s1.ok()) return s1; // caller owns and reports the error
-        s1.deinit(self.allocator);
+        if (try self.runStep(&batch, &.{ "stash", "push", "--staged", "-m", "ziggity: keep staged" })) |failure| return failure;
         // 2. Stash the remaining (unstaged) changes as the user's entry.
-        var s2 = if (message) |m|
+        const s2 = if (message) |m|
             try self.exec(&.{ "stash", "push", "-m", m })
         else
             try self.exec(&.{ "stash", "push" });
-        if (!s2.ok()) {
+        if (batch.add(self.allocator, s2)) |failure| {
             // Best-effort: put the staged changes back before surfacing the error.
             if (self.exec(&.{ "stash", "pop", "--index", "stash@{0}" })) |undo| {
                 var u = undo;
                 u.deinit(self.allocator);
             } else |_| {}
-            return s2;
+            return failure;
         }
-        s2.deinit(self.allocator);
         // 3. Restore the staged changes (now stash@{1}) to the index. `--index`
         // preserves the staged/unstaged split; a plain pop is the fallback.
         var restore = try self.exec(&.{ "stash", "pop", "--index", "stash@{1}" });
-        if (restore.ok()) return restore;
+        if (restore.ok()) return batch.finish(self.allocator, restore);
         restore.deinit(self.allocator);
-        return try self.exec(&.{ "stash", "pop", "stash@{1}" });
+        return batch.finish(self.allocator, try self.exec(&.{ "stash", "pop", "stash@{1}" }));
     }
 
     /// The top stash commit hash (`refs/stash`), or "" when there is no stash.
@@ -2608,37 +2658,31 @@ pub const Git = struct {
         return self.allocator.dupe(u8, std.mem.trim(u8, r.stdout, " \t\r\n"));
     }
 
-    fn resetFilePaths(self: *Git, file: model.FileStatus) !?ExecResult {
+    fn resetFilePaths(self: *Git, batch: *ExecBatch, file: model.FileStatus) !?ExecResult {
         const paths: [2][]const u8 = .{ file.path, file.previous_path orelse "" };
-        var result = try self.unstagePaths(paths[0..if (file.previous_path == null) 1 else 2]);
-        if (!result.ok()) return result;
-        result.deinit(self.allocator);
-        return null;
+        return batch.add(self.allocator, try self.unstagePaths(paths[0..if (file.previous_path == null) 1 else 2]));
     }
 
-    fn runStep(self: *Git, args: []const []const u8) !?ExecResult {
-        var result = try self.exec(args);
-        if (!result.ok()) return result;
-        result.deinit(self.allocator);
-        return null;
+    fn runStep(self: *Git, batch: *ExecBatch, args: []const []const u8) !?ExecResult {
+        return batch.add(self.allocator, try self.exec(args));
     }
 
     pub fn discardFiles(self: *Git, files: []const model.FileStatus) !ExecResult {
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
         for (files) |file| {
-            var r = try self.discardFile(file);
-            if (!r.ok()) return r;
-            r.deinit(self.allocator);
+            if (batch.add(self.allocator, try self.discardFile(file))) |failure| return failure;
         }
-        return self.successResult();
+        return batch.finish(self.allocator, try self.successResult());
     }
 
     pub fn discardUnstagedFiles(self: *Git, files: []const model.FileStatus) !ExecResult {
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
         for (files) |file| {
-            var r = try self.discardUnstaged(file);
-            if (!r.ok()) return r;
-            r.deinit(self.allocator);
+            if (batch.add(self.allocator, try self.discardUnstaged(file))) |failure| return failure;
         }
-        return self.successResult();
+        return batch.finish(self.allocator, try self.successResult());
     }
 
     pub fn successResult(self: *Git) !ExecResult {
@@ -3967,6 +4011,64 @@ test "stashKeeping restores the same working state it stashed" {
     defer stash_list.deinit(a);
     try std.testing.expect(stash_list.ok());
     try std.testing.expect(std.mem.indexOf(u8, stash_list.stdout, "keep") != null);
+}
+
+test "batch keeps prior stderr separate from a stdout-only failure" {
+    const a = std.testing.allocator;
+    var batch: ExecBatch = .{};
+    defer batch.deinit(a);
+    const success: ExecResult = .{ .stdout = &.{}, .stderr = try a.dupe(u8, "warning\n"), .term = .{ .exited = 0 } };
+    try std.testing.expect(batch.add(a, success) == null);
+
+    var failed = batch.add(a, .{ .stdout = try a.dupe(u8, "failure\n"), .stderr = &.{}, .term = .{ .exited = 1 } }).?;
+    defer failed.deinit(a);
+    try std.testing.expect(!failed.ok());
+    try std.testing.expectEqualStrings("warning\n", failed.prior_stderr);
+    try std.testing.expectEqualStrings("failure\n", failed.stdout);
+    try std.testing.expectEqualStrings("", failed.stderr);
+}
+
+test "dropping multiple stashes retains the output of both drops" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [160]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
+    try env.put("HOME", path);
+    try env.put("GIT_CONFIG_GLOBAL", "/dev/null");
+    try env.put("GIT_CONFIG_SYSTEM", "/dev/null");
+    try env.put("LC_ALL", "C");
+    const setup = try std.process.run(a, io, .{
+        .argv = &.{
+            "sh", "-ec",
+            \\git init -q
+            \\git -c user.name=t -c user.email=t@t commit -qm init --allow-empty
+            \\for n in 1 2; do
+            \\    printf '%s' "$n" > untracked
+            \\    git -c user.name=t -c user.email=t@t stash push -uq
+            \\done
+        },
+        .cwd = .{ .path = path },
+        .environ_map = &env,
+    });
+    defer a.free(setup.stdout);
+    defer a.free(setup.stderr);
+    try std.testing.expect(setup.term == .exited and setup.term.exited == 0);
+    var git = try Git.initAt(a, io, &env, path);
+    defer git.deinit();
+    var result = try git.stashDropMany(&.{ 0, 1 });
+    defer result.deinit(a);
+    try std.testing.expect(result.ok());
+    try std.testing.expect(std.mem.startsWith(u8, result.prior_stdout, "Dropped stash@{1}"));
+    try std.testing.expect(std.mem.indexOf(u8, result.prior_stdout, "Dropped stash@{0}") != null);
+    var remaining = try git.exec(&.{ "stash", "list" });
+    defer remaining.deinit(a);
+    try std.testing.expect(remaining.ok());
+    try std.testing.expectEqualStrings("", remaining.stdout);
 }
 
 test "prepareCommitMsg runs a guarded hook and seeds the branch ticket" {

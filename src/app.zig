@@ -139,6 +139,7 @@ pub const CommitRowMap = struct {
 /// so a stale result can be discarded (see `App.applyAiResult`).
 pub const AiRequest = struct {
     field: aiauthor_mod.Field,
+    capture_output: bool,
     dialog_generation: u64,
     revision: u64,
     staged_signature: u64,
@@ -1746,12 +1747,12 @@ pub const Mutation = union(enum) {
             .delete_remote_tag => |x| blk: {
                 // "Delete both" removes the local tag first, then the remote one;
                 // report the local failure if it fails, else the remote result.
+                var batch: git_mod.ExecBatch = .{};
+                defer batch.deinit(gpa);
                 if (x.also_local) {
-                    var r = try wgit.deleteTag(x.name);
-                    if (!r.ok()) break :blk r;
-                    r.deinit(gpa);
+                    if (batch.add(gpa, try wgit.deleteTag(x.name))) |failed| break :blk failed;
                 }
-                break :blk try wgit.deleteRemoteTag(x.remote, x.name);
+                break :blk batch.finish(gpa, try wgit.deleteRemoteTag(x.remote, x.name));
             },
             .remove_worktree => |p| wgit.removeWorktree(p),
             .add_worktree => |x| wgit.addWorktree(x.path, x.base),
@@ -1801,18 +1802,17 @@ pub const Mutation = union(enum) {
             .stage_batch => |b| blk: {
                 // All-op baseline first, then per-path overrides; report the
                 // first failure.
+                var batch: git_mod.ExecBatch = .{};
+                defer batch.deinit(gpa);
                 if (b.all) |stage_all| {
-                    var r = if (stage_all) try wgit.stageAll() else try wgit.unstageAll();
-                    if (!r.ok()) break :blk r;
-                    r.deinit(gpa);
+                    const result = if (stage_all) try wgit.stageAll() else try wgit.unstageAll();
+                    if (batch.add(gpa, result)) |failed| break :blk failed;
                 }
                 if (b.add.len > 0) {
-                    var r = try wgit.stagePaths(b.add);
-                    if (!r.ok()) break :blk r;
-                    r.deinit(gpa);
+                    if (batch.add(gpa, try wgit.stagePaths(b.add))) |failed| break :blk failed;
                 }
-                if (b.reset.len > 0) break :blk try wgit.unstagePaths(b.reset);
-                break :blk try wgit.successResult();
+                const result = if (b.reset.len > 0) try wgit.unstagePaths(b.reset) else try wgit.successResult();
+                break :blk batch.finish(gpa, result);
             },
         };
     }
@@ -2059,9 +2059,10 @@ fn appendDiffColumns(out: *std.ArrayList(u8), allocator: std.mem.Allocator, line
             i += 1;
             continue;
         }
-        if (col >= lo and col < hi) try out.append(allocator, b);
-        col += 1;
-        i += 1;
+        const step = cellStep(line, i);
+        if (col >= lo) try out.appendSlice(allocator, line[i .. i + step.len]);
+        col += step.width;
+        i += step.len;
     }
 }
 
@@ -2152,7 +2153,7 @@ pub fn wrapRowsFor(gpa: std.mem.Allocator, text: []const u8, content_width: u16)
         if (e.used < victim.used) victim = e;
     }
     if (victim.gpa) |g| g.free(victim.rows);
-    const rows = diffwrap.build(gpa, text, content_width, &wrapCellWidth) catch wrap_empty[0..];
+    const rows = diffwrap.build(gpa, text, content_width, &cellStep) catch wrap_empty[0..];
     victim.* = .{ .addr = addr, .len = text.len, .width = content_width, .used = wrap_clock, .gpa = gpa, .rows = rows };
     return rows;
 }
@@ -3498,8 +3499,7 @@ pub fn viewScroll(prev_origin: usize, size: usize, cursor: usize) ViewScroll {
 /// columns it occupies, measured exactly as the renderer draws it (`decodeCell`):
 /// a whole grapheme cluster via `gwidth`, zero-width forced to one, and any
 /// invalid UTF-8 counted as a single one-column cell.
-const CellStep = struct { len: usize, width: usize };
-fn cellStep(line: []const u8, i: usize) CellStep {
+fn cellStep(line: []const u8, i: usize) diffwrap.CellStep {
     const b = line[i];
     if (b < 0x80) return .{ .len = 1, .width = 1 };
     const seq = std.unicode.utf8ByteSequenceLength(b) catch return .{ .len = 1, .width = 1 };
@@ -3776,6 +3776,7 @@ pub const App = struct {
     /// Panel hit-boxes captured by the renderer for mouse handling.
     panel_rects: [7]PanelRect = undefined,
     panel_rect_count: usize = 0,
+    status_output_rect: ?PanelRect = null,
     // Scratch buffers for dynamically-formatted panel titles. vaxis stores each
     // cell's grapheme as a slice into the source text (it does not copy), and the
     // frame is flushed *after* the render function returns — so a title built in
@@ -4382,6 +4383,7 @@ pub const App = struct {
     mutation_requested: ?Mutation = null,
     mutation_active: bool = false,
     mutation_msg: []u8 = &.{},
+    mutation_command: []u8 = &.{},
     mutation_echo: bool = false,
     mutation_post: PostMutation = .none,
     mutation_refresh: ScopeSet = ScopeSet.full,
@@ -4588,6 +4590,7 @@ pub const App = struct {
         if (self.preview_wanted) |job| job.deinit(page_alloc);
         if (self.mutation_requested) |job| job.deinit(page_alloc);
         page_alloc.free(self.mutation_msg);
+        page_alloc.free(self.mutation_command);
         credentials_mod.clearGitCredentials(self);
         self.credential_user.deinit(self.allocator);
         if (self.exe_path) |p| self.allocator.free(p);
@@ -5306,7 +5309,7 @@ pub const App = struct {
         for (self.config.custom_commands[0..self.config.custom_count]) |*cc| {
             if (cc.binding.matches(key)) {
                 if (self.foregroundBusy()) return self.setMessage("operation in progress...", .{});
-                return self.runCustomCommand(cc.command(), false);
+                return self.runCustomCommand(cc.command());
             }
         }
 
@@ -6397,10 +6400,11 @@ pub const App = struct {
         return null;
     }
 
-    /// The screen rect of a selectable diff pane, or null if it isn't on screen.
+    /// The screen rect of a selectable text pane, or null if it isn't on screen.
     /// In the split staging view the main area is halved (active | read-only);
     /// otherwise the whole main area is the `.main` pane and there is no `.other`.
     pub fn paneRectFor(self: *const App, pane: SelPane) ?PanelRect {
+        if (self.showStatusOutput()) return if (pane == .main) self.status_output_rect else null;
         const m = self.mainRect() orelse return null;
         if (self.staging_active and self.staging_split) {
             const left_w = m.w / 2;
@@ -6422,6 +6426,7 @@ pub const App = struct {
 
     /// The text shown in a selectable pane.
     pub fn paneText(self: *const App, pane: SelPane) []const u8 {
+        if (pane == .main and self.showStatusOutput()) return self.shell_output;
         return switch (pane) {
             .main => if (self.staging_active) self.staging_diff else self.diff,
             .other => self.staging_other_diff,
@@ -6468,10 +6473,11 @@ pub const App = struct {
     /// to its source line and the segment's starting column. In truncate mode it
     /// is the direct `scroll + row` / `col + h_off` mapping.
     fn diffPointFor(self: *const App, pane: SelPane, r: PanelRect, col: u16, row: u16) DiffPoint {
-        const content_top = r.y + 1;
-        const content_left = r.x + 1;
-        const content_h = r.h -| 2;
-        const content_w = r.w -| 2;
+        const border: u16 = if (self.showStatusOutput()) 0 else 1;
+        const content_top = r.y + border;
+        const content_left = r.x + border;
+        const content_h = r.h -| (2 * border);
+        const content_w = r.w -| (2 * border);
         const rel_row: u16 = if (row <= content_top) 0 else @min(row - content_top, content_h -| 1);
         const screen_col: usize = if (col <= content_left) 0 else @min(col - content_left, content_w);
 
@@ -8577,7 +8583,10 @@ pub const App = struct {
         // Reset the diff scroll only when the shown content actually changes.
         // Jumping to a panel that already drives the main view (so the same diff
         // stays on screen) keeps your scroll position instead of snapping to top.
-        if (self.contentFocus() != old_content) self.resetMainView();
+        if (self.contentFocus() != old_content) {
+            self.diff_sel_active = false;
+            self.resetMainView();
+        }
         try self.updatePreview();
     }
 
@@ -8847,10 +8856,9 @@ pub const App = struct {
     /// In the review with `=` on, it is the whole-file (full-context) diff built
     /// from the same source.
     pub fn activeMainText(self: *const App) []const u8 {
-        if (self.showStatusOutput()) return self.shell_output;
         if (self.mode == .diff_review and self.review_whole_file and self.review_whole_diff.len > 0)
             return self.review_whole_diff;
-        return if (self.staging_active) self.staging_diff else self.diff;
+        return self.paneText(.main);
     }
 
     /// The `@@` hunks the review's `J`/`K` cursor steps through. In the whole-file
@@ -9120,6 +9128,7 @@ pub const App = struct {
         const staged = self.staging_active and self.staging_staged_view;
         var result = try self.git.discardStagingPatch(patch, staged);
         defer result.deinit(self.allocator);
+        self.captureCommandOutput("git apply", result);
         if (!result.ok()) {
             const stderr = std.mem.trim(u8, result.stderr, " \t\r\n");
             return self.setMessage("discard failed: {s}", .{if (stderr.len > 0) stderr else "git apply error"});
@@ -9707,7 +9716,7 @@ pub const App = struct {
     fn mainContentWidth(self: *const App) u16 {
         // Cached: the clamp in the render loop calls this every frame, and a fresh
         // full-text scan there made scrolling a large diff clunky.
-        return cachedMaxVisibleWidth(if (self.showStatusOutput()) self.shell_output else self.paneText(.main));
+        return cachedMaxVisibleWidth(self.paneText(.main));
     }
 
     /// Largest horizontal offset that still keeps the widest line's end at (or
@@ -10958,7 +10967,7 @@ pub const App = struct {
                 self.mode = .normal;
                 self.text_prompt_kind = null;
                 defer self.input_buffer.clearRetainingCapacity();
-                self.runCustomCommand(value, true) catch |err| {
+                self.runCustomCommand(value) catch |err| {
                     self.op_running = false;
                     self.mode = .normal;
                     try self.setMessage("shell command failed: {s}", .{@errorName(err)});
@@ -11254,6 +11263,7 @@ pub const App = struct {
                 if (!std.mem.eql(u8, old, value)) {
                     var result = try self.git.renameRemote(old, value);
                     defer result.deinit(self.allocator);
+                    self.captureCommandOutput("git remote rename", result);
                     if (!result.ok()) {
                         self.cancelTextPrompt("rename failed (name in use?)");
                         return;
@@ -13210,6 +13220,10 @@ pub const App = struct {
         if (result_opt) |result| {
             var mutable = result;
             defer mutable.deinit(result_allocator);
+            const args = std.mem.join(self.allocator, " ", op.argv()) catch &.{};
+            defer self.allocator.free(args);
+            var command_buf: [128]u8 = undefined;
+            self.captureCommandOutput(std.fmt.bufPrint(&command_buf, "git {s}", .{args}) catch "git", result);
             if (mutable.ok()) {
                 // Network success stays silent (bottom bar).
                 try self.setMessage("{s} complete", .{op.label()});
@@ -13297,6 +13311,7 @@ pub const App = struct {
         try self.beginOpFmt("git verify-commit {s}", .{commit.short_hash});
         var result = try self.git.verifyCommit(commit.hash);
         defer result.deinit(self.allocator);
+        self.captureCommandOutput(self.op_command, result);
         // gpg writes the verification to stderr; fall back to stdout if empty.
         const out = if (result.stderr.len > 0) result.stderr else result.stdout;
         if (result.ok()) {
@@ -13538,6 +13553,8 @@ pub const App = struct {
     pub fn runMutationScoped(self: *App, result: git_mod.ExecResult, scopes: ScopeSet, comptime success_fmt: []const u8, args: anytype) !void {
         var mutable = result;
         defer mutable.deinit(self.allocator);
+        const log = self.git.command_log.items;
+        self.captureCommandOutput(if (log.len > 0) log[log.len - 1] else "git", result);
         if (mutable.ok()) {
             const summary = try std.fmt.allocPrint(self.allocator, success_fmt, args);
             defer self.allocator.free(summary);
@@ -13587,18 +13604,22 @@ pub const App = struct {
         errdefer job.deinit(page_alloc);
         const msg = try std.fmt.allocPrint(page_alloc, success_fmt, args);
         errdefer page_alloc.free(msg);
+        const command = try page_alloc.dupe(u8, if (meta.command.len > 0) meta.command else "git");
+        errdefer page_alloc.free(command);
+        try self.setMessage("{s}...", .{meta.gerund});
         if (meta.command.len > 0) self.git.recordRaw(meta.command);
 
         if (self.mutation_requested) |old| old.deinit(page_alloc);
         page_alloc.free(self.mutation_msg);
+        page_alloc.free(self.mutation_command);
         self.mutation_requested = job;
         self.mutation_msg = msg;
+        self.mutation_command = command;
         self.mutation_echo = meta.echo;
         self.mutation_post = meta.post;
         self.mutation_refresh = meta.refresh;
         self.mutation_gerund = meta.gerund;
         self.spinner_frame = 0;
-        try self.setMessage("{s}...", .{meta.gerund});
     }
 
     /// TUI loop hook: claim the queued mutation to run off-thread.
@@ -13621,15 +13642,7 @@ pub const App = struct {
         if (result_opt) |result| {
             var mutable = result;
             defer mutable.deinit(gpa);
-            const commit_command = switch (job) {
-                .commit => |commit| if (commit.no_verify) "git commit --no-verify" else "git commit",
-                .amend => "git commit --amend --no-edit",
-                .amend_message => "git commit --amend",
-                else => "",
-            };
-            if (commit_command.len > 0 and (result.stdout.len > 0 or result.stderr.len > 0)) {
-                self.captureTerminalOutput(commit_command, result) catch {};
-            }
+            self.captureCommandOutput(self.mutation_command, result);
             if (mutable.ok()) {
                 if (std.meta.activeTag(job) != .stage_batch) self.git.amend_view = null;
                 // The commit landed: drop the preserved draft that submitCommit
@@ -13734,13 +13747,13 @@ pub const App = struct {
         }
     }
 
-    fn runCustomCommand(self: *App, command: []const u8, from_shell_prompt: bool) !void {
+    fn runCustomCommand(self: *App, command: []const u8) !void {
         var run_buf: [256]u8 = undefined;
         const shown = std.fmt.bufPrint(&run_buf, "$ {s}", .{command}) catch command;
         try self.beginOp(shown);
         var result = try self.git.runShell(command);
         defer result.deinit(self.allocator);
-        if (from_shell_prompt) try self.captureTerminalOutput(command, result);
+        self.captureCommandOutput(command, result);
         // Custom commands are usually run to read output, so by default show it
         // in the dialog; `command_output = silent` makes them follow the same
         // result_dialog policy as git actions.
@@ -13758,14 +13771,20 @@ pub const App = struct {
         self.refreshViews(Refresh.all);
     }
 
-    fn captureTerminalOutput(self: *App, command: []const u8, result: git_mod.ExecResult) !void {
-        const stdout = std.mem.trimEnd(u8, result.stdout, "\r\n");
-        const stderr = std.mem.trimEnd(u8, result.stderr, "\r\n");
-        const output = try std.fmt.allocPrint(self.allocator, "$ {s}\n{s}{s}{s}", .{
-            command, stdout, if (stdout.len > 0 and stderr.len > 0) "\n" else "", stderr,
-        });
+    pub fn captureCommandOutput(self: *App, command: []const u8, result: git_mod.ExecResult) void {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        for ([_][]const u8{ result.prior_stdout, result.stdout, result.prior_stderr, result.stderr }) |raw| {
+            const stream = std.mem.trimEnd(u8, raw, "\r\n");
+            if (stream.len == 0) continue;
+            if (out.written().len == 0) out.writer.print("$ {s}", .{command}) catch return;
+            out.writer.print("\n{s}", .{stream}) catch return;
+        }
+        if (out.written().len == 0) return;
+        const output = out.toOwnedSlice() catch return;
         self.replaceShellOutput(output);
         if (self.showStatusOutput()) {
+            self.diff_sel_active = false;
             self.main_scroll = 0;
             self.main_hscroll = 0;
         }
@@ -14044,7 +14063,7 @@ pub const App = struct {
     /// Start (or restart) AI generation for `field`, if AI is configured. No-op
     /// when that field is already generating (single-flight). Captures the
     /// revision tokens and hands a request to the TUI loop to run off-thread.
-    pub fn requestAiGeneration(self: *App, field: aiauthor_mod.Field) !void {
+    pub fn requestAiGeneration(self: *App, field: aiauthor_mod.Field, capture_output: bool) !void {
         if (!self.config.aiConfigured()) return;
         const state = switch (field) {
             .title => self.commit_ai_title_state,
@@ -14064,6 +14083,7 @@ pub const App = struct {
 
         const req = AiRequest{
             .field = field,
+            .capture_output = capture_output,
             .dialog_generation = self.commit_dialog_generation,
             .revision = revision,
             .staged_signature = self.stagedSignature(),
@@ -14688,6 +14708,26 @@ test "diff selection copies the highlighted span across lines" {
     app.diff_sel_head_col = 5;
     try app.copyDiffSelection();
     try std.testing.expectEqualStrings("one\nline two", app.clipboard_request.?);
+}
+
+test "Status output can be copied from the main pane" {
+    const allocator = std.testing.allocator;
+    var no_files = [_]model.FileStatus{};
+    var app = try testApp(allocator, &no_files);
+    defer deinitTestApp(&app);
+
+    app.focus = .status;
+    app.shell_output = try allocator.dupe(u8, "$ git commit\n\x1b[31mé界 failed\x1b[m");
+    try app.enterMain();
+    try app.requestClipboardCopy();
+    try std.testing.expectEqualStrings("$ git commit\né界 failed", app.clipboard_request orelse "");
+
+    app.status_output_rect = .{ .focus = .main, .x = 20, .y = 12, .w = 30, .h = 1 };
+    app.main_scroll = 1;
+    try std.testing.expect(try app.handleMouse(.{ .col = 20, .row = 12, .type = .press, .button = .left, .mods = .{} }));
+    try std.testing.expect(try app.handleMouse(.{ .col = 23, .row = 12, .type = .drag, .button = .left, .mods = .{} }));
+    try std.testing.expect(try app.handleMouse(.{ .col = 23, .row = 12, .type = .release, .button = .left, .mods = .{} }));
+    try std.testing.expectEqualStrings("é界", app.clipboard_request orelse "");
 }
 
 test "selection copies from the staging panes, each its own text" {
@@ -15654,7 +15694,7 @@ test "AI commit authoring: availability, request, and stale-result protection" {
 
     // Not configured: AI unavailable, a request is a no-op, dialog unchanged.
     try std.testing.expect(!app.config.aiConfigured());
-    try app.requestAiGeneration(.title);
+    try app.requestAiGeneration(.title, true);
     try std.testing.expectEqual(GenState.idle, app.commit_ai_title_state);
     try std.testing.expect(app.commit_ai_title_req == null);
 
@@ -15663,7 +15703,7 @@ test "AI commit authoring: availability, request, and stale-result protection" {
 
     // Configured: a request enters `generating` and queues work for the loop.
     app.resetCommitAiState();
-    try app.requestAiGeneration(.title);
+    try app.requestAiGeneration(.title, true);
     try std.testing.expectEqual(GenState.generating, app.commit_ai_title_state);
     const r1 = app.commit_ai_title_req.?;
 
@@ -15675,7 +15715,7 @@ test "AI commit authoring: availability, request, and stale-result protection" {
     // User edits while a request runs: the stale result is discarded.
     app.resetCommitAiState();
     app.commit_buffer.clearRetainingCapacity();
-    try app.requestAiGeneration(.title);
+    try app.requestAiGeneration(.title, true);
     const r2 = app.commit_ai_title_req.?;
     try app.commit_buffer.appendSlice(allocator, "User typed");
     app.bumpCommitFieldRevision(.subject);
@@ -15685,7 +15725,7 @@ test "AI commit authoring: availability, request, and stale-result protection" {
     // A result for a closed/previous dialog instance is ignored.
     app.resetCommitAiState();
     app.commit_buffer.clearRetainingCapacity();
-    try app.requestAiGeneration(.title);
+    try app.requestAiGeneration(.title, true);
     const r3 = app.commit_ai_title_req.?;
     app.resetCommitAiState(); // dialog closes
     try app.applyAiResult(.title, r3.dialog_generation, r3.revision, r3.staged_signature, "Late title", null);
@@ -15693,7 +15733,7 @@ test "AI commit authoring: availability, request, and stale-result protection" {
 
     // Failure surfaces a non-modal failed state (commit still possible).
     app.resetCommitAiState();
-    try app.requestAiGeneration(.title);
+    try app.requestAiGeneration(.title, true);
     const r4 = app.commit_ai_title_req.?;
     try app.applyAiResult(.title, r4.dialog_generation, r4.revision, r4.staged_signature, null, null);
     try std.testing.expectEqual(GenState.failed, app.commit_ai_title_state);
@@ -15701,7 +15741,7 @@ test "AI commit authoring: availability, request, and stale-result protection" {
     // A failure detail (from the ai_command's stderr) is shown in the status bar,
     // so the user sees *why* it failed, not just that it did.
     app.resetCommitAiState();
-    try app.requestAiGeneration(.title);
+    try app.requestAiGeneration(.title, true);
     const r5 = app.commit_ai_title_req.?;
     try app.applyAiResult(.title, r5.dialog_generation, r5.revision, r5.staged_signature, null, "Codex error: model not supported");
     try std.testing.expectEqual(GenState.failed, app.commit_ai_title_state);
@@ -15722,13 +15762,13 @@ test "AI ctrl+g targets the focused commit field" {
 
     app.commit_field = .body; // description focused
     try commits_mod.handleCommitPromptKey(&app, ctrl_g);
-    try std.testing.expect(app.commit_ai_desc_req != null);
+    try std.testing.expect(app.commit_ai_desc_req.?.capture_output);
     try std.testing.expect(app.commit_ai_title_req == null);
     app.resetCommitAiState();
 
     app.commit_field = .subject; // title focused
     try commits_mod.handleCommitPromptKey(&app, ctrl_g);
-    try std.testing.expect(app.commit_ai_title_req != null);
+    try std.testing.expect(app.commit_ai_title_req.?.capture_output);
     try std.testing.expect(app.commit_ai_desc_req == null);
     app.resetCommitAiState();
 }
@@ -19885,7 +19925,7 @@ test "refDiff / refLog / defaultBranch gather a branch's changes for PR generati
     try std.testing.expectEqualStrings("main", def); // no origin/HEAD, local main exists
 }
 
-test "generatePrDoc runs the ai_command and returns a split title + body" {
+test "AI generation preserves command output even on failure" {
     const a = std.testing.allocator;
     const tio = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -19903,16 +19943,29 @@ test "generatePrDoc runs the ai_command and returns a split title + body" {
         \\git config user.name t
         \\git config commit.gpgsign false
         \\printf 'x\n' > f.txt && git add f.txt && git commit -qm base
+        \\printf 'y\n' >> f.txt && git add f.txt
     );
     var g = try git_mod.Git.initAt(a, tio, &env, dir_path); // sets git_dir for runAiCommand
     defer g.deinit();
 
     const ctx = aiauthor_mod.DocContext{ .subject = "branch feature vs main", .commit_log = "- add feature", .diff = "diff --git a/f b/f" };
     // Fake ai_command: ignores stdin (the piped prompt), prints a title + body.
-    var doc = try aiauthor_mod.generatePrDoc(a, &g, "printf 'Add the feature\\n\\n## Summary\\nDoes the thing.'", ctx);
+    var pr_output: ?git_mod.ExecResult = null;
+    defer if (pr_output) |*output| output.deinit(a);
+    var doc = try aiauthor_mod.generatePrDoc(a, &g, "printf 'Add the feature\\n\\n## Summary\\nDoes the thing.'; printf 'provider notice' >&2", ctx, &pr_output);
     defer doc.deinit(a);
     try std.testing.expectEqualStrings("Add the feature", doc.title);
     try std.testing.expectEqualStrings("## Summary\nDoes the thing.", doc.body);
+    try std.testing.expectEqualStrings("Add the feature\n\n## Summary\nDoes the thing.", pr_output.?.stdout);
+    try std.testing.expectEqualStrings("provider notice", pr_output.?.stderr);
+
+    var commit_output: ?git_mod.ExecResult = null;
+    defer if (commit_output) |*output| output.deinit(a);
+    var detail: ?[]u8 = null;
+    defer if (detail) |message| a.free(message);
+    try std.testing.expectError(error.AiCommandFailed, aiauthor_mod.generate(a, &g, "printf 'partial response'; printf 'provider failed' >&2; exit 1", .title, "", .{}, .{}, &detail, &commit_output));
+    try std.testing.expectEqualStrings("partial response", commit_output.?.stdout);
+    try std.testing.expectEqualStrings("provider failed", commit_output.?.stderr);
 }
 
 test "merge commit's per-file preview shows the brought-in file (issue #22 follow-up)" {
@@ -20187,6 +20240,37 @@ test "staging the last change falls back to the change above (e2e)" {
     try std.testing.expect(std.mem.indexOf(u8, app.staging_diff, "+TOP") != null);
 }
 
+test "user-triggered network operations show both output streams" {
+    const a = std.testing.allocator;
+    var files = [_]model.FileStatus{};
+    var app = try testApp(a, &files);
+    defer deinitTestApp(&app);
+    app.focus = .status;
+    const result: git_mod.ExecResult = .{
+        .stdout = try a.dupe(u8, "push output\n"),
+        .stderr = try a.dupe(u8, "push progress\n"),
+        .term = .{ .exited = 0 },
+    };
+    try app.completeAsync(.push, result, a);
+    try std.testing.expectEqualStrings("$ git push\npush output\npush progress", app.activeMainText());
+}
+
+test "Status keeps output from earlier steps when a Git batch ends silently" {
+    const a = std.testing.allocator;
+    var files = [_]model.FileStatus{};
+    var app = try testApp(a, &files);
+    defer deinitTestApp(&app);
+    app.focus = .status;
+    app.captureCommandOutput("git stash drop", .{
+        .stdout = &.{},
+        .stderr = &.{},
+        .prior_stdout = @constCast("Dropped stash@{1}\nDropped stash@{0}\n"),
+        .prior_stderr = @constCast("warning from an earlier step\n"),
+        .term = .{ .exited = 0 },
+    });
+    try std.testing.expectEqualStrings("$ git stash drop\nDropped stash@{1}\nDropped stash@{0}\nwarning from an earlier step", app.activeMainText());
+}
+
 test "built-in commit shows both streams from a failing pre-commit hook" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -20458,6 +20542,7 @@ fn deinitTestApp(app: *App) void {
     if (app.preview_wanted) |job| job.deinit(page_alloc);
     if (app.mutation_requested) |job| job.deinit(page_alloc);
     page_alloc.free(app.mutation_msg);
+    page_alloc.free(app.mutation_command);
     staging_mod.clearStagePending(app);
     app.stage_pending.deinit(app.allocator);
     // Release the module-level render caches this test may have populated with
@@ -21217,6 +21302,10 @@ test "wrap: mouse selection across wrapped rows maps and copies correctly" {
     try app.copyDiffSelection();
     // Visual cols [3,15) of "0123456789abcdefghij" = "3456789abcde".
     try std.testing.expectEqualStrings("3456789abcde", app.clipboard_request.?);
+
+    const combined = "12345678é\u{0301}界X";
+    const rows = wrapRowsFor(allocator, combined, 10);
+    try std.testing.expectEqual(@as(u16, 9), rows[1].vis_start);
 }
 
 test "issue #6: a panel number key cycles its tabs when already focused" {

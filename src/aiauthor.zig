@@ -113,7 +113,8 @@ pub const Context = struct {
 
 /// Gather the git context, build the field's prompt, run `command`, and return
 /// the normalized result (caller owns it). Runs off the UI thread.
-pub fn generate(allocator: std.mem.Allocator, git: *git_mod.Git, command: []const u8, field: Field, current_title: []const u8, limits: Limits, source: DiffSource, err_out: *?[]u8) ![]u8 {
+/// When requested, the caller also owns the command's raw output, even if parsing fails.
+pub fn generate(allocator: std.mem.Allocator, git: *git_mod.Git, command: []const u8, field: Field, current_title: []const u8, limits: Limits, source: DiffSource, err_out: *?[]u8, command_output: ?*?git_mod.ExecResult) ![]u8 {
     err_out.* = null;
     const diff = switch (source.kind) {
         .staged => try git.stagedDiff(),
@@ -158,7 +159,11 @@ pub fn generate(allocator: std.mem.Allocator, git: *git_mod.Git, command: []cons
     defer allocator.free(prompt);
 
     var res = git.runAiCommand(command, prompt) catch return GenError.AiCommandFailed;
-    defer res.deinit(allocator);
+    defer if (command_output) |output| {
+        output.* = res;
+    } else {
+        res.deinit(allocator);
+    };
     if (!res.ok()) {
         // The command ran but exited non-zero: carry its first stderr line out so
         // the UI can show *why* (e.g. a provider/model error), not just "failed".
@@ -417,8 +422,8 @@ const max_commit_log_bytes: usize = 8 * 1024;
 /// Generate a pull request title + markdown body from `ctx`, honoring an optional
 /// `pr-instructions.md` (repo overrides global; `# Title` / `# Body` sections
 /// route to the title vs the body). One AI call returns "title\n\n<body>", which
-/// is split. Runs off the UI thread. Caller owns the result.
-pub fn generatePrDoc(allocator: std.mem.Allocator, git: *git_mod.Git, command: []const u8, ctx: DocContext) !DocResult {
+/// is split. Runs off the UI thread. Caller owns both the document and raw output.
+pub fn generatePrDoc(allocator: std.mem.Allocator, git: *git_mod.Git, command: []const u8, ctx: DocContext, command_output: *?git_mod.ExecResult) !DocResult {
     const raw_instr = loadInstructions(allocator, git, "pr-instructions.md");
     defer if (raw_instr) |r| allocator.free(r);
     const title_instr = if (raw_instr) |r| try composeFieldInstructions(allocator, r, .title) else try allocator.dupe(u8, "");
@@ -429,8 +434,8 @@ pub fn generatePrDoc(allocator: std.mem.Allocator, git: *git_mod.Git, command: [
     const prompt = try buildPrPrompt(allocator, ctx, title_instr, body_instr);
     defer allocator.free(prompt);
 
-    var res = git.runAiCommand(command, prompt) catch return GenError.AiCommandFailed;
-    defer res.deinit(allocator);
+    const res = git.runAiCommand(command, prompt) catch return GenError.AiCommandFailed;
+    command_output.* = res;
     if (!res.ok()) return GenError.AiCommandFailed;
     const out = std.mem.trim(u8, res.stdout, " \t\r\n");
     if (out.len == 0) return GenError.EmptyResponse;

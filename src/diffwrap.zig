@@ -7,9 +7,8 @@
 //! word-diff character ordinals carry across wrapped rows unchanged.
 //!
 //! Widths must match the renderer: ANSI escapes are skipped, tabs count as four
-//! columns, and each other character's width comes from `widthFn` (the same
-//! `gwidth` the renderer uses), with zero-width forced to one. Wrapping is
-//! greedy and breaks at the last space that fit, hard-breaking words longer than
+//! columns, and other characters use the same grapheme widths as the renderer.
+//! Wrapping is greedy and breaks at the last space that fit, hard-breaking words longer than
 //! the width. When wrapping is off, callers use one row per line instead (see
 //! `App.mainVisualRows`), and `build` is not called.
 const std = @import("std");
@@ -29,11 +28,13 @@ pub const Row = struct {
 /// shown in wrap mode (use horizontal scroll for such lines).
 const max_line_vis: u16 = 60000;
 
+pub const CellStep = struct { len: usize, width: u16 };
+
 pub fn build(
     gpa: std.mem.Allocator,
     text: []const u8,
     content_width: u16,
-    widthFn: *const fn (grapheme: []const u8) u16,
+    cellStep: *const fn (line: []const u8, offset: usize) CellStep,
 ) ![]Row {
     var rows: std.ArrayList(Row) = .empty;
     errdefer rows.deinit(gpa);
@@ -43,7 +44,7 @@ pub fn build(
     var ls: usize = 0;
     while (true) {
         const le = std.mem.indexOfScalarPos(u8, text, ls, '\n') orelse text.len;
-        try wrapLine(gpa, &rows, text, ls, le, line_no, content_width, widthFn);
+        try wrapLine(gpa, &rows, text, ls, le, line_no, content_width, cellStep);
         line_no += 1;
         if (le == text.len) break;
         ls = le + 1;
@@ -60,7 +61,7 @@ fn wrapLine(
     le: usize,
     line_no: u32,
     width: u16,
-    widthFn: *const fn ([]const u8) u16,
+    cellStep: *const fn ([]const u8, usize) CellStep,
 ) !void {
     const start32: u32 = @intCast(ls);
     const end32: u32 = @intCast(le);
@@ -86,20 +87,14 @@ fn wrapLine(
             i += 1;
             continue;
         }
-        var cw: u16 = 1;
-        var clen: usize = 1;
-        if (b == '\t') {
-            cw = 4;
-        } else if (b >= 0x80) {
-            clen = std.unicode.utf8ByteSequenceLength(b) catch 1;
-            if (i + clen > le) clen = 1;
-            const w = widthFn(text[i .. i + clen]);
-            cw = if (w == 0) 1 else w;
-        }
+        const step: CellStep = if (b < 0x80)
+            .{ .len = 1, .width = if (b == '\t') 4 else 1 }
+        else
+            cellStep(text[ls..le], i - ls);
 
         // Break before a char that would overrun the segment (but never on an
         // empty segment: a single too-wide char is placed and overflows).
-        if (vis > seg_start and vis + cw > seg_start + width) {
+        if (vis > seg_start and vis + step.width > seg_start + width) {
             const at = if (have_break and break_vis > seg_start) break_vis else vis;
             try rows.append(gpa, .{ .line = line_no, .start = start32, .end = end32, .vis_start = seg_start, .vis_end = at });
             seg_start = at;
@@ -113,8 +108,8 @@ fn wrapLine(
             break_vis = vis + 1;
             have_break = true;
         }
-        vis += cw;
-        i += clen;
+        vis += step.width;
+        i += step.len;
     }
     // Final segment (also the sole row for an empty line: vis == seg_start == 0).
     try rows.append(gpa, .{ .line = line_no, .start = start32, .end = end32, .vis_start = seg_start, .vis_end = vis });
@@ -123,14 +118,14 @@ fn wrapLine(
 const testing = std.testing;
 
 /// Test width: ASCII = 1; a leading byte >= 0xF0 (our stand-in for a wide char) = 2.
-fn testWidth(g: []const u8) u16 {
-    if (g.len > 0 and g[0] >= 0xf0) return 2;
-    return 1;
+fn testCell(line: []const u8, offset: usize) CellStep {
+    const byte = line[offset];
+    return .{ .len = std.unicode.utf8ByteSequenceLength(byte) catch 1, .width = if (byte >= 0xf0) 2 else 1 };
 }
 
 test "no wrap when the line fits" {
     const a = testing.allocator;
-    const rows = try build(a, "hello world", 40, testWidth);
+    const rows = try build(a, "hello world", 40, testCell);
     defer a.free(rows);
     try testing.expectEqual(@as(usize, 1), rows.len);
     try testing.expectEqual(@as(u16, 0), rows[0].vis_start);
@@ -140,7 +135,7 @@ test "no wrap when the line fits" {
 test "wraps at the last space that fits" {
     const a = testing.allocator;
     // width 5: "aa " fits, then "bb cc" fills the next row exactly.
-    const rows = try build(a, "aa bb cc", 5, testWidth);
+    const rows = try build(a, "aa bb cc", 5, testCell);
     defer a.free(rows);
     try testing.expectEqual(@as(usize, 2), rows.len);
     try testing.expectEqual(@as(u16, 0), rows[0].vis_start);
@@ -151,7 +146,7 @@ test "wraps at the last space that fits" {
 
 test "hard-breaks a word longer than the width" {
     const a = testing.allocator;
-    const rows = try build(a, "abcdefghij", 4, testWidth);
+    const rows = try build(a, "abcdefghij", 4, testCell);
     defer a.free(rows);
     try testing.expectEqual(@as(usize, 3), rows.len);
     try testing.expectEqual(@as(u16, 4), rows[0].vis_end);
@@ -161,7 +156,7 @@ test "hard-breaks a word longer than the width" {
 
 test "multiple source lines keep their indices; empty line is one row" {
     const a = testing.allocator;
-    const rows = try build(a, "ab\n\ncd", 10, testWidth);
+    const rows = try build(a, "ab\n\ncd", 10, testCell);
     defer a.free(rows);
     try testing.expectEqual(@as(usize, 3), rows.len);
     try testing.expectEqual(@as(u32, 0), rows[0].line);
@@ -173,7 +168,7 @@ test "multiple source lines keep their indices; empty line is one row" {
 test "tabs count as four columns" {
     const a = testing.allocator;
     // "\tab" -> visual width 6; at width 5 it wraps after the tab boundary.
-    const rows = try build(a, "\tabcd", 5, testWidth);
+    const rows = try build(a, "\tabcd", 5, testCell);
     defer a.free(rows);
     // tab(4) + "a"(1) = 5 fits; "b" overflows, no space to break on -> hard break.
     try testing.expectEqual(@as(usize, 2), rows.len);
@@ -183,7 +178,7 @@ test "tabs count as four columns" {
 test "ANSI escapes do not consume visual width" {
     const a = testing.allocator;
     // The colour codes are zero-width; "hi" is 2 columns, fits in one row.
-    const rows = try build(a, "\x1b[32mhi\x1b[m", 10, testWidth);
+    const rows = try build(a, "\x1b[32mhi\x1b[m", 10, testCell);
     defer a.free(rows);
     try testing.expectEqual(@as(usize, 1), rows.len);
     try testing.expectEqual(@as(u16, 2), rows[0].vis_end);
@@ -192,7 +187,7 @@ test "ANSI escapes do not consume visual width" {
 test "wide characters take two columns" {
     const a = testing.allocator;
     // Two wide chars (2 cols each) = 4 cols; width 3 -> wrap after the first.
-    const rows = try build(a, "\xf0\x9f\x9a\x80\xf0\x9f\x8e\x89", 3, testWidth);
+    const rows = try build(a, "\xf0\x9f\x9a\x80\xf0\x9f\x8e\x89", 3, testCell);
     defer a.free(rows);
     try testing.expectEqual(@as(usize, 2), rows.len);
     try testing.expectEqual(@as(u16, 2), rows[0].vis_end); // first wide char (2 cols)

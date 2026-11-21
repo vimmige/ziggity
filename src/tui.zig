@@ -531,6 +531,7 @@ const AiGenRun = struct {
     command: []u8,
     current_title: []u8,
     field: aiauthor_mod.Field,
+    capture_output: bool,
     limits: aiauthor_mod.Limits = .{},
     /// Which changes to describe (inline value, copied from the request).
     source: aiauthor_mod.DiffSource = .{},
@@ -542,6 +543,7 @@ const AiGenRun = struct {
     /// On failure, a short reason from the ai_command's stderr (owned), surfaced
     /// in the status bar so the user sees *why* generation failed. Null if none.
     error_detail: ?[]u8 = null,
+    command_output: ?git_mod.ExecResult = null,
 
     fn free(self: *AiGenRun) void {
         async_allocator.free(self.command);
@@ -550,6 +552,8 @@ const AiGenRun = struct {
         self.result = null;
         if (self.error_detail) |e| async_allocator.free(e);
         self.error_detail = null;
+        if (self.command_output) |*output| output.deinit(async_allocator);
+        self.command_output = null;
     }
 };
 
@@ -565,7 +569,8 @@ fn runAiGen(ag: *AiGenRun) void {
         for (wgit.command_log.items) |e| async_allocator.free(e);
         wgit.command_log.deinit(async_allocator);
     }
-    if (aiauthor_mod.generate(async_allocator, &wgit, ag.command, ag.field, ag.current_title, ag.limits, ag.source, &ag.error_detail)) |text| {
+    const output = if (ag.capture_output) &ag.command_output else null;
+    if (aiauthor_mod.generate(async_allocator, &wgit, ag.command, ag.field, ag.current_title, ag.limits, ag.source, &ag.error_detail, output)) |text| {
         ag.result = text;
         ag.failed = false;
     } else |_| {
@@ -601,6 +606,7 @@ const PrGenRun = struct {
     title: ?[]u8 = null,
     body: ?[]u8 = null,
     failed: bool = false,
+    command_output: ?git_mod.ExecResult = null,
 
     fn free(self: *PrGenRun) void {
         async_allocator.free(self.command);
@@ -611,6 +617,8 @@ const PrGenRun = struct {
         if (self.body) |b| async_allocator.free(b);
         self.title = null;
         self.body = null;
+        if (self.command_output) |*output| output.deinit(async_allocator);
+        self.command_output = null;
     }
 };
 
@@ -631,7 +639,7 @@ fn prGenWorker(pr: *PrGenRun) void {
     const diff: []const u8 = wgit.refDiff(pr.base, pr.target, pr.three_dot) catch "";
     defer if (diff.len != 0) async_allocator.free(@constCast(diff));
     const ctx = aiauthor_mod.DocContext{ .subject = pr.subject, .commit_log = log, .diff = diff };
-    if (aiauthor_mod.generatePrDoc(async_allocator, &wgit, pr.command, ctx)) |doc| {
+    if (aiauthor_mod.generatePrDoc(async_allocator, &wgit, pr.command, ctx, &pr.command_output)) |doc| {
         pr.title = doc.title;
         pr.body = doc.body;
         pr.failed = false;
@@ -995,6 +1003,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                     if (ai_title_future) |*f| {
                         f.await(io);
                         ai_title_future = null;
+                        if (ai_title_run.command_output) |output| app.captureCommandOutput("AI commit title", output);
                         app.applyAiResult(.title, ai_title_run.dialog_generation, ai_title_run.revision, ai_title_run.staged_signature, if (ai_title_run.failed) null else ai_title_run.result, ai_title_run.error_detail) catch {};
                         ai_title_run.free();
                         render_needed = true;
@@ -1004,6 +1013,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                     if (ai_desc_future) |*f| {
                         f.await(io);
                         ai_desc_future = null;
+                        if (ai_desc_run.command_output) |output| app.captureCommandOutput("AI commit description", output);
                         app.applyAiResult(.description, ai_desc_run.dialog_generation, ai_desc_run.revision, ai_desc_run.staged_signature, if (ai_desc_run.failed) null else ai_desc_run.result, ai_desc_run.error_detail) catch {};
                         ai_desc_run.free();
                         render_needed = true;
@@ -1013,6 +1023,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                     if (pr_gen_future) |*f| {
                         f.await(io);
                         pr_gen_future = null;
+                        if (pr_gen_run.command_output) |output| app.captureCommandOutput("AI PR description", output);
                         app.applyPrDoc(pr_gen_run.generation, if (pr_gen_run.failed) null else pr_gen_run.title, if (pr_gen_run.failed) null else pr_gen_run.body) catch {};
                         pr_gen_run.free();
                         render_needed = true;
@@ -1347,6 +1358,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                     .command = async_allocator.dupe(u8, app.config.ai_command.get()) catch "",
                     .current_title = async_allocator.dupe(u8, req.current_title) catch "",
                     .field = .title,
+                    .capture_output = req.capture_output,
                     .limits = req.limits,
                     .source = req.source,
                     .dialog_generation = req.dialog_generation,
@@ -1375,6 +1387,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                     .command = async_allocator.dupe(u8, app.config.ai_command.get()) catch "",
                     .current_title = async_allocator.dupe(u8, req.current_title) catch "",
                     .field = .description,
+                    .capture_output = req.capture_output,
                     .limits = req.limits,
                     .source = req.source,
                     .dialog_generation = req.dialog_generation,
@@ -1817,6 +1830,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
     app.syncListView(.stash, stash_h -| 2);
 
     // Capture panel hit-boxes for mouse handling.
+    app.status_output_rect = null;
     app.panel_rects = .{
         .{ .focus = .status, .x = 0, .y = 0, .w = side_w, .h = status_h },
         .{ .focus = .files, .x = 0, .y = status_h, .w = side_w, .h = files_h },
@@ -4860,12 +4874,15 @@ fn drawStatusOutput(root: vaxis.Window, pane: vaxis.Window, app: *app_mod.App) v
     aboutLine(win, app, &row, &slot, std.fmt.bufPrint(&sbuf, "{d} changed  ({d} staged, {d} unstaged)", .{ app.data.files.len, app.data.stagedCount(), app.data.unstagedCount() }) catch "", st.normal);
     aboutLine(win, app, &row, &slot, std.fmt.bufPrint(&sbuf, "{d} branches  {d} stashes", .{ app.data.branches.len, app.data.stash.len }) catch "", st.normal);
 
-    const output = pane.child(.{ .y_off = @min(row + 1, win.height) });
+    const output_top = @min(row + 1, win.height);
+    app.dialog_row_count = @min(app.dialog_row_count, output_top);
+    const output = pane.child(.{ .y_off = output_top });
     app.main_view_height = output.height;
     app.main_scroll = @min(app.main_scroll, app.maxMainScroll());
     if (app.shell_output.len == 0) {
-        print(output, 0, 0, "Latest output from >, git commit, or git commit --amend.", st.muted);
+        print(output, 0, 0, "Latest output from > or any ziggity subcommand", st.muted);
     } else {
+        app.status_output_rect = .{ .focus = .main, .x = @intCast(output.x_off), .y = @intCast(output.y_off), .w = output.width, .h = output.height };
         drawDiffContent(output, app, app.shell_output, .main);
         drawScrollbarRange(root, @intCast(output.x_off + output.width), @intCast(output.y_off), output.height, app.mainContentLines(), app.main_scroll, app.focus == .main);
     }
