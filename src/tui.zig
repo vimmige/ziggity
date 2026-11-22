@@ -4515,6 +4515,7 @@ fn drawGraphCodepoint(win: vaxis.Window, row: u16, col: u16, cp: u21, base: vaxi
 fn drawCommitRows(win: vaxis.Window, app: *const app_mod.App, commits: []const model.Commit, selected: usize, panel_focus: model.Focus) void {
     const start = app.listScroll(panel_focus);
     const focused = app.focus == panel_focus;
+    const reflog = panel_focus == .commits and app.commits_tab == .reflog;
     // The inline commit graph is drawn only for the main Commits list (not the
     // reflog/divergence tabs or the Branches sub-commits drill).
     const graph = if (panel_focus == .commits and app.commits_tab == .commits and app.inlineGraphVisible())
@@ -4596,6 +4597,13 @@ fn drawCommitRows(win: vaxis.Window, app: *const app_mod.App, commits: []const m
         } else {
             const head = std.fmt.bufPrint(&buf, "{c}{s} ", .{ marker, commit.short_hash }) catch "";
             col = printSpan(win, row, col, head, withFg(base, hash_fg));
+        }
+
+        if (reflog) {
+            col = printSpan(win, row, col, commit.refs, base);
+            col = printSpan(win, row, col, ": ", base);
+            _ = printSpan(win, row, col, commit.subject, base);
+            continue;
         }
 
         // The author's initials in a stable per-author colour, padded to a
@@ -6463,6 +6471,51 @@ fn dimmed(base: vaxis.Style) vaxis.Style {
     s.fg = .default;
     s.dim = true;
     return s;
+}
+
+test "reflog rows show Git's selectors and actions even for the same commit" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [160]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
+    try env.put("GIT_CONFIG_GLOBAL", "/dev/null");
+    try env.put("GIT_CONFIG_SYSTEM", "/dev/null");
+    const setup = try std.process.run(allocator, io, .{
+        .argv = &.{ "sh", "-ec", "git init -qb main; git -c user.name=Test -c user.email=test@example.com -c commit.gpgsign=false commit -qm first --allow-empty; git checkout -qb feature" },
+        .cwd = .{ .path = path },
+        .environ_map = &env,
+    });
+    defer allocator.free(setup.stdout);
+    defer allocator.free(setup.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, setup.term);
+
+    var git = try git_mod.Git.initAt(allocator, io, &env, path);
+    defer git.deinit();
+    var cli = try git.exec(&.{ "reflog", "-2" });
+    defer cli.deinit(allocator);
+    try std.testing.expect(cli.ok());
+    var app: app_mod.App = .{ .allocator = allocator, .git = git, .config = .{}, .focus = .commits, .commits_tab = .reflog };
+    app.data.reflog = try git.loadReflog(2);
+    defer app.data.replaceReflog(allocator, &.{});
+    try std.testing.expectEqual(@as(usize, 2), app.data.reflog.len);
+
+    var screen = try vaxis.Screen.init(allocator, .{ .cols = 80, .rows = 2, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(allocator);
+    const win: vaxis.Window = .{ .screen = &screen, .width = 80, .height = 2, .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0 };
+    drawCommits(win, &app);
+    var lines = std.mem.tokenizeScalar(u8, cli.stdout, '\n');
+    for (0..2) |row| {
+        const expected = lines.next() orelse return error.MissingReflogEntry;
+        var actual: [79]u8 = undefined;
+        for (&actual, 1..) |*byte, col| byte.* = win.readCell(@intCast(col), @intCast(row)).?.char.grapheme[0];
+        try std.testing.expectEqualStrings(expected, std.mem.trimEnd(u8, &actual, " "));
+        try std.testing.expectEqual(@as(usize, 0), app.data.reflog[row].parents.len);
+    }
 }
 
 test "narrow review highlights the cursor without reversing the hunk header" {

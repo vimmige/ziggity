@@ -1749,10 +1749,8 @@ pub const Git = struct {
         // %gd is the reflog selector (HEAD@{n}); %gs the reflog subject. They
         // map onto the Commit model's refs/subject fields for reuse.
         var result = try self.exec(&.{
-            "log",
-            "-g",
-            "--date=relative",
-            "--pretty=format:%H%x00%h%x00%an%x00%cr%x00%gd%x00%gs",
+            "reflog",
+            "--pretty=format:%H%x00%h%x00%an%x00%cr%x00%gd%x00%x00%gs",
             "--no-show-signature",
             limit_arg,
         });
