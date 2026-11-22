@@ -6514,17 +6514,18 @@ pub const App = struct {
         const rel_row: u16 = if (row <= content_top) 0 else @min(row - content_top, content_h -| 1);
         const screen_col: usize = if (col <= content_left) 0 else @min(col - content_left, content_w);
 
+        const visual_row = self.paneScroll(pane) + rel_row;
+        const source_row = if (pane == .main) self.visualRowWithoutStagingBorder(visual_row) else visual_row;
         if (self.wrap_diff) {
             const text = self.paneText(pane);
             const rows = wrapRowsFor(self.allocator, text, content_w);
-            const vidx = self.paneScroll(pane) + rel_row;
-            if (vidx < rows.len) {
-                const wr = rows[vidx];
+            if (source_row < rows.len) {
+                const wr = rows[source_row];
                 return .{ .line = wr.line, .col = @as(usize, wr.vis_start) + screen_col };
             }
             return .{ .line = diffLineCount(text) -| 1, .col = screen_col };
         }
-        return .{ .line = self.paneScroll(pane) + rel_row, .col = screen_col + self.paneHScroll(pane) };
+        return .{ .line = source_row, .col = screen_col + self.paneHScroll(pane) };
     }
 
     /// Normalized (start <= end) selection for `pane`, clamped to its content.
@@ -9345,6 +9346,23 @@ pub const App = struct {
         return if (self.mode == .diff_review and width >= 5 and self.currentDiffHunk() != null) width - 2 else width;
     }
 
+    pub fn selectedStagingHunk(self: *const App) ?diff_mod.Hunk {
+        if (!self.staging_active or self.staging_patch_mode or self.mode == .diff_review) return null;
+        const idx = staging_mod.stagingHunkAt(self, self.staging_cursor) orelse return null;
+        return self.staging.?.hunks[idx];
+    }
+
+    pub fn stagingHunkBottomRow(self: *const App) ?usize {
+        const hunk = self.selectedStagingHunk() orelse return null;
+        return self.firstTextRowOfLine(hunk.end_line);
+    }
+
+    fn visualRowWithoutStagingBorder(self: *const App, row: usize) usize {
+        const bottom = self.stagingHunkBottomRow() orelse return row;
+        // A click on the border belongs to the last line of the selected hunk.
+        return row -| @intFromBool(row >= bottom);
+    }
+
     /// Total displayed rows of the main panel: source lines when truncating, or
     /// wrapped visual rows when `wrap_diff` is on. `main_scroll` is an index into
     /// these, so the two models share one scroll field. Drives the scrollbar and
@@ -9356,6 +9374,10 @@ pub const App = struct {
             if (self.wrap_diff) return self.splitWrapRows().len;
             return self.splitRows().rows.len;
         }
+        return self.mainTextRows() + @intFromBool(self.selectedStagingHunk() != null);
+    }
+
+    fn mainTextRows(self: *const App) usize {
         const text = self.activeMainText();
         if (!self.wrap_diff) {
             // Cached line count (O(1) after the first build) instead of a fresh
@@ -9379,9 +9401,10 @@ pub const App = struct {
         return self.sourceLineAtVisualRow(self.main_scroll);
     }
 
-    fn sourceLineAtVisualRow(self: *const App, row: usize) usize {
+    fn sourceLineAtVisualRow(self: *const App, visual_row: usize) usize {
+        const row = self.visualRowWithoutStagingBorder(visual_row);
         const text = self.activeMainText();
-        if (!self.wrap_diff) return @min(row, self.mainVisualRows() -| 1);
+        if (!self.wrap_diff) return @min(row, self.mainTextRows() -| 1);
         const width = self.unifiedDiffWidth();
         const rows = wrapRowsFor(self.allocator, text, width);
         return if (rows.len == 0) 0 else rows[@min(row, rows.len - 1)].line;
@@ -9390,6 +9413,12 @@ pub const App = struct {
     /// The visual-row index where source line `line` first appears, under the
     /// *current* wrap mode (the inverse of `topSourceLine`).
     pub fn firstVisualRowOfLine(self: *const App, line: usize) usize {
+        const row = self.firstTextRowOfLine(line);
+        const hunk = self.selectedStagingHunk() orelse return row;
+        return row + @intFromBool(line >= hunk.end_line);
+    }
+
+    fn firstTextRowOfLine(self: *const App, line: usize) usize {
         if (!self.wrap_diff) return line;
         const text = self.activeMainText();
         const width = self.unifiedDiffWidth();

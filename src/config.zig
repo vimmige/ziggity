@@ -157,16 +157,13 @@ pub const KeyMap = struct {
 /// Terminal color indices (0-255) for UI elements, set via `color.<name>` in
 /// the config. Defaults match the built-in palette.
 pub const Theme = struct {
-    /// Background of the selected row in the focused panel: a soft muted blue
-    /// (256-colour 24) rather than the harsh pure ANSI blue (4).
-    selected_bg: u8 = 24,
+    /// Background of the selected row in the focused panel (dark gray).
+    selected_bg: u8 = 238,
     /// Background of the selected row in a panel that does NOT have focus, so
     /// the selection stays visible (dimmer than `selected_bg`).
     inactive_selected_bg: u8 = 8,
-    /// Foreground for text that would be hard to read on `selected_bg` — the
-    /// unstaged red of a filename is illegible on blue, so on the selected row it
-    /// is drawn in this legible colour instead (bright white by default). The
-    /// status letters and other rows keep their normal colours.
+    /// Foreground for unstaged filenames on the focused selection (bright white
+    /// by default). The status letters keep their normal colours.
     selected_fg: u8 = 15,
     // Greens use the standard ANSI slot (2) rather than the bright one (10):
     // terminal themes paint standard green tastefully, whereas bright green is
