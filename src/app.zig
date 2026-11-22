@@ -13586,8 +13586,7 @@ pub const App = struct {
     pub fn runMutationScoped(self: *App, result: git_mod.ExecResult, scopes: ScopeSet, comptime success_fmt: []const u8, args: anytype) !void {
         var mutable = result;
         defer mutable.deinit(self.allocator);
-        const log = self.git.command_log.items;
-        self.captureCommandOutput(if (log.len > 0) log[log.len - 1] else "git", result);
+        if (result.command.len > 0) self.captureCommandOutput("", result);
         if (mutable.ok()) {
             const summary = try std.fmt.allocPrint(self.allocator, success_fmt, args);
             defer self.allocator.free(summary);
@@ -13807,13 +13806,33 @@ pub const App = struct {
     pub fn captureCommandOutput(self: *App, command: []const u8, result: git_mod.ExecResult) void {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
+        if (result.command.len > 0) {
+            out.writer.writeAll(result.command) catch return;
+        } else {
+            out.writer.print("$ {s}", .{command}) catch return;
+        }
         for ([_][]const u8{ result.prior_stdout, result.stdout, result.prior_stderr, result.stderr }) |raw| {
             const stream = std.mem.trimEnd(u8, raw, "\r\n");
             if (stream.len == 0) continue;
-            if (out.written().len == 0) out.writer.print("$ {s}", .{command}) catch return;
             out.writer.print("\n{s}", .{stream}) catch return;
         }
-        if (out.written().len == 0) return;
+        switch (result.term) {
+            .exited => |code| if (code == 0)
+                out.writer.writeAll("\nok") catch return
+            else
+                out.writer.print("\nfailed({d})", .{code}) catch return,
+            .signal => |signal| {
+                if (comptime @typeInfo(std.posix.SIG) == .@"enum") {
+                    if (std.enums.tagName(std.posix.SIG, signal)) |name| {
+                        out.writer.print("\nterminated(SIG{s})", .{name}) catch return;
+                    } else {
+                        out.writer.print("\nterminated({d})", .{@backingInt(signal)}) catch return;
+                    }
+                } else out.writer.writeAll("\nterminated") catch return;
+            },
+            .stopped => out.writer.writeAll("\nstopped") catch return,
+            .unknown => out.writer.writeAll("\nunknown exit status") catch return,
+        }
         const output = out.toOwnedSlice() catch return;
         self.replaceShellOutput(output);
         if (self.showStatusOutput()) {
@@ -20285,7 +20304,20 @@ test "user-triggered network operations show both output streams" {
         .term = .{ .exited = 0 },
     };
     try app.completeAsync(.push, result, a);
-    try std.testing.expectEqualStrings("$ git push\npush output\npush progress", app.activeMainText());
+    try std.testing.expectEqualStrings("$ git push\npush output\npush progress\nok", app.activeMainText());
+}
+
+test "silent commands replace previous Status output with their exit status" {
+    const a = std.testing.allocator;
+    var files = [_]model.FileStatus{};
+    var app = try testApp(a, &files);
+    defer deinitTestApp(&app);
+    app.focus = .status;
+
+    app.captureCommandOutput("git rebase --abort", .{ .stdout = &.{}, .stderr = &.{}, .term = .{ .exited = 0 } });
+    try std.testing.expectEqualStrings("$ git rebase --abort\nok", app.activeMainText());
+    app.captureCommandOutput("exit 7", .{ .stdout = &.{}, .stderr = &.{}, .term = .{ .exited = 7 } });
+    try std.testing.expectEqualStrings("$ exit 7\nfailed(7)", app.activeMainText());
 }
 
 test "Status keeps output from earlier steps when a Git batch ends silently" {
@@ -20301,7 +20333,7 @@ test "Status keeps output from earlier steps when a Git batch ends silently" {
         .prior_stderr = @constCast("warning from an earlier step\n"),
         .term = .{ .exited = 0 },
     });
-    try std.testing.expectEqualStrings("$ git stash drop\nDropped stash@{1}\nDropped stash@{0}\nwarning from an earlier step", app.activeMainText());
+    try std.testing.expectEqualStrings("$ git stash drop\nDropped stash@{1}\nDropped stash@{0}\nwarning from an earlier step\nok", app.activeMainText());
 }
 
 test "built-in commit shows both streams from a failing pre-commit hook" {
@@ -20339,7 +20371,7 @@ test "built-in commit shows both streams from a failing pre-commit hook" {
     try std.testing.expect(!app.op_ok);
     app.focus = .status;
     try app.updatePreview();
-    try std.testing.expectEqualStrings("$ git commit\nhook-output\nhook-error", app.activeMainText());
+    try std.testing.expectEqualStrings("$ git --no-optional-locks commit -m test\nhook-output\nhook-error\nfailed(1)", app.activeMainText());
 }
 
 test "shell prompt output remains available in Status after switching panels" {
@@ -20365,7 +20397,7 @@ test "shell prompt output remains available in Status after switching panels" {
     try app.input_buffer.appendSlice(a, command);
     try app.submitTextPrompt();
     try std.testing.expect(app.focus == .files);
-    const expected = "$ " ++ command ++ "\nstandard output\nstandard error";
+    const expected = "$ " ++ command ++ "\nstandard output\nstandard error\nfailed(7)";
     app.focus = .status;
     try app.updatePreview();
     try std.testing.expectEqualStrings(expected, app.activeMainText());

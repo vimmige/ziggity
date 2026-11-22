@@ -12,12 +12,14 @@ pub const ExecResult = struct {
     stdout: []u8,
     stderr: []u8,
     term: std.process.Child.Term,
+    command: []u8 = &.{},
     prior_stdout: []u8 = &.{},
     prior_stderr: []u8 = &.{},
 
     pub fn deinit(self: *ExecResult, allocator: std.mem.Allocator) void {
         allocator.free(self.stdout);
         allocator.free(self.stderr);
+        allocator.free(self.command);
         allocator.free(self.prior_stdout);
         allocator.free(self.prior_stderr);
         self.* = undefined;
@@ -29,15 +31,26 @@ pub const ExecResult = struct {
             else => false,
         };
     }
+
+    pub fn fromRun(allocator: std.mem.Allocator, result: std.process.RunResult, argv: []const []const u8) ExecResult {
+        return .{
+            .stdout = result.stdout,
+            .stderr = result.stderr,
+            .term = result.term,
+            .command = formatCommand(allocator, argv) catch &.{},
+        };
+    }
 };
 
 /// Keep completed steps for the output pane without changing the result used
 /// to classify the final step's success or failure.
 pub const ExecBatch = struct {
+    commands: std.ArrayList(u8) = .empty,
     stdout: std.ArrayList(u8) = .empty,
     stderr: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *ExecBatch, allocator: std.mem.Allocator) void {
+        self.commands.deinit(allocator);
         self.stdout.deinit(allocator);
         self.stderr.deinit(allocator);
     }
@@ -52,6 +65,7 @@ pub const ExecBatch = struct {
     fn record(self: *ExecBatch, allocator: std.mem.Allocator, result: ExecResult) void {
         var owned = result;
         defer owned.deinit(allocator);
+        _ = appendStream(&self.commands, allocator, result.command);
         _ = appendStream(&self.stdout, allocator, result.prior_stdout);
         _ = appendStream(&self.stdout, allocator, result.stdout);
         _ = appendStream(&self.stderr, allocator, result.prior_stderr);
@@ -60,6 +74,7 @@ pub const ExecBatch = struct {
 
     pub fn finish(self: *ExecBatch, allocator: std.mem.Allocator, result: ExecResult) ExecResult {
         var owned = result;
+        owned.command = takeStream(&self.commands, allocator, result.command);
         owned.prior_stdout = takeStream(&self.stdout, allocator, result.prior_stdout);
         owned.prior_stderr = takeStream(&self.stderr, allocator, result.prior_stderr);
         return owned;
@@ -81,6 +96,25 @@ pub const ExecBatch = struct {
         return bytes;
     }
 };
+
+fn formatCommand(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    if (argv.len == 0) return &.{};
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(allocator);
+    try line.append(allocator, '$');
+    for (argv) |arg| {
+        try line.append(allocator, ' ');
+        const safe = for (arg) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and std.mem.indexOfScalar(u8, "-_./:=@%+", byte) == null) break false;
+        } else true;
+        if (safe and arg.len > 0) {
+            try line.appendSlice(allocator, arg);
+        } else {
+            try Git.appendSingleQuoted(&line, allocator, arg);
+        }
+    }
+    return line.toOwnedSlice(allocator);
+}
 
 /// On a transient lock error, retry up to `lock_retry_count` times with an
 /// exponential backoff: the wait starts at `lock_retry_base_ms` and doubles each
@@ -389,7 +423,8 @@ pub const Git = struct {
         if (args.len >= 2) {
             const second = args[1];
             const long_flag = std.mem.startsWith(u8, second, "--") and second.len > 2;
-            if (std.mem.eql(u8, args[0], "branch") and long_flag) return true;
+            if (std.mem.eql(u8, args[0], "branch") and long_flag and
+                !std.mem.startsWith(u8, second, "--set-upstream-to=")) return true;
             if (std.mem.eql(u8, args[0], "tag") and long_flag) return true;
             if (std.mem.eql(u8, args[0], "stash") and std.mem.eql(u8, second, "list")) return true;
         }
@@ -486,17 +521,15 @@ pub const Git = struct {
             runWithLockRetry(self.allocator, self.io, options)
         else
             std.process.run(self.allocator, self.io, options);
-        return .{
-            .stdout = result.stdout,
-            .stderr = result.stderr,
-            .term = result.term,
-        };
+        const logical_args = if (hasLiteralPathspecs(args)) args[1..] else args;
+        return ExecResult.fromRun(self.allocator, result, if (isReadOnly(logical_args)) &.{} else argv.items);
     }
 
     fn output(self: *Git, args: []const []const u8) ![]u8 {
         var result = try self.exec(args);
         errdefer result.deinit(self.allocator);
         if (!result.ok()) return GitError.CommandFailed;
+        self.allocator.free(result.command);
         self.allocator.free(result.stderr);
         return result.stdout;
     }
@@ -712,7 +745,7 @@ pub const Git = struct {
             .stdout_limit = .limited(16 * 1024 * 1024),
             .stderr_limit = .limited(4 * 1024 * 1024),
         });
-        return .{ .stdout = result.stdout, .stderr = result.stderr, .term = result.term };
+        return ExecResult.fromRun(self.allocator, result, &argv);
     }
 
     fn rebaseFailure(self: *Git, message: []const u8) !ExecResult {
@@ -839,10 +872,10 @@ pub const Git = struct {
 
     /// Begin a bisect and mark `rev` as the first good/bad endpoint.
     pub fn bisectStartMark(self: *Git, good: bool, rev: []const u8) !ExecResult {
-        var start = try self.exec(&.{ "bisect", "start" });
-        if (!start.ok()) return start;
-        start.deinit(self.allocator);
-        return self.bisectMark(good, rev);
+        var batch: ExecBatch = .{};
+        defer batch.deinit(self.allocator);
+        if (try self.runStep(&batch, &.{ "bisect", "start" })) |failure| return failure;
+        return batch.finish(self.allocator, try self.bisectMark(good, rev));
     }
 
     /// Mark a commit good/bad during a bisect. With no `rev` the current
@@ -1561,7 +1594,12 @@ pub const Git = struct {
             .stdout_limit = .limited(1 * 1024 * 1024),
             .stderr_limit = .limited(256 * 1024),
         });
-        return .{ .stdout = result.stdout, .stderr = result.stderr, .term = result.term };
+        return .{
+            .stdout = result.stdout,
+            .stderr = result.stderr,
+            .term = result.term,
+            .command = std.fmt.allocPrint(self.allocator, "$ {s}", .{command}) catch &.{},
+        };
     }
 
     pub fn loadCommits(self: *Git, ref_name: []const u8, limit: ?usize) ![]model.Commit {
@@ -1754,6 +1792,7 @@ pub const Git = struct {
         var result = try self.exec(&.{ "--literal-pathspecs", "show", "-m", "--first-parent", hash, "--no-ext-diff", "--no-color", context_arg, "--format=", "--", path });
         errdefer result.deinit(self.allocator);
         if (!result.ok()) return GitError.CommandFailed;
+        self.allocator.free(result.command);
         self.allocator.free(result.stderr);
         return result.stdout;
     }
@@ -2236,7 +2275,7 @@ pub const Git = struct {
             .stdout_limit = .limited(16 * 1024 * 1024),
             .stderr_limit = .limited(4 * 1024 * 1024),
         });
-        return .{ .stdout = result.stdout, .stderr = result.stderr, .term = result.term };
+        return ExecResult.fromRun(self.allocator, result, &argv);
     }
 
     /// Drop a merge commit: replay everything after it onto its first parent,
@@ -2259,7 +2298,7 @@ pub const Git = struct {
             .stdout_limit = .limited(16 * 1024 * 1024),
             .stderr_limit = .limited(4 * 1024 * 1024),
         });
-        return .{ .stdout = result.stdout, .stderr = result.stderr, .term = result.term };
+        return ExecResult.fromRun(self.allocator, result, &argv);
     }
 
     /// Cherry-pick several commits in one go (apply in the given order).

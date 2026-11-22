@@ -201,7 +201,7 @@ fn asyncWorker(job: *AsyncJob) void {
         e.deinit();
         job.cred_environ = null;
     }
-    job.result = .{ .stdout = result.stdout, .stderr = result.stderr, .term = result.term };
+    job.result = git_mod.ExecResult.fromRun(async_allocator, result, argv.items);
     postDone(job);
 }
 
@@ -4880,7 +4880,7 @@ fn drawStatusOutput(root: vaxis.Window, pane: vaxis.Window, app: *app_mod.App) v
     app.main_view_height = output.height;
     app.main_scroll = @min(app.main_scroll, app.maxMainScroll());
     if (app.shell_output.len == 0) {
-        print(output, 0, 0, "Latest output from > or any ziggity subcommand", st.muted);
+        print(output, 0, 0, "Run a command to see its result here", st.muted);
     } else {
         app.status_output_rect = .{ .focus = .main, .x = @intCast(output.x_off), .y = @intCast(output.y_off), .w = output.width, .h = output.height };
         drawDiffContent(output, app, app.shell_output, .main);
