@@ -16,6 +16,9 @@ Releases before 0.55.0 are listed on the
 
 ## [Unreleased]
 
+### Removed
+- The `space` shortcut for jumping to the selected hunk's start in side-by-side review.
+
 ## [0.62.0] - 2026-11-15
 
 ### Fixed

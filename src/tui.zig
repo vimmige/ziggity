@@ -2092,7 +2092,7 @@ fn drawDiffReview(root: vaxis.Window, app: *app_mod.App) void {
         "";
     const unit = if (app.review_line_mode) "line" else "hunk";
     const discard = if (app.reviewDiscardOffered()) "  d discard" else "";
-    const footer = std.fmt.bufPrint(&review_footer_buf, "  j/k {s}  a toggle selection{s}  space hunk start{s}  ^w wrap  H/L pan  esc back  q quit", .{ unit, discard, whole }) catch "  a line/hunk  esc back";
+    const footer = std.fmt.bufPrint(&review_footer_buf, "  j/k {s}  a toggle selection{s}{s}  ^w wrap  H/L pan  esc back  q quit", .{ unit, discard, whole }) catch "  a line/hunk  esc back";
     print(root, footer_row, 0, footer, st.bottom_accent);
 }
 

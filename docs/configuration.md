@@ -334,10 +334,9 @@ side by side, press `|` to open a full-screen review: the old file on the left
 and the new on the right, lines aligned, file line numbers down each side, and
 the changed words emphasized. `j`/`k` or the arrows select hunks by default.
 Press `a` to switch between hunk and line movement. The hunk border follows
-the line selection as it moves. `PageUp`/`PageDown` and `Home`/`End` scroll,
-and `space` brings the selected hunk's header back into view. The header
-stays pinned while you scroll through the selected hunk. `d` discards the
-selected hunk or line for uncommitted changes. `=` fills in the rest of a
+the line selection as it moves. `PageUp`/`PageDown` and `Home`/`End` scroll.
+The header stays pinned while you scroll through the selected hunk. `d` discards
+the selected hunk or line for uncommitted changes. `=` fills in the rest of a
 single file around its changes, `^w` wraps both columns, `H`/`L`
 pan, and `esc` returns. Both act on a single file, so `=` is offered for a
 working-tree file, the staging view, or one file drilled into a commit, while `d`

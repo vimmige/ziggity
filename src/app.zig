@@ -9118,8 +9118,6 @@ pub const App = struct {
             self.main_scroll = self.maxMainScroll();
             return self.syncReviewCursor();
         }
-        // `space` recentres the view on the selected hunk after scrolling away.
-        if (key.matches(' ', .{})) return self.refocusDiffHunk();
         if (km.toggle_wrap.matches(key)) return self.toggleWrapDiff();
         if (km.scroll_left.matches(key) or key.matches(vaxis.Key.left, .{ .shift = true })) return self.scrollMainHorizontal(-@as(i32, horizontal_scroll_step));
         if (km.scroll_right.matches(key) or key.matches(vaxis.Key.right, .{ .shift = true })) return self.scrollMainHorizontal(@as(i32, horizontal_scroll_step));
@@ -9854,8 +9852,7 @@ pub const App = struct {
         try self.setMessage("hunk {d}/{d}", .{ next + 1, hunks.len });
     }
 
-    /// `space` in the review: bring the selected hunk back into view (its header
-    /// to the top) without changing which hunk is selected, after scrolling away.
+    /// Scroll to the selected hunk's start.
     fn refocusDiffHunk(self: *App) void {
         if (self.currentDiffHunk()) |h| self.scrollDiffHunkToTop(self.diffHunkRow(h));
     }
