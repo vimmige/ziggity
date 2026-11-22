@@ -2442,10 +2442,11 @@ const help_lines = [_][]const u8{
     "Files  (tabs: Files, Worktrees, Submodules — [ and ] switch)",
     "  space          stage (whole dir in tree view); unstage in Staged",
     "  a              stage all; unstage all in Staged",
-    "  c              new commit (also during rebase); amend in amend view",
-    "  w              commit with --no-verify (skip hooks)",
-    "  A              enter amend view; then c edits the last commit's message",
-    "  C              edit the last commit's message and amend staged changes",
+    "  c              new commit (also during rebase); same as C in amend view",
+    "  w              new commit with --no-verify; same as C in amend view",
+    "  C              amend and edit message (includes staged changes)",
+    "  A              open amend view; press again to amend and keep the message",
+    "                 With reword_on_amend enabled, the second A edits the message.",
     "  e              open the file in your editor",
     "  i              ignore (.gitignore) or exclude (.git/info/exclude) the file",
     "  y              copy the file path to the clipboard",
@@ -2492,9 +2493,10 @@ const help_lines = [_][]const u8{
     "  [              switch to the unstaged side",
     "  ]              switch to the staged side",
     "  \\              toggle split view (unstaged | staged)",
-    "  c              new commit; amend in amend view",
-    "  A              enter amend view; then c edits the last commit's message",
-    "  C              edit the last commit's message and amend staged changes",
+    "  c              new commit; same as C in amend view",
+    "  C              amend and edit message (includes staged changes)",
+    "  A              open amend view; press again to amend and keep the message",
+    "                 With reword_on_amend enabled, the second A edits the message.",
     "  e              open the file in your editor",
     "",
     "Branches  (tabs: Local, Remotes, Tags)",
@@ -5663,8 +5665,14 @@ fn hintRowsNeeded(width: u16, start_col: u16, hints: []const u8) u16 {
 /// this is the set of stages `footerHints` produces distinct strings for.
 const footer_contexts = [_]FooterCtx{
     .{ .focus = .status },
-    .{ .focus = .files, .files_tab = .files },
-    .{ .focus = .staged },
+    .{ .focus = .files, .rebasing = true },
+    .{ .focus = .files, .rebasing = true, .commit_mode = .amend },
+    .{ .focus = .files, .rebasing = true, .commit_mode = .amend_reword },
+    .{ .focus = .files, .rebasing = true, .commit_mode = .replay },
+    .{ .focus = .staged, .rebasing = true },
+    .{ .focus = .staged, .rebasing = true, .commit_mode = .amend },
+    .{ .focus = .staged, .rebasing = true, .commit_mode = .amend_reword },
+    .{ .focus = .staged, .rebasing = true, .commit_mode = .replay },
     .{ .focus = .files, .files_tab = .worktrees },
     .{ .focus = .files, .files_tab = .submodules },
     .{ .focus = .files, .conflict = true },
@@ -5685,7 +5693,10 @@ const footer_contexts = [_]FooterCtx{
     .{ .focus = .main, .fullscreen = true },
     .{ .focus = .main, .fullscreen = true, .main_file = true },
     .{ .focus = .main, .fullscreen = true, .main_patch_file = true },
-    .{ .staging = true },
+    .{ .staging = true, .rebasing = true },
+    .{ .staging = true, .rebasing = true, .commit_mode = .amend },
+    .{ .staging = true, .rebasing = true, .commit_mode = .amend_reword },
+    .{ .staging = true, .rebasing = true, .commit_mode = .replay },
     .{ .staging_patch = true },
     .{ .rebase_plan = true },
 };
@@ -5743,6 +5754,8 @@ fn footerHasModalPrompt(mode: app_mod.Mode) bool {
     };
 }
 
+const CommitHintMode = enum { normal, amend, amend_reword, replay, commit_only };
+
 /// The view state that selects a footer hint line. A small value type so the
 /// footer copy can be unit-tested without constructing a whole `App`.
 const FooterCtx = struct {
@@ -5767,8 +5780,10 @@ const FooterCtx = struct {
     branch_commits: bool = false,
     /// Within the Branches drill, showing a commit's file list (vs the commits).
     branch_files: bool = false,
-    /// A merge/rebase/conflict is in progress (data.state != .clean).
+    /// The Files and Staged panels show conflict actions.
     conflict: bool = false,
+    commit_mode: CommitHintMode = .normal,
+    rebasing: bool = false,
     /// The Diff panel is showing a working-tree file (so `e` can edit it).
     main_file: bool = false,
     main_patch_file: bool = false,
@@ -5799,9 +5814,7 @@ fn footerHints(c: FooterCtx) []const u8 {
     if (c.staging_patch) {
         return "j/k line  v range  space add/remove line (@@=hunk)  ^p patch  e edit  esc back" ++ global;
     }
-    if (c.staging) {
-        return "j/k line  J/K hunk  v range  space stage/unstage  d discard (@@=hunk)  [/] staged/unstaged  \\ split  | side-by-side  c/A commit/amend  C amend message  e edit  esc back" ++ global;
-    }
+    if (c.staging) return fileFooterHints(c, global);
     // A commit's file list, building a custom patch: `space` toggles the whole
     // file, `enter` opens per-line selection, `^p` opens the patch menu, `e`
     // edits the file. Shared by the Commits and Branches sub-commits drills.
@@ -5839,10 +5852,10 @@ fn footerHints(c: FooterCtx) []const u8 {
             .tags => "space checkout  n new-tag  d delete  f fetch  P push  g reset  y copy  w worktree  W diff  [/] tabs" ++ global_branches,
         };
     }
-    if (c.focus == .staged) return "space unstage  a unstage all  c commit  C amend message  A amend  enter hunks  ` tree  ~ fold tree" ++ global;
+    if (c.focus == .staged) return fileFooterHints(c, global);
     if (c.focus == .files) {
         return switch (c.files_tab) {
-            .files => "space stage  a all  c/w commit/no-verify  C amend message  A amend  e edit  d discard  i ignore/exclude  y copy  ^f fixup-base  s stash  / filter  ` tree  enter hunks  [/] tabs" ++ global,
+            .files => fileFooterHints(c, global),
             .worktrees => "space/enter switch  n new  o editor  d remove  [/] tabs" ++ global,
             .submodules => "enter enter  space update  n add  e edit-url  d remove  b bulk  [/] tabs" ++ global,
         };
@@ -5875,8 +5888,49 @@ fn footerHints(c: FooterCtx) []const u8 {
     };
 }
 
+fn fileFooterHints(c: FooterCtx, comptime global: []const u8) []const u8 {
+    return switch (c.commit_mode) {
+        inline else => |mode| blk: {
+            const commit = comptime switch (mode) {
+                .normal, .commit_only => "c New commit",
+                .amend => "c/C Amend (edit message)  A Amend (keep message)",
+                .amend_reword => "c/C/A Amend (edit message)",
+                .replay => "c Commit replayed changes",
+            };
+            const amend = if (mode == .normal) "  C Amend (edit message)  A Amend view" else "";
+            const no_verify = switch (mode) {
+                .normal, .replay, .commit_only => "  w Commit (no-verify)",
+                .amend, .amend_reword => "",
+            };
+            const exit_amend = switch (mode) {
+                .amend, .amend_reword => "  esc exit amend view",
+                else => "",
+            };
+            inline for (.{ false, true }) |rebasing| {
+                if (c.rebasing == rebasing) {
+                    const rebase = if (rebasing) "m continue/abort  " else "";
+                    if (c.staging) break :blk rebase ++ "j/k line  J/K hunk  v range  space stage/unstage  d discard (@@=hunk)  [/] staged/unstaged  \\ split  | side-by-side  " ++ commit ++ amend ++ "  e edit  esc back" ++ global;
+                    if (c.focus == .staged) break :blk rebase ++ "space unstage  a unstage all  " ++ commit ++ amend ++ "  enter hunks  ` tree  ~ fold tree" ++ exit_amend ++ global;
+                    break :blk rebase ++ "space stage  a all  " ++ commit ++ amend ++ no_verify ++ "  e edit  d discard  i ignore/exclude  y copy  ^f fixup-base  s stash  / filter  ` tree  enter hunks  [/] tabs" ++ exit_amend ++ global;
+                }
+            }
+            unreachable;
+        },
+    };
+}
+
 /// Footer hints for the live app — projects `App` state onto `FooterCtx`.
-fn contextHints(app: *const app_mod.App) []const u8 {
+fn contextHints(app: *app_mod.App) []const u8 {
+    const rebasing = app.data.state == .rebasing;
+    const conflict = if (rebasing) app.conflictFileCount() != 0 else app.data.state != .clean;
+    const commit_mode: CommitHintMode = if (app.git.amend_view != null)
+        if (app.config.reword_on_amend) .amend_reword else .amend
+    else if (rebasing and !app.git.isRebaseEdit())
+        .replay
+    else if (!rebasing and conflict)
+        .commit_only
+    else
+        .normal;
     return footerHints(.{
         .focus = app.focus,
         .branches_tab = app.branches_tab,
@@ -5890,7 +5944,9 @@ fn contextHints(app: *const app_mod.App) []const u8 {
         .rebase_plan = app.mode == .rebase_plan,
         .branch_commits = app.branch_commits_active,
         .branch_files = app.branchFilesActive(),
-        .conflict = app.data.state != .clean,
+        .conflict = conflict,
+        .commit_mode = commit_mode,
+        .rebasing = rebasing,
         // `e` edits the file when the Diff panel shows a working-tree file.
         .main_file = app.focus == .main and !app.staging_active and
             app.contentFocus().isFilePanel() and app.selectedFile() != null,
@@ -6658,6 +6714,31 @@ test "every help-section keyword matches a real help header" {
             }
         }
         try std.testing.expect(found);
+    }
+}
+
+test "footer advertises the commit shortcuts for each amend and rebase state" {
+    const cases = [_]struct { ctx: FooterCtx, keys: []const u8 }{
+        .{ .ctx = .{ .focus = .files }, .keys = "c C A w" },
+        .{ .ctx = .{ .focus = .staged, .rebasing = true }, .keys = "m c C A" },
+        .{ .ctx = .{ .focus = .files, .commit_mode = .amend }, .keys = "c/C A" },
+        .{ .ctx = .{ .staging = true, .commit_mode = .amend_reword }, .keys = "c/C/A" },
+        .{ .ctx = .{ .focus = .staged, .rebasing = true, .commit_mode = .replay }, .keys = "m c" },
+        .{ .ctx = .{ .focus = .files, .rebasing = true, .conflict = true }, .keys = "m" },
+    };
+    for (cases) |case| {
+        const hints = footerHints(case.ctx);
+        var expected = std.mem.tokenizeScalar(u8, case.keys, ' ');
+        var groups = std.mem.tokenizeSequence(u8, hints, "  ");
+        while (groups.next()) |group| {
+            const key = std.mem.sliceTo(group, ' ');
+            if (key.len == 0 or (key.len > 1 and key[1] != '/')) continue;
+            if (std.mem.indexOfScalar(u8, "cCAwm", key[0]) == null) continue;
+            try std.testing.expectEqualStrings(expected.next() orelse "", key);
+            try std.testing.expect(group.len > key.len + 1);
+        }
+        try std.testing.expect(expected.next() == null);
+        if (case.ctx.rebasing and !case.ctx.conflict) try std.testing.expectStringStartsWith(hints, "m ");
     }
 }
 

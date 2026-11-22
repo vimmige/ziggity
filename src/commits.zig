@@ -246,7 +246,7 @@ pub fn amendLastCommit(app: *App) !void {
         app.focus = .staged;
         app.resetMainView();
         try app.updatePreview();
-        return app.setMessage("amend view: A to amend, c to edit message, esc to exit", .{});
+        return app.setMessage("amend view (esc to exit)", .{});
     }
     // With `reword_on_amend`, open the message editor prefilled with HEAD's
     // message so the amend can also reword in one step. Submitting the editor is
@@ -287,7 +287,7 @@ pub fn startAmendReword(app: *App) !void {
     app.commit_body_last_caret = std.math.maxInt(usize); // force the caret into view on open
     app.commit_sel_anchor = null;
     app.commit_mouse_selecting = false;
-    try app.setMessage("amend: edit the message", .{});
+    try app.setMessage("amend and edit message", .{});
 }
 
 /// "Paste and edit the message": open the message editor prefilled from the
