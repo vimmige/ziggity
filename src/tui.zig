@@ -1715,8 +1715,24 @@ fn diffTitleRef(ref: []const u8) []const u8 {
 }
 
 fn diffTitle(app: *app_mod.App) []const u8 {
+    const focus = app.contentFocus();
+    const title = if (app.diff_base != null) "Diff" else switch (focus) {
+        .status => "Status",
+        .files => switch (app.files_tab) {
+            .files => "Diff",
+            .worktrees => "Worktree",
+            .submodules => "Submodule",
+        },
+        .commits => if (app.commits_tab == .reflog) "Reflog Entry" else "Patch",
+        .branches => if (app.branch_commits_active) "Patch" else switch (app.branches_tab) {
+            .local => "Log",
+            .remotes => "Remote",
+            .tags => "Tag",
+        },
+        else => "Diff",
+    };
     var writer = std.Io.Writer.fixed(&app.main_title_buf);
-    writer.writeAll("Diff") catch unreachable;
+    writer.writeAll(title) catch unreachable;
     if (app.diff_base) |ref| {
         const base = diffTitleRef(ref);
         const target = if (diffmode_mod.selectedRefForDiff(app)) |t| diffTitleRef(t) else "selected";
@@ -1725,11 +1741,9 @@ fn diffTitle(app: *app_mod.App) []const u8 {
             if (app.diff_three_dot) "..." else "..",
             if (app.diff_reverse) base else target,
         }) catch {};
-    } else switch (app.contentFocus()) {
+    } else switch (focus) {
         .commits, .branches => {
-            if (app.contentFocus() == .branches and !app.branch_commits_active) {
-                return if (app.selectedBranchRefName() != null) "Log" else "Diff";
-            }
+            if (focus == .branches and !app.branch_commits_active) return title;
             if (app.commitRangeEndpoints()) |range| {
                 writer.print(" [{s}^..{s}]", .{ diffTitleRef(range.from), diffTitleRef(range.to) }) catch {};
             } else if (app.selectedCommit()) |commit| {
@@ -1737,12 +1751,12 @@ fn diffTitle(app: *app_mod.App) []const u8 {
             }
         },
         .files, .staged => {
-            if (app.contentFocus() == .files and app.files_tab != .files) return "Diff";
-            const source = if (app.contentFocus() == .staged) "Staged" else if (app.file_display_filter == .all) "Unstaged + Staged" else "Unstaged";
+            if (focus == .files and app.files_tab != .files) return title;
+            const source = if (focus == .staged) "Staged" else if (app.file_display_filter == .all) "Unstaged + Staged" else "Unstaged";
             const path = if (app.tree_view) blk: {
-                const row = app.fileTree().selectedRow() orelse return "Diff";
+                const row = app.fileTree().selectedRow() orelse return title;
                 break :blk if (row.path.len == 0) "." else row.path;
-            } else if (app.selectedFile()) |file| file.path else return "Diff";
+            } else if (app.selectedFile()) |file| file.path else return title;
             writer.print(" · {s} · {s}", .{ source, path }) catch {};
             if (app.focus == .main and app.selectedFile() != null) {
                 writer.writeAll(" (enter to stage)") catch {};
@@ -6558,6 +6572,29 @@ test "narrow review highlights the cursor without reversing the hunk header" {
         try std.testing.expectEqualStrings("-", narrow.readCell(1, 4).?.char.grapheme);
         try std.testing.expectEqual(vaxis.Color{ .index = ui_theme.selected_bg }, narrow.readCell(1, 4).?.style.bg);
         try std.testing.expect(!narrow.readCell(1, 2).?.style.reverse);
+    }
+}
+
+test "preview titles follow the active tab when the main pane is focused" {
+    var app: app_mod.App = .{ .allocator = std.testing.allocator, .git = undefined, .config = .{}, .focus = .main };
+    app.main_origin = .status;
+    try std.testing.expectEqualStrings("Status", diffTitle(&app));
+    app.main_origin = .files;
+    for ([_][]const u8{ "Diff", "Worktree", "Submodule" }, 0..) |title, i| {
+        app.files_tab = @fromBackingInt(@intCast(i));
+        try std.testing.expectEqualStrings(title, diffTitle(&app));
+    }
+    app.main_origin = .staged;
+    try std.testing.expectEqualStrings("Diff", diffTitle(&app));
+    app.main_origin = .commits;
+    for ([_][]const u8{ "Patch", "Reflog Entry", "Patch" }, 0..) |title, i| {
+        app.commits_tab = @fromBackingInt(@intCast(i));
+        try std.testing.expectEqualStrings(title, diffTitle(&app));
+    }
+    app.main_origin = .branches;
+    for ([_][]const u8{ "Log", "Remote", "Tag" }, 0..) |title, i| {
+        app.branches_tab = @fromBackingInt(@intCast(i));
+        try std.testing.expectEqualStrings(title, diffTitle(&app));
     }
 }
 
