@@ -1170,6 +1170,7 @@ const PreviewKind = union(enum) {
     dir: []const u8,
     staged_dir: []const u8,
     branch: []const u8,
+    tag: model.Tag,
     commit: []const u8,
     commit_file: struct { hash: []const u8, path: []const u8 },
     /// The diff a single commit introduced under a directory pathspec.
@@ -12781,6 +12782,10 @@ pub const App = struct {
                         return self.setCheapPreview(try std.fmt.allocPrint(self.allocator, "Remote: {s}\nURL:    {s}\n\nenter to view its branches.\n", .{ remote.name, remote.url }));
                     return self.setCheapPreview(try self.allocator.dupe(u8, "No remotes.\n"));
                 }
+                if (self.branches_tab == .tags) {
+                    if (self.selectedTag()) |tag| return self.requestGitPreview(.{ .tag = tag });
+                    return self.setCheapPreview(try self.allocator.dupe(u8, "No tags.\n"));
+                }
                 if (self.selectedBranchRefName()) |name| return self.requestGitPreview(.{ .branch = name });
                 return self.setCheapPreview(try self.allocator.dupe(u8, "Nothing to show in this tab.\n"));
             },
@@ -12884,6 +12889,7 @@ pub const App = struct {
             .dir => |p| std.fmt.allocPrint(gpa, "fd:{d}:{c}:{s}", .{ ctx, @as(u8, if (self.file_display_filter == .all) 'A' else 'U'), p }),
             .staged_dir => |p| std.fmt.allocPrint(gpa, "f:staged-dir:{d}:{s}", .{ ctx, p }),
             .branch => |name| std.fmt.allocPrint(gpa, "b:{s}", .{name}),
+            .tag => |tag| std.fmt.allocPrint(gpa, "tag:{s}:{s}", .{ tag.hash, tag.name }),
             .commit => |hash| std.fmt.allocPrint(gpa, "c:{d}:{s}", .{ ctx, hash }),
             .commit_file => |cf| std.fmt.allocPrint(gpa, "cf:{d}:{s}:{s}", .{ ctx, cf.hash, cf.path }),
             .commit_dir => |cd| std.fmt.allocPrint(gpa, "cd:{d}:{s}:{s}", .{ ctx, cd.hash, cd.path }),
@@ -12993,15 +12999,22 @@ pub const App = struct {
                     });
                 }
             },
-            .branch => |name| {
-                // Show the branch's commit graph in the main view
-                // (`git log --graph --color=always --decorate --date=relative
-                // --pretty=medium`, titled "Log"), not a terse oneline list.
-                // The renderer parses git's ANSI colors; a generous cap keeps
-                // the buffered preview bounded.
+            .branch, .tag => {
+                if (kind == .tag) {
+                    const tag = kind.tag;
+                    const format = "--format=%(if:equals=tag)%(objecttype)%(then)Annotated%(else)Lightweight%(end)" ++
+                        " tag: %(color:yellow)%(refname:strip=2)%(color:reset)%0a%0a" ++
+                        "%(if:equals=tag)%(objecttype)%(then)" ++
+                        "Tagger:      %(taggername) %(taggeremail)%0aTagged Date: %(taggerdate:default)%0a%0a" ++
+                        "%(contents)%0a%(end)-----";
+                    try sections.append(page_alloc, .{
+                        .argv = try dupArgv(&.{ "tag", "--list", "--color=always", "--points-at", tag.hash, format, "--", tag.name }),
+                    });
+                }
+                const ref = if (kind == .tag) kind.tag.hash else kind.branch;
                 empty_msg = "No commits.\n";
                 try sections.append(page_alloc, .{
-                    .argv = try dupArgv(&.{ "log", "--graph", "--color=always", "--abbrev-commit", "--decorate", "--date=relative", "--pretty=medium", "-300", name, "--" }),
+                    .argv = try dupArgv(&.{ "log", "--graph", "--color=always", "--abbrev-commit", "--decorate", "--date=relative", "--pretty=medium", "-300", ref, "--" }),
                 });
             },
             .commit => |hash| {
@@ -20079,6 +20092,54 @@ test "merge commit's per-file preview shows the brought-in file (issue #22 follo
     try std.testing.expect(std.mem.indexOf(u8, out, "new file") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "feat.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "No changes for this file") == null);
+}
+
+test "tag previews show a header above the log for annotated and lightweight tags" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [160]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try testGitEnv(&env, path);
+    try testRunSetup(a, io, &env, path,
+        \\set -e
+        \\git init -q -b main
+        \\git config user.email t@t
+        \\git config user.name Tester
+        \\git commit -qm 'First commit' --allow-empty
+        \\GIT_COMMITTER_DATE="2026-11-21T15:50:43+0100" git tag -am 'Release notes' annotated
+        \\git tag lightweight
+    );
+
+    var app = try testApp(a, &.{});
+    defer deinitTestApp(&app);
+    app.git = try git_mod.Git.initAt(a, io, &env, path);
+    defer app.git.deinit();
+    app.data.tags = try app.git.loadTags();
+    defer app.data.replaceTags(a, &.{});
+    app.focus = .branches;
+    app.branches_tab = .tags;
+    for (app.data.tags, 0..) |tag, i| {
+        app.tag_index = i;
+        try app.updatePreview();
+        const job = app.takePreviewJob().?;
+        defer job.deinit(page_alloc);
+        const out = try job.run(a, io, &env, path);
+        defer a.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "First commit") != null);
+        if (std.mem.eql(u8, tag.name, "annotated")) {
+            try std.testing.expect(std.mem.startsWith(u8, out, "Annotated tag: "));
+            try std.testing.expect(std.mem.indexOf(u8, out, "Tester <t@t>\nTagged Date: Sat Nov 21 15:50:43 2026 +0100\n\nRelease notes\n\n-----\n") != null);
+        } else {
+            const plain = try stripAnsiAll(a, out);
+            defer a.free(plain);
+            try std.testing.expect(std.mem.startsWith(u8, plain, "Lightweight tag: lightweight\n\n-----\n\n* "));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), app.data.tags.len);
 }
 
 test "completePreview frees the page-allocated job with the page allocator (issue #19)" {
