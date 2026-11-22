@@ -1985,13 +1985,14 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
             // Stack Unstaged above Staged.
             drawStagingSplit(root, app, side_w, 0, main_w, body_h);
         } else {
-            const scroll: ScrollInfo = .{ .len = app.mainContentLines(), .pos = app.main_scroll };
+            var scroll: ScrollInfo = .{ .len = app.mainContentLines(), .pos = app.main_scroll };
             // In the single-pane staging view, `[`/`]` switch the unstaged/staged
             // side, so show them as a highlighted tab strip.
             const wrap_tag: []const u8 = if (app.wrap_diff) "\u{21A9} wrap" else "";
             const title_shown = titleWithWrap(app, main_title, &main_title_wrap_buf);
             const main = if (app.staging_active and !app.staging_patch_mode) blk: {
                 const staging_tabs = [_][]const u8{ "Unstaged", "Staged" };
+                scroll.selection = stagingPosition(app);
                 break :blk tabbedPanel(root, side_w, 0, main_w, body_h, null, &staging_tabs, @as(usize, if (app.staging_staged_view) 1 else 0), wrap_tag, app.focus == .main, scroll);
             } else blk: {
                 const frame = panelBorder(root, side_w, 0, main_w, body_h, app.focus == .main, if (status_output) null else scroll);
@@ -3615,15 +3616,20 @@ fn drawDiscardConfirmPopup(root: vaxis.Window, app: *app_mod.App) void {
     print(win, win.height -| 1, 0, footer, st.bottom_accent);
 }
 
-/// Content size and scroll position for a panel's scrollbar. `len` is the total
-/// number of lines/items, `pos` the index of the first visible one.
-const ScrollInfo = struct { len: usize, pos: usize };
+const SelectionPosition = struct { current: usize, total: usize };
+
+/// Scrollbar rows and optional selection in the underlying content.
+const ScrollInfo = struct { len: usize = 0, pos: usize = 0, selection: ?SelectionPosition = null };
 
 const scrollbar_glyph = "▐"; // U+2590, drawn on the right border
 
-/// Scrollbar info for a list panel: total items and the current view offset.
 fn listScrollInfo(app: *const app_mod.App, focus: model.Focus) ScrollInfo {
-    return .{ .len = app.activeListLen(focus), .pos = app.listScroll(focus) };
+    const len = app.activeListLen(focus);
+    return .{
+        .len = len,
+        .pos = app.listScroll(focus),
+        .selection = .{ .current = if (len > 0) app.activeListSelected(focus) +| 1 else 0, .total = len },
+    };
 }
 
 /// `title` is drawn via `printSegment`, which keeps a reference to the bytes
@@ -3671,7 +3677,16 @@ fn panelBorder(root: vaxis.Window, x: u16, y: u16, w: u16, h: u16, focused: bool
             .glyphs = .single_rounded,
         },
     });
-    if (scroll) |s| drawScrollbar(raw, s.len, s.pos, focused);
+    if (scroll) |s| {
+        drawScrollbar(raw, s.len, s.pos, focused);
+        if (s.selection) |sel| {
+            var buf: [48]u8 = undefined;
+            const label = std.fmt.bufPrint(&buf, "{d} of {d}", .{ @min(sel.current, sel.total), sel.total }) catch unreachable;
+            if (label.len + 2 <= w) {
+                _ = printSpan(raw, h - 1, w - 1 - @as(u16, @intCast(label.len)), label, border_style);
+            }
+        }
+    }
     return .{ .raw = raw, .inner = inner };
 }
 
@@ -5501,6 +5516,17 @@ fn drawStagingPane(frame: vaxis.Window, app: *const app_mod.App, text: []const u
     }
 }
 
+fn stagingPosition(app: *const app_mod.App) SelectionPosition {
+    if (app.staging_line_mode) {
+        const text = app.staging_diff;
+        const indexed = app_mod.lineOffsets(app.allocator, text).len;
+        return .{ .current = app.staging_cursor + 1, .total = if (indexed > 0) indexed else app_mod.diffLineCount(text) };
+    }
+    const total = if (app.staging) |parsed| parsed.hunks.len else 0;
+    const index = staging_mod.stagingHunkAt(app, app.staging_cursor);
+    return .{ .current = if (index) |i| i + 1 else 0, .total = total };
+}
+
 /// Split staging view: Unstaged above Staged, with the
 /// active side bordered as focused. The active side is `app.staging_diff`; the
 /// other is the read-only `app.staging_other_diff`.
@@ -5518,8 +5544,9 @@ fn drawStagingSplit(root: vaxis.Window, app: *app_mod.App, x: u16, y: u16, w: u1
             return app_mod.wrapRowsFor(a.allocator, text, stagingContentWidth(a, panel_w -| 2)).len;
         }
     }.f;
-    const top = panel(root, x, y, w, top_h, titleWithWrap(app, "Unstaged", &main_title_wrap_buf), focused and unstaged_active, null);
-    const bottom = panel(root, x, y + top_h, w, h - top_h, titleWithWrap(app, "Staged", &split_title_buf), focused and !unstaged_active, null);
+    const selection: ScrollInfo = .{ .selection = stagingPosition(app) };
+    const top = panel(root, x, y, w, top_h, titleWithWrap(app, "Unstaged", &main_title_wrap_buf), focused and unstaged_active, if (unstaged_active) selection else null);
+    const bottom = panel(root, x, y + top_h, w, h - top_h, titleWithWrap(app, "Staged", &split_title_buf), focused and !unstaged_active, if (unstaged_active) null else selection);
     const active = if (unstaged_active) top else bottom;
     const width = stagingContentWidth(app, active.width);
     const resized = active.height < app.main_view_height or (app.wrap_diff and width != app.main_view_width);
@@ -6686,6 +6713,9 @@ test "stacked staging keeps the hunk border in both selection modes" {
     drawStagingSplit(root, &app, 0, 0, root.width, root.height);
     try std.testing.expectEqualStrings("U", root.readCell(2, 0).?.char.grapheme);
     try std.testing.expectEqualStrings("S", root.readCell(2, 10).?.char.grapheme);
+    for ("1 of 2", 53..) |byte, col| {
+        try std.testing.expectEqualStrings(&.{byte}, root.readCell(@intCast(col), 9).?.char.grapheme);
+    }
     try std.testing.expect(app.paneRectFor(.other).?.contains(2, 11));
     try std.testing.expectEqualStrings("╭", root.readCell(1, 2).?.char.grapheme);
     try std.testing.expectEqual(vaxis.Color{ .index = 12 }, root.readCell(1, 2).?.style.fg);
@@ -6712,8 +6742,18 @@ test "stacked staging keeps the hunk border in both selection modes" {
     try std.testing.expectEqualStrings("@", root.readCell(2, 7).?.char.grapheme);
     try std.testing.expectEqual(@as(usize, 6), app.firstVisualRowOfLine(4));
     try std.testing.expectEqual(@as(usize, 9), app.mainVisualRows());
+    for ("3 of 7", 53..) |byte, col| {
+        try std.testing.expectEqualStrings(&.{byte}, root.readCell(@intCast(col), 9).?.char.grapheme);
+    }
     _ = try app.handleMouse(.{ .type = .press, .button = .left, .col = 2, .row = 7, .mods = .{} });
     try std.testing.expectEqual(@as(usize, 4), app.diff_sel_anchor_line);
+
+    app.staging_staged_view = true;
+    drawStagingSplit(root, &app, 0, 0, root.width, root.height);
+    try std.testing.expectEqualStrings("─", root.readCell(53, 9).?.char.grapheme);
+    for ("3 of 7", 53..) |byte, col| {
+        try std.testing.expectEqualStrings(&.{byte}, root.readCell(@intCast(col), 19).?.char.grapheme);
+    }
 }
 
 test "stacked staging reveals a selection visible in single view" {
@@ -7014,6 +7054,49 @@ test "footer hints have no key contradictions per stage" {
     // arm of the final switch is `unreachable` — exercised only via the
     // dedicated branches block above).
     try std.testing.expect(footerHints(.{ .focus = .main }).len > 0);
+}
+
+test "list border shows the selected row independently of the scroll offset" {
+    const allocator = std.testing.allocator;
+    var screen = try vaxis.Screen.init(allocator, .{ .cols = 20, .rows = 5, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(allocator);
+    const root: vaxis.Window = .{
+        .screen = &screen,
+        .width = screen.width,
+        .height = screen.height,
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+    };
+    var entries: [300]model.Commit = undefined;
+    var app: app_mod.App = .{
+        .allocator = allocator,
+        .git = undefined,
+        .config = .{},
+        .commits_tab = .reflog,
+        .reflog_index = 31,
+    };
+    app.data.reflog = &entries;
+    app.listView(.commits).?.scroll = 40;
+
+    const scroll = listScrollInfo(&app, .commits);
+    _ = tabbedPanel(root, 0, 0, 20, 3, 4, &.{ "Commits", "Reflog" }, 1, "", true, scroll);
+    for ("32 of 300", 10..) |byte, col| {
+        try std.testing.expectEqualStrings(&.{byte}, root.readCell(@intCast(col), 2).?.char.grapheme);
+    }
+    try std.testing.expectEqualStrings("╯", root.readCell(19, 2).?.char.grapheme);
+
+    _ = panel(root, 0, 0, 20, 3, "Reflog", false, scroll);
+    try std.testing.expectEqualStrings("3", root.readCell(10, 2).?.char.grapheme);
+    _ = panel(root, 0, 0, 20, 2, "Reflog", true, scroll);
+    try std.testing.expectEqualStrings("─", root.readCell(18, 1).?.char.grapheme);
+    _ = panel(root, 0, 0, 9, 3, "Reflog", true, scroll);
+    try std.testing.expectEqualStrings("─", root.readCell(7, 2).?.char.grapheme);
+    _ = panel(root, 0, 0, 20, 3, "Stash", false, listScrollInfo(&app, .stash));
+    for ("0 of 0", 13..) |byte, col| {
+        try std.testing.expectEqualStrings(&.{byte}, root.readCell(@intCast(col), 2).?.char.grapheme);
+    }
 }
 
 test "scrollbar thumb sizes and positions to the content" {

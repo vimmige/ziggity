@@ -6282,7 +6282,7 @@ pub const App = struct {
     }
 
     /// Selected item index in the panel's currently-shown list (tab/mode aware).
-    fn activeListSelected(self: *const App, focus: model.Focus) usize {
+    pub fn activeListSelected(self: *const App, focus: model.Focus) usize {
         // In the interactive-rebase editor the cursor is the plan index.
         if (self.mode == .rebase_plan and focus == .commits) return self.rebase_plan_index;
         return switch (focus) {
