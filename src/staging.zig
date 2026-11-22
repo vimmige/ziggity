@@ -371,9 +371,12 @@ pub fn applyStagingSelection(app: *App) !void {
     };
     defer app.allocator.free(patch);
 
-    var result = try app.git.applyPatch(patch, app.staging_staged_view);
+    const action = if (app.staging_staged_view)
+        (if (whole_hunk) "Unstage hunk" else "Unstage selection")
+    else
+        (if (whole_hunk) "Stage hunk" else "Stage selection");
+    var result = try app.git.applyPatch(patch, app.staging_staged_view, action);
     defer result.deinit(app.allocator);
-    app.captureCommandOutput("git apply", result);
     if (!result.ok()) {
         const stderr = std.mem.trim(u8, result.stderr, " \t\r\n");
         try app.setMessage("apply failed: {s}", .{if (stderr.len > 0) stderr else "git apply error"});
@@ -459,7 +462,6 @@ pub fn discardStagingSelection(app: *App) !void {
     else
         try app.git.discardStagingPatch(patch, app.staging_staged_view);
     defer result.deinit(app.allocator);
-    app.captureCommandOutput("git apply", result);
     if (!result.ok()) {
         const stderr = std.mem.trim(u8, result.stderr, " \t\r\n");
         try app.setMessage("discard failed: {s}", .{if (stderr.len > 0) stderr else "git apply error"});

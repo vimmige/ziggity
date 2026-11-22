@@ -97,7 +97,7 @@ pub const ExecBatch = struct {
     }
 };
 
-fn formatCommand(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+pub fn formatCommand(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
     if (argv.len == 0) return &.{};
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(allocator);
@@ -244,6 +244,17 @@ pub fn runWithLockRetry(allocator: std.mem.Allocator, io: std.Io, options: std.p
     }
 }
 
+pub const CommandLogEntry = struct {
+    text: []u8,
+    command_start: usize,
+    command_end: usize,
+    output_start: usize,
+
+    pub fn command(self: CommandLogEntry) []const u8 {
+        return self.text[self.command_start..self.command_end];
+    }
+};
+
 pub const Git = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -252,8 +263,8 @@ pub const Git = struct {
     /// Absolute path to the git directory (`.git`), for storing side files like
     /// the pending-commit draft. Empty on throwaway worker `Git`s that don't need it.
     git_dir: []u8 = &.{},
-    /// Ring of recently-run mutating commands, for the command-log view.
-    command_log: std.ArrayList([]u8) = .empty,
+    /// User commands and their captured output, kept for the session.
+    command_log: std.ArrayList(CommandLogEntry) = .empty,
     // Active filters for the Commits list, applied on every load. Owned.
     log_grep: ?[]u8 = null,
     log_author: ?[]u8 = null,
@@ -317,8 +328,6 @@ pub const Git = struct {
         }
     };
 
-    const command_log_cap = 200;
-
     pub fn init(allocator: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map) !Git {
         return initAt(allocator, io, environ, ".");
     }
@@ -381,8 +390,7 @@ pub const Git = struct {
     pub fn deinit(self: *Git) void {
         self.allocator.free(self.root);
         self.allocator.free(self.git_dir);
-        for (self.command_log.items) |entry| self.allocator.free(entry);
-        self.command_log.deinit(self.allocator);
+        self.clearCommandLog();
         self.clearLogFilters();
         self.* = undefined;
     }
@@ -418,10 +426,14 @@ pub const Git = struct {
     /// kept out of the command log so the auto-refresh does not flood it.
     fn isReadOnly(args: []const []const u8) bool {
         if (args.len == 0) return true;
-        const reads = [_][]const u8{ "status", "diff", "diff-tree", "log", "show", "rev-parse", "rev-list", "for-each-ref", "ls-files", "reflog", "cat-file" };
+        const reads = [_][]const u8{ "status", "diff", "diff-tree", "log", "show", "rev-parse", "rev-list", "for-each-ref", "ls-files", "reflog", "cat-file", "blame", "show-ref", "symbolic-ref", "merge-base", "commit-graph", "var" };
         for (reads) |r| if (std.mem.eql(u8, args[0], r)) return true;
         if (args.len >= 2) {
             const second = args[1];
+            if (std.mem.eql(u8, args[0], "remote") and (std.mem.eql(u8, second, "-v") or std.mem.eql(u8, second, "get-url"))) return true;
+            if (std.mem.eql(u8, args[0], "worktree") and std.mem.eql(u8, second, "list")) return true;
+            if (std.mem.eql(u8, args[0], "submodule") and std.mem.eql(u8, second, "status")) return true;
+            if (std.mem.eql(u8, args[0], "config") and std.mem.eql(u8, second, "--get")) return true;
             const long_flag = std.mem.startsWith(u8, second, "--") and second.len > 2;
             if (std.mem.eql(u8, args[0], "branch") and long_flag and
                 !std.mem.startsWith(u8, second, "--set-upstream-to=")) return true;
@@ -431,55 +443,171 @@ pub const Git = struct {
         return false;
     }
 
-    /// Record a command run outside `exec` (e.g. an async network op) in the log.
-    pub fn recordExternal(self: *Git, args: []const []const u8) void {
-        self.recordCommand(args);
+    pub fn clearCommandLog(self: *Git) void {
+        for (self.command_log.items) |entry| self.allocator.free(entry.text);
+        self.command_log.deinit(self.allocator);
+        self.command_log = .empty;
     }
 
-    /// Append a verbatim command line to the log (e.g. a slow mutation run on a
-    /// worker, whose own Git's log is discarded). Cap-aware, best-effort.
-    pub fn recordRaw(self: *Git, line: []const u8) void {
-        const entry = self.allocator.dupe(u8, line) catch return;
-        if (self.command_log.items.len >= command_log_cap) {
-            self.allocator.free(self.command_log.orderedRemove(0));
+    pub fn appendCommandLog(self: *Git, entries: []const CommandLogEntry) void {
+        self.command_log.ensureUnusedCapacity(self.allocator, entries.len) catch return;
+        for (entries) |entry| {
+            var copy = entry;
+            copy.text = self.allocator.dupe(u8, entry.text) catch return;
+            self.command_log.appendAssumeCapacity(copy);
         }
-        self.command_log.append(self.allocator, entry) catch self.allocator.free(entry);
     }
 
-    fn recordCommand(self: *Git, args: []const []const u8) void {
-        const command = if (hasLiteralPathspecs(args)) args[1..] else args;
-        if (isReadOnly(command)) return;
-        var buf: std.Io.Writer.Allocating = .init(self.allocator);
-        defer buf.deinit();
-        buf.writer.writeAll("git") catch return;
-        for (args) |arg| {
-            buf.writer.writeByte(' ') catch return;
-            buf.writer.writeAll(arg) catch return;
+    pub fn recordCommandResult(self: *Git, action: []const u8, fallback: []const u8, shell: bool, result: ExecResult) void {
+        const command = if (std.mem.startsWith(u8, result.command, "$ ")) result.command[2..] else if (result.command.len > 0) result.command else fallback;
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        out.writer.print("{s}\n  {s}\n{s}", .{ action, command, if (shell) "Shell output" else "Git output" }) catch return;
+        switch (result.term) {
+            .exited => |code| out.writer.print("({d})", .{code}) catch return,
+            .signal => |signal| out.writer.print("(signal {d})", .{@backingInt(signal)}) catch return,
+            .stopped => out.writer.writeAll("(stopped)") catch return,
+            .unknown => out.writer.writeAll("(unknown)") catch return,
         }
-        const entry = buf.toOwnedSlice() catch return;
-        if (self.command_log.items.len >= command_log_cap) {
-            self.allocator.free(self.command_log.orderedRemove(0));
+        for ([_][]const u8{ result.prior_stdout, result.stdout, result.prior_stderr, result.stderr }) |stream| {
+            if (stream.len == 0) continue;
+            if (out.written()[out.written().len - 1] != '\n') out.writer.writeByte('\n') catch return;
+            out.writer.writeAll(stream) catch return;
         }
-        self.command_log.append(self.allocator, entry) catch self.allocator.free(entry);
+        const text = out.toOwnedSlice() catch return;
+        const start = action.len + 3;
+        self.command_log.append(self.allocator, .{
+            .text = text,
+            .command_start = start,
+            .command_end = start + command.len,
+            .output_start = start + command.len + 1,
+        }) catch self.allocator.free(text);
     }
 
-    /// Run an arbitrary shell command in the repository root (for user-defined
-    /// custom commands). Recorded in the command log.
+    pub fn recordCommandError(self: *Git, action: []const u8, command: []const u8, shell: bool, err: anyerror) void {
+        self.recordCommandResult(action, command, shell, .{
+            .stdout = &.{},
+            .stderr = @constCast(@errorName(err)),
+            .term = .{ .unknown = 0 },
+        });
+    }
+
+    /// Run an arbitrary shell command in the repository root.
     pub fn runShell(self: *Git, command: []const u8) !ExecResult {
-        const entry = std.fmt.allocPrint(self.allocator, "$ {s}", .{command}) catch null;
-        if (entry) |e| {
-            if (self.command_log.items.len >= command_log_cap) {
-                self.allocator.free(self.command_log.orderedRemove(0));
-            }
-            self.command_log.append(self.allocator, e) catch self.allocator.free(e);
-        }
-        const result = try runWithLockRetry(self.allocator, self.io, .{
+        const result = std.process.run(self.allocator, self.io, .{
             .argv = &.{ "sh", "-c", command },
             .cwd = .{ .path = self.root },
-            .stdout_limit = .limited(16 * 1024 * 1024),
-            .stderr_limit = .limited(4 * 1024 * 1024),
+        }) catch |err| {
+            self.recordCommandError("Shell Command", command, true, err);
+            return err;
+        };
+        const completed = ExecResult.fromRun(self.allocator, result, &.{});
+        self.recordCommandResult("Shell Command", command, true, completed);
+        return completed;
+    }
+
+    fn logArgs(args: []const []const u8) []const []const u8 {
+        var rest = args;
+        while (rest.len > 0) {
+            if (hasLiteralPathspecs(rest)) {
+                rest = rest[1..];
+            } else if (rest.len >= 2 and std.mem.eql(u8, rest[0], "-c")) {
+                rest = rest[2..];
+            } else break;
+        }
+        return rest;
+    }
+
+    pub fn gitAction(args: []const []const u8) []const u8 {
+        const verb = args[0];
+        const next = if (args.len > 1) args[1] else "";
+        if (std.mem.eql(u8, verb, "add")) {
+            if (std.mem.eql(u8, next, "-A")) return "Stage all";
+            return if (args.len > 3) "Stage files" else "Stage file";
+        }
+        if (std.mem.eql(u8, verb, "reset")) {
+            if (next.len == 0) return "Unstage all";
+            const split: usize = if (std.mem.eql(u8, next, "--")) 1 else 2;
+            if (!std.mem.startsWith(u8, next, "-") or split == 1) {
+                if (args.len > split + 1 and std.mem.eql(u8, args[split], "--")) {
+                    if (args.len == split + 2 and std.mem.eql(u8, args[split + 1], ".")) return "Unstage all";
+                    return if (args.len == split + 2) "Unstage file" else "Unstage files";
+                }
+            }
+        }
+        if (std.mem.eql(u8, verb, "commit") and std.mem.eql(u8, next, "--amend")) return "Amend commit";
+        if (std.mem.eql(u8, verb, "checkout") and std.mem.eql(u8, next, "-b")) return "Create branch";
+        if (std.mem.eql(u8, verb, "stash")) {
+            const stash_labels = std.StaticStringMap([]const u8).initComptime(.{
+                .{ "apply", "Apply stash" }, .{ "drop", "Drop stash" }, .{ "pop", "Pop stash" },
+                .{ "push", "Create stash" }, .{ "show", "Show stash" }, .{ "store", "Store stash" },
+            });
+            if (stash_labels.get(next)) |label| return label;
+        }
+        if (std.mem.eql(u8, verb, "branch")) {
+            if (std.mem.eql(u8, next, "-d") or std.mem.eql(u8, next, "-D")) return "Delete branch";
+            if (std.mem.eql(u8, next, "-m")) return "Rename branch";
+            if (std.mem.eql(u8, next, "-f")) return "Move branch";
+            if (std.mem.startsWith(u8, next, "--set-upstream-to")) return "Set upstream";
+            return "Create branch";
+        }
+        if (std.mem.eql(u8, verb, "tag")) return if (std.mem.eql(u8, next, "-d")) "Delete tag" else "Create tag";
+        if (std.mem.eql(u8, verb, "remote")) {
+            const remote_labels = std.StaticStringMap([]const u8).initComptime(.{
+                .{ "add", "Add remote" },       .{ "prune", "Prune remote" },        .{ "remove", "Remove remote" },
+                .{ "rename", "Rename remote" }, .{ "set-url", "Change remote URL" },
+            });
+            if (remote_labels.get(next)) |label| return label;
+        }
+        if (std.mem.eql(u8, verb, "worktree")) {
+            if (std.mem.eql(u8, next, "add")) return "Add worktree";
+            if (std.mem.eql(u8, next, "remove")) return "Remove worktree";
+        }
+        if (std.mem.eql(u8, verb, "submodule")) {
+            const submodule_labels = std.StaticStringMap([]const u8).initComptime(.{
+                .{ "add", "Add submodule" },         .{ "deinit", "Deinitialize submodule" },
+                .{ "init", "Initialize submodule" }, .{ "set-url", "Change submodule URL" },
+                .{ "sync", "Sync submodule" },       .{ "update", "Update submodule" },
+            });
+            if (submodule_labels.get(next)) |label| return label;
+        }
+        const labels = std.StaticStringMap([]const u8).initComptime(.{
+            .{ "apply", "Apply patch" },           .{ "bisect", "Bisect" },
+            .{ "checkout", "Checkout" },           .{ "cherry-pick", "Cherry-pick" },
+            .{ "clean", "Clean files" },           .{ "commit", "Commit" },
+            .{ "fetch", "Fetch" },                 .{ "merge", "Merge" },
+            .{ "pull", "Pull" },                   .{ "push", "Push" },
+            .{ "rebase", "Rebase" },               .{ "remote", "Remote" },
+            .{ "reset", "Reset" },                 .{ "restore", "Restore files" },
+            .{ "revert", "Revert commit" },        .{ "rm", "Remove files" },
+            .{ "stash", "Stash" },                 .{ "submodule", "Submodule" },
+            .{ "verify-commit", "Verify commit" }, .{ "worktree", "Worktree" },
         });
-        return .{ .stdout = result.stdout, .stderr = result.stderr, .term = result.term };
+        return labels.get(verb) orelse "Git command";
+    }
+
+    fn runGit(self: *Git, run_options: std.process.RunOptions, args: []const []const u8, retry: bool, action: ?[]const u8) !ExecResult {
+        const logical = logArgs(args);
+        const label = action orelse if (isReadOnly(logical)) null else gitAction(logical);
+        var options = run_options;
+        if (label != null) {
+            options.stdout_limit = .unlimited;
+            options.stderr_limit = .unlimited;
+        }
+        const result = (if (retry)
+            runWithLockRetry(self.allocator, self.io, options)
+        else
+            std.process.run(self.allocator, self.io, options)) catch |err| {
+            if (label) |name| {
+                const command = formatCommand(self.allocator, options.argv) catch &.{};
+                defer self.allocator.free(command);
+                self.recordCommandError(name, if (command.len >= 2) command[2..] else "git", false, err);
+            }
+            return err;
+        };
+        const completed = ExecResult.fromRun(self.allocator, result, if (label != null) options.argv else &.{});
+        if (label) |name| self.recordCommandResult(name, "git", false, completed);
+        return completed;
     }
 
     fn hasLiteralPathspecs(args: []const []const u8) bool {
@@ -487,11 +615,10 @@ pub const Git = struct {
     }
 
     pub fn exec(self: *Git, args: []const []const u8) !ExecResult {
-        return self.execWithRetry(args, true);
+        return self.execWithRetry(args, true, null);
     }
 
-    fn execWithRetry(self: *Git, args: []const []const u8, retry: bool) !ExecResult {
-        self.recordCommand(args);
+    fn execWithRetry(self: *Git, args: []const []const u8, retry: bool, action: ?[]const u8) !ExecResult {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(self.allocator);
         try argv.append(self.allocator, "git");
@@ -503,7 +630,6 @@ pub const Git = struct {
         // spurious "unable to create '.git/index.lock': File exists". The flag is
         // honored even when the env var isn't (e.g. an fsmonitor daemon). It's a
         // no-op for write commands, which take the required index lock regardless.
-        // Recorded command log keeps the logical args only (see `recordCommand`).
         try argv.append(self.allocator, "--no-optional-locks");
         try argv.appendSlice(self.allocator, args);
 
@@ -517,12 +643,7 @@ pub const Git = struct {
             .stdout_limit = .limited(16 * 1024 * 1024),
             .stderr_limit = .limited(4 * 1024 * 1024),
         };
-        const result = try if (retry)
-            runWithLockRetry(self.allocator, self.io, options)
-        else
-            std.process.run(self.allocator, self.io, options);
-        const logical_args = if (hasLiteralPathspecs(args)) args[1..] else args;
-        return ExecResult.fromRun(self.allocator, result, if (isReadOnly(logical_args)) &.{} else argv.items);
+        return self.runGit(options, args, retry, action);
     }
 
     fn output(self: *Git, args: []const []const u8) ![]u8 {
@@ -578,13 +699,13 @@ pub const Git = struct {
     /// Apply a patch to the index. `reverse` unstages (used on the staged
     /// side). The patch is written to a temp file under the git dir since
     /// `std.process.run` cannot feed stdin.
-    pub fn applyPatch(self: *Git, patch: []const u8, reverse: bool) !ExecResult {
+    pub fn applyPatch(self: *Git, patch: []const u8, reverse: bool, action: []const u8) !ExecResult {
         const patch_path = try self.writeTempFile(patch);
         defer self.removeTempFile(patch_path);
         if (reverse) {
-            return self.exec(&.{ "apply", "--cached", "--reverse", "--whitespace=nowarn", "--", patch_path });
+            return self.execWithRetry(&.{ "apply", "--cached", "--reverse", "--whitespace=nowarn", "--", patch_path }, true, action);
         }
-        return self.exec(&.{ "apply", "--cached", "--whitespace=nowarn", "--", patch_path });
+        return self.execWithRetry(&.{ "apply", "--cached", "--whitespace=nowarn", "--", patch_path }, true, action);
     }
 
     fn writeTempFile(self: *Git, data: []const u8) ![]u8 {
@@ -636,9 +757,9 @@ pub const Git = struct {
         const p = try self.writeTempFile(patch);
         defer self.removeTempFile(p);
         if (staged) {
-            return self.exec(&.{ "apply", "--reverse", "--index", "--whitespace=nowarn", "--", p });
+            return self.execWithRetry(&.{ "apply", "--reverse", "--index", "--whitespace=nowarn", "--", p }, true, "Discard changes");
         }
-        return self.exec(&.{ "apply", "--reverse", "--whitespace=nowarn", "--", p });
+        return self.execWithRetry(&.{ "apply", "--reverse", "--whitespace=nowarn", "--", p }, true, "Discard changes");
     }
 
     /// Forward-apply a discard patch. Used for a partial line discard of a *new*
@@ -649,9 +770,9 @@ pub const Git = struct {
         const p = try self.writeTempFile(patch);
         defer self.removeTempFile(p);
         if (staged) {
-            return self.exec(&.{ "apply", "--index", "--whitespace=nowarn", "--", p });
+            return self.execWithRetry(&.{ "apply", "--index", "--whitespace=nowarn", "--", p }, true, "Discard changes");
         }
-        return self.exec(&.{ "apply", "--whitespace=nowarn", "--", p });
+        return self.execWithRetry(&.{ "apply", "--whitespace=nowarn", "--", p }, true, "Discard changes");
     }
 
     /// Remove a built patch's changes from its source commit: rebase with the
@@ -737,15 +858,13 @@ pub const Git = struct {
         }
 
         const argv = [_][]const u8{ "git", "-c", "rebase.missingCommitsCheck=error", "rebase", "-i", "--autostash", "--no-rebase-merges", base orelse "--root" };
-        self.recordCommand(argv[1..]);
-        const result = try std.process.run(self.allocator, self.io, .{
+        return self.runGit(.{
             .argv = &argv,
             .cwd = .{ .path = self.root },
             .environ_map = &env,
             .stdout_limit = .limited(16 * 1024 * 1024),
             .stderr_limit = .limited(4 * 1024 * 1024),
-        });
-        return ExecResult.fromRun(self.allocator, result, &argv);
+        }, argv[1..], false, null);
     }
 
     fn rebaseFailure(self: *Git, message: []const u8) !ExecResult {
@@ -1576,7 +1695,7 @@ pub const Git = struct {
     /// Run the configured AI command, feeding `prompt` on stdin and returning its
     /// stdout. The prompt is piped in from a temp file (`cat file | <command>`),
     /// which handles pipelines and avoids any stdin/stdout deadlock.
-    pub fn runAiCommand(self: *Git, command: []const u8, prompt: []const u8) !ExecResult {
+    pub fn runAiCommand(self: *Git, command: []const u8, prompt: []const u8, keep_output: bool) !ExecResult {
         const path = try self.writeTempFile(prompt);
         defer self.removeTempFile(path);
 
@@ -1587,13 +1706,16 @@ pub const Git = struct {
         try full.appendSlice(self.allocator, " | ");
         try full.appendSlice(self.allocator, command);
 
-        const result = try runWithLockRetry(self.allocator, self.io, .{
+        const result = std.process.run(self.allocator, self.io, .{
             .argv = &.{ "sh", "-c", full.items },
             .cwd = .{ .path = self.root },
             .environ_map = self.environ,
-            .stdout_limit = .limited(1 * 1024 * 1024),
-            .stderr_limit = .limited(256 * 1024),
-        });
+            .stdout_limit = if (keep_output) .unlimited else .limited(1024 * 1024),
+            .stderr_limit = if (keep_output) .unlimited else .limited(256 * 1024),
+        }) catch |err| {
+            if (!keep_output) return err;
+            return .{ .stdout = &.{}, .stderr = try self.allocator.dupe(u8, @errorName(err)), .term = .{ .unknown = 0 } };
+        };
         return .{
             .stdout = result.stdout,
             .stderr = result.stderr,
@@ -1909,20 +2031,13 @@ pub const Git = struct {
         // Seed an empty template for the hook to populate, mirroring git's flow.
         std.Io.Dir.writeFile(.cwd(), self.io, .{ .sub_path = msg_path, .data = "" }) catch return null;
 
-        var argv = [_][]const u8{ hook_path, msg_path };
-        const result = std.process.run(self.allocator, self.io, .{
-            .argv = &argv,
+        var result = self.runGit(.{
+            .argv = &.{ hook_path, msg_path },
             .cwd = .{ .path = self.root },
             .environ_map = self.environ,
-            .stdout_limit = .limited(1 << 20),
-            .stderr_limit = .limited(1 << 20),
-        }) catch return null;
-        self.allocator.free(result.stdout);
-        self.allocator.free(result.stderr);
-        switch (result.term) {
-            .exited => |code| if (code != 0) return null,
-            else => return null,
-        }
+        }, &.{}, false, "Prepare commit message") catch return null;
+        defer result.deinit(self.allocator);
+        if (!result.ok()) return null;
 
         const raw = std.Io.Dir.readFileAlloc(.cwd(), self.io, msg_path, self.allocator, .limited(1 << 20)) catch return null;
         defer self.allocator.free(raw);
@@ -2265,15 +2380,13 @@ pub const Git = struct {
         try env.put("GIT_SEQUENCE_EDITOR", "true");
         try env.put("GIT_EDITOR", "true");
         const argv = [_][]const u8{ "git", "rebase", "-i", "--autosquash", "--autostash", base };
-        self.recordCommand(argv[1..]);
-        const result = try runWithLockRetry(self.allocator, self.io, .{
+        return self.runGit(.{
             .argv = &argv,
             .cwd = .{ .path = self.root },
             .environ_map = &env,
             .stdout_limit = .limited(16 * 1024 * 1024),
             .stderr_limit = .limited(4 * 1024 * 1024),
-        });
-        return ExecResult.fromRun(self.allocator, result, &argv);
+        }, argv[1..], true, null);
     }
 
     /// Drop a merge commit: replay everything after it onto its first parent,
@@ -2288,15 +2401,13 @@ pub const Git = struct {
         try env.put("GIT_SEQUENCE_EDITOR", "true");
         try env.put("GIT_EDITOR", "true");
         const argv = [_][]const u8{ "git", "rebase", "--autostash", "--onto", first_parent, hash };
-        self.recordCommand(argv[1..]);
-        const result = try runWithLockRetry(self.allocator, self.io, .{
+        return self.runGit(.{
             .argv = &argv,
             .cwd = .{ .path = self.root },
             .environ_map = &env,
             .stdout_limit = .limited(16 * 1024 * 1024),
             .stderr_limit = .limited(4 * 1024 * 1024),
-        });
-        return ExecResult.fromRun(self.allocator, result, &argv);
+        }, argv[1..], true, null);
     }
 
     /// Cherry-pick several commits in one go (apply in the given order).
@@ -2452,7 +2563,7 @@ pub const Git = struct {
         if (!std.mem.eql(u8, &expected, &current.fingerprint)) return self.undoRefused("HEAD or reflog changed. Open undo again");
 
         // A retry after a lock failure would use an old safety check.
-        return self.execWithRetry(&.{ "reset", if (keep_changes) "--soft" else "--keep", "--no-recurse-submodules", pending.target, "--" }, false);
+        return self.execWithRetry(&.{ "reset", if (keep_changes) "--soft" else "--keep", "--no-recurse-submodules", pending.target, "--" }, false, "Undo");
     }
 
     /// True when undoing the operation described by reflog subject `s` must keep
@@ -3374,6 +3485,9 @@ test "command log filters read-only invocations" {
     try std.testing.expect(Git.isReadOnly(&.{ "branch", "--format=%x00" }));
     try std.testing.expect(Git.isReadOnly(&.{ "tag", "--sort=-creatordate" }));
     try std.testing.expect(Git.isReadOnly(&.{ "stash", "list" }));
+    try std.testing.expect(Git.isReadOnly(&.{ "remote", "-v" }));
+    try std.testing.expect(Git.isReadOnly(&.{ "worktree", "list", "--porcelain" }));
+    try std.testing.expect(Git.isReadOnly(&.{ "submodule", "status" }));
     // Mutations are logged.
     try std.testing.expect(!Git.isReadOnly(&.{ "commit", "-m", "x" }));
     try std.testing.expect(!Git.isReadOnly(&.{ "branch", "-d", "--", "feat" }));
@@ -3898,6 +4012,7 @@ test "discardStagingPatch reverse-applies to the working tree and to the index" 
     defer a.free(unstaged_diff);
     var d1 = try git.discardStagingPatch(unstaged_diff, false);
     defer d1.deinit(a);
+    try std.testing.expect(std.mem.startsWith(u8, git.command_log.items[git.command_log.items.len - 1].text, "Discard changes\n"));
     try std.testing.expect(d1.ok());
     var st1 = try git.exec(&.{ "status", "--porcelain=v1" });
     defer st1.deinit(a);
@@ -4118,6 +4233,12 @@ test "dropping multiple stashes retains the output of both drops" {
     try std.testing.expect(result.ok());
     try std.testing.expect(std.mem.startsWith(u8, result.prior_stdout, "Dropped stash@{1}"));
     try std.testing.expect(std.mem.indexOf(u8, result.prior_stdout, "Dropped stash@{0}") != null);
+    const entries = git.command_log.items;
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expect(std.mem.startsWith(u8, entries[0].text, "Drop stash\n"));
+    try std.testing.expect(std.mem.indexOf(u8, entries[0].text, "Dropped stash@{1}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entries[0].text, "Dropped stash@{0}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, entries[1].text, "Dropped stash@{0}") != null);
     var remaining = try git.exec(&.{ "stash", "list" });
     defer remaining.deinit(a);
     try std.testing.expect(remaining.ok());
@@ -4154,6 +4275,7 @@ test "prepareCommitMsg runs a guarded hook and seeds the branch ticket" {
         \\cat > .git/hooks/prepare-commit-msg <<'EOF'
         \\#!/bin/sh
         \\[ -z "$2" ] || exit 0
+        \\printf "prepare diagnostic\n" >&2
         \\ticket=$(git symbolic-ref --short HEAD | grep -oE '[A-Z]+-[0-9]+')
         \\printf '%s: %s' "$ticket" "$(cat "$1")" > "$1"
         \\EOF
@@ -4180,6 +4302,10 @@ test "prepareCommitMsg runs a guarded hook and seeds the branch ticket" {
     const seed = (try git.prepareCommitMsg()) orelse return error.HookProducedNoSeed;
     defer a.free(seed);
     try std.testing.expectEqualStrings("PROJ-42:", seed);
+    try std.testing.expectEqual(@as(usize, 1), git.command_log.items.len);
+    const text = git.command_log.items[0].text;
+    try std.testing.expect(std.mem.startsWith(u8, text, "Prepare commit message\n"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "\nGit output(0)\nprepare diagnostic\n") != null);
 }
 
 test "undoKeepsChanges: only commit/amend/initial reset --soft (keep changes)" {

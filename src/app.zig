@@ -182,6 +182,11 @@ pub const EditorRequest = struct {
 /// `keep` snapshots the changes into a stash but leaves the working tree as-is.
 pub const StashKind = enum { all, untracked, staged, unstaged, file, keep };
 
+/// Wall-clock milliseconds per donut animation frame. Matches the ticker's
+/// spinner cadence, so the rotation runs at the same speed as before but is now
+/// driven by elapsed time (see `App.advanceDonut`) instead of tick count.
+const donut_frame_ms: i96 = 80;
+
 pub const TextPromptKind = enum {
     shell,
     new_branch,
@@ -1546,8 +1551,7 @@ pub fn loadScopesAsync(gpa: std.mem.Allocator, io: std.Io, environ: *std.process
     wgit.log_author = @constCast(filters.author);
     wgit.log_path = @constCast(filters.path);
     defer {
-        for (wgit.command_log.items) |e| gpa.free(e);
-        wgit.command_log.deinit(gpa);
+        wgit.clearCommandLog();
     }
 
     // `loaded` tracks the views that actually loaded — a transient git error on
@@ -1715,15 +1719,10 @@ pub const Mutation = union(enum) {
         };
     }
 
-    /// Worker-thread entry point: run the mutation on a throwaway page-allocator
-    /// `Git`. The wgit's command log (mutations are recorded) is page-allocated
-    /// and freed here since the real app log is updated separately on request.
-    pub fn run(self: Mutation, gpa: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, root: []u8, git_dir: []const u8, amend_view: ?git_mod.Git.AmendView, checkout_head: *?[]u8) !git_mod.ExecResult {
-        var wgit = git_mod.Git{ .allocator = gpa, .io = io, .environ = environ, .root = root, .git_dir = @constCast(git_dir), .amend_view = amend_view };
-        defer {
-            for (wgit.command_log.items) |e| gpa.free(e);
-            wgit.command_log.deinit(gpa);
-        }
+    /// Run on the worker's Git so each command keeps its own result.
+    pub fn run(self: Mutation, wgit: *git_mod.Git, checkout_head: *?[]u8) !git_mod.ExecResult {
+        const gpa = wgit.allocator;
+        const amend_view = wgit.amend_view;
         try wgit.clearStaleAmendView();
         if (amend_view != null and wgit.amend_view == null) return git_mod.GitError.CommandFailed;
         return switch (self) {
@@ -3693,6 +3692,11 @@ pub const TreeState = struct {
     }
 };
 
+pub const CommandLogRow = struct {
+    entry: usize,
+    row: diffwrap.Row,
+};
+
 pub const App = struct {
     allocator: std.mem.Allocator,
     git: git_mod.Git,
@@ -3821,7 +3825,6 @@ pub const App = struct {
     /// Panel hit-boxes captured by the renderer for mouse handling.
     panel_rects: [7]PanelRect = undefined,
     panel_rect_count: usize = 0,
-    status_output_rect: ?PanelRect = null,
     // Scratch buffers for dynamically-formatted panel titles. vaxis stores each
     // cell's grapheme as a slice into the source text (it does not copy), and the
     // frame is flushed *after* the render function returns — so a title built in
@@ -4111,7 +4114,6 @@ pub const App = struct {
     op_command: []u8 = &.{},
     op_summary: []u8 = &.{},
     op_output: []u8 = &.{},
-    shell_output: []u8 = &.{},
     op_ok: bool = true,
     op_running: bool = false,
     op_scroll: usize = 0,
@@ -4266,7 +4268,12 @@ pub const App = struct {
     /// One-shot: on the first help render, scroll so `help_focus_header` is in
     /// view. Cleared by the renderer so the user can scroll freely afterward.
     help_scroll_to_focus: bool = false,
+    command_log_fullscreen: bool = false,
     command_log_scroll: usize = 0,
+    command_log_width: u16 = 0,
+    command_log_anchor: ?CommandLogRow = null,
+    command_log_laid_out: usize = 0,
+    command_log_rows: std.ArrayList(CommandLogRow) = .empty,
     command_log_max_scroll: usize = 0,
     undo_label_buf: [160]u8 = undefined,
     undo_label_len: usize = 0,
@@ -4436,6 +4443,20 @@ pub const App = struct {
     mutation_gerund: []const u8 = "working",
     busy_flag: std.atomic.Value(bool) = .init(false),
     spinner_frame: usize = 0,
+    // Drives the Status-panel "about" splash animation (the rotating donut).
+    // `anim_frame` is derived from accumulated *active* monotonic time (see
+    // `advanceDonut`), NOT the count of `.anim_tick` events — so a dropped or
+    // bursted tick can't make the donut stall or fast-forward, only skip a
+    // frame. Each tick adds the (capped) time since the previous tick to
+    // `anim_accum_ns`, so a long gap — lost focus, hidden splash, a blocked
+    // loop — resumes the spin where it left off instead of jumping. `animate_flag`
+    // tells the ticker thread to keep posting ticks while the splash is on
+    // screen and focused; `anim_last_ns` is the previous tick's monotonic
+    // instant (0 = not yet stamped).
+    anim_frame: usize = 0,
+    anim_last_ns: i96 = 0,
+    anim_accum_ns: i96 = 0,
+    animate_flag: std.atomic.Value(bool) = .init(false),
     // Persistent storage for the about-splash's selectable text lines: the
     // dialog-grid selection keeps row slices by reference and reads them on a
     // later mouse-release, so they can't be transient render-time buffers.
@@ -4460,8 +4481,15 @@ pub const App = struct {
         return pt.row == self.about_url_row and pt.col >= self.about_url_lo and pt.col < self.about_url_hi;
     }
 
-    pub fn showStatusOutput(self: *const App) bool {
+    pub fn showAboutSplash(self: *const App) bool {
         return self.contentFocus() == .status and !self.staging_active and self.diff_base == null;
+    }
+
+    /// Whether the ticker should keep animating: the splash is visible, we're at
+    /// the top level (no dialog), and the terminal has focus (no CPU spent
+    /// animating a hidden/backgrounded window).
+    pub fn wantsAnimation(self: *const App) bool {
+        return self.showAboutSplash() and self.mode == .normal and self.terminal_focused;
     }
 
     pub fn init(
@@ -4585,7 +4613,6 @@ pub const App = struct {
         self.allocator.free(self.op_command);
         self.allocator.free(self.op_summary);
         self.allocator.free(self.op_output);
-        self.allocator.free(self.shell_output);
         self.commit_buffer.deinit(self.allocator);
         self.commit_body_buffer.deinit(self.allocator);
         self.allocator.free(self.commit_preserved_subject);
@@ -4649,6 +4676,7 @@ pub const App = struct {
         if (self.reroot_request) |p| self.allocator.free(p);
         for (self.repo_stack.items) |p| self.allocator.free(p);
         self.repo_stack.deinit(self.allocator);
+        self.command_log_rows.deinit(self.allocator);
         self.git.deinit();
         self.* = undefined;
     }
@@ -5277,14 +5305,13 @@ pub const App = struct {
             return;
         }
         if (self.mode == .command_log) {
-            if (self.config.keymap.down.matches(key) or key.matches(vaxis.Key.down, .{})) {
-                // Saturating add: the scroll starts at maxInt ("open at bottom")
-                // and is only clamped at render, which the empty-log path skips.
-                self.command_log_scroll = @min(self.command_log_scroll +| 1, self.command_log_max_scroll);
+            if (self.config.keymap.toggle_fullscreen.matches(key)) {
+                self.command_log_fullscreen = !self.command_log_fullscreen;
                 self.clearDialogSelection();
+            } else if (self.config.keymap.down.matches(key) or key.matches(vaxis.Key.down, .{})) {
+                self.scrollCommandLog(true, 1);
             } else if (self.config.keymap.up.matches(key) or key.matches(vaxis.Key.up, .{})) {
-                self.command_log_scroll -|= 1;
-                self.clearDialogSelection();
+                self.scrollCommandLog(false, 1);
             } else if (self.isEnterKey(key) or self.isDialogCloseKey(key)) {
                 self.mode = .normal;
                 self.clearDialogSelection();
@@ -5736,8 +5763,10 @@ pub const App = struct {
             .toggle_tree => try self.toggleTreeView(),
             .command_log => {
                 self.mode = .command_log;
+                self.command_log_fullscreen = false;
                 // Open scrolled to the newest entries (clamped to max at render).
                 self.command_log_scroll = std.math.maxInt(usize);
+                self.command_log_anchor = null;
                 try self.setMessage("command log", .{});
             },
             .help => {
@@ -6080,8 +6109,8 @@ pub const App = struct {
 
         // The Status-panel "about" splash reuses the dialog-grid selection: drag
         // over its text lines to select, release to copy. Its rows are registered
-        // in `drawStatusOutput` only for the selectable header text.
-        if (self.showStatusOutput()) {
+        // in `drawAboutSplash` only for the selectable header text.
+        if (self.showAboutSplash()) {
             const c: u16 = if (mouse.col < 0) 0 else @intCast(mouse.col);
             const rw: u16 = if (mouse.row < 0) 0 else @intCast(mouse.row);
             switch (mouse.type) {
@@ -6442,7 +6471,7 @@ pub const App = struct {
     /// In the split staging view the main area is split into two rows;
     /// otherwise the whole main area is the `.main` pane and there is no `.other`.
     pub fn paneRectFor(self: *const App, pane: SelPane) ?PanelRect {
-        if (self.showStatusOutput()) return if (pane == .main) self.status_output_rect else null;
+        if (self.showAboutSplash()) return null;
         const m = self.mainRect() orelse return null;
         if (self.staging_active and self.staging_split) {
             const top_h = m.h / 2;
@@ -6458,7 +6487,6 @@ pub const App = struct {
 
     /// The text shown in a selectable pane.
     pub fn paneText(self: *const App, pane: SelPane) []const u8 {
-        if (pane == .main and self.showStatusOutput()) return self.shell_output;
         return switch (pane) {
             .main => if (self.staging_active) self.staging_diff else self.diff,
             .other => self.staging_other_diff,
@@ -6505,7 +6533,7 @@ pub const App = struct {
     /// to its source line and the segment's starting column. In truncate mode it
     /// is the direct `scroll + row` / `col + h_off` mapping.
     fn diffPointFor(self: *const App, pane: SelPane, r: PanelRect, col: u16, row: u16) DiffPoint {
-        const border: u16 = if (self.showStatusOutput()) 0 else 1;
+        const border: u16 = 1;
         const content_top = r.y + border;
         const gutter: u16 = if (self.staging_active and !self.staging_patch_mode and r.w >= 7) 1 else 0;
         const content_left = r.x + border + gutter;
@@ -6622,7 +6650,7 @@ pub const App = struct {
                 return true;
             },
             .command_log => {
-                self.command_log_scroll = if (down) @min(self.command_log_scroll +| lines, self.command_log_max_scroll) else self.command_log_scroll -| lines;
+                self.scrollCommandLog(down, lines);
                 return true;
             },
             .pr_preview => {
@@ -6661,6 +6689,89 @@ pub const App = struct {
         for (self.dialog_rows[0..self.dialog_row_count]) |*r| r.* = "";
     }
 
+    fn scrollCommandLog(self: *App, down: bool, lines: usize) void {
+        const scroll = if (down) @min(self.command_log_scroll +| lines, self.command_log_max_scroll) else self.command_log_scroll -| lines;
+        self.command_log_scroll = scroll;
+        self.command_log_anchor = if (scroll < self.command_log_max_scroll and scroll < self.command_log_rows.items.len)
+            self.command_log_rows.items[scroll]
+        else
+            null;
+        self.clearDialogSelection();
+    }
+
+    fn compareLogRows(a: CommandLogRow, b: CommandLogRow) std.math.Order {
+        return std.mem.order(usize, &.{ a.entry, a.row.start, a.row.vis_start }, &.{ b.entry, b.row.start, b.row.vis_start });
+    }
+
+    fn appendCommandRows(self: *App, entry: usize, text: []const u8, width: u16) !void {
+        const rows = &self.command_log_rows;
+        const original_len = rows.items.len;
+        errdefer rows.shrinkRetainingCapacity(original_len);
+        if (entry > 0) {
+            const end: u32 = @intCast(self.git.command_log.items[entry - 1].text.len);
+            try rows.append(self.allocator, .{
+                .entry = entry - 1,
+                .row = .{ .line = 0, .start = end, .end = end, .vis_start = 0, .vis_end = 0 },
+            });
+        }
+        var start: usize = 0;
+        while (start < text.len) {
+            // Keep each chunk below diffwrap's column limit, even for all tabs.
+            var end = @min(start + 12 * 1024, text.len);
+            if (end < text.len) {
+                if (std.mem.lastIndexOfScalar(u8, text[start..end], '\n')) |newline| {
+                    end = start + newline + 1;
+                } else {
+                    while ((text[end] & 0xc0) == 0x80 and end > start + 1) end -= 1;
+                }
+            }
+            const wrapped = try diffwrap.build(self.allocator, text[start..end], width, &cellStep);
+            defer self.allocator.free(wrapped);
+            try rows.ensureUnusedCapacity(self.allocator, wrapped.len);
+            for (wrapped) |part| {
+                var row = part;
+                row.start += @intCast(start);
+                row.end += @intCast(start);
+                rows.appendAssumeCapacity(.{ .entry = entry, .row = row });
+            }
+            start = end;
+        }
+    }
+
+    pub fn layoutCommandLog(self: *App, width: u16, height: u16) void {
+        const rows = &self.command_log_rows;
+        if (width != self.command_log_width) {
+            self.command_log_width = width;
+            self.command_log_laid_out = 0;
+            rows.clearRetainingCapacity();
+            self.clearDialogSelection();
+        }
+        const log = self.git.command_log.items;
+        while (self.command_log_laid_out < log.len) : (self.command_log_laid_out += 1) {
+            const idx = self.command_log_laid_out;
+            self.appendCommandRows(idx, log[idx].text, width) catch break;
+        }
+        self.command_log_max_scroll = rows.items.len -| height;
+        const scroll = if (self.command_log_anchor) |anchor|
+            @min(std.sort.upperBound(CommandLogRow, rows.items, anchor, compareLogRows) -| 1, self.command_log_max_scroll)
+        else
+            self.command_log_max_scroll;
+        if (scroll != self.command_log_scroll) self.clearDialogSelection();
+        self.command_log_scroll = scroll;
+    }
+
+    fn commandLogDialogRow(self: *const App, row: usize) ?CommandLogRow {
+        if (self.mode != .command_log) return null;
+        const i = self.command_log_scroll +| row;
+        if (i >= self.command_log_rows.items.len) return null;
+        return self.command_log_rows.items[i];
+    }
+
+    fn dialogRowWidth(self: *const App, row: usize, text: []const u8) usize {
+        if (self.commandLogDialogRow(row)) |r| return r.row.vis_end - r.row.vis_start;
+        return text.len;
+    }
+
     /// Record the text rendered on content row `idx` so it can be selected/copied.
     pub fn setDialogRow(self: *App, idx: usize, text: []const u8) void {
         if (idx < self.dialog_row_count) self.dialog_rows[idx] = text;
@@ -6690,7 +6801,8 @@ pub const App = struct {
         if (win_row < r.sr or win_row > r.er) return null;
         const text = if (win_row < self.dialog_row_count) self.dialog_rows[win_row] else "";
         const lo = if (win_row == r.sr) r.sc else 0;
-        const hi = if (win_row == r.er) @min(r.ec, text.len) else text.len;
+        const width = self.dialogRowWidth(win_row, text);
+        const hi = if (win_row == r.er) @min(r.ec, width) else width;
         return .{ .lo = @intCast(@min(lo, std.math.maxInt(u16))), .hi = @intCast(@min(hi, std.math.maxInt(u16))) };
     }
 
@@ -6701,11 +6813,10 @@ pub const App = struct {
         const wr: usize = row - self.dialog_origin_y;
         if (wr >= self.dialog_row_count) return null;
         const wc: usize = col - self.dialog_origin_x;
-        return .{ .row = wr, .col = @min(wc, self.dialog_rows[wr].len) };
+        return .{ .row = wr, .col = @min(wc, self.dialogRowWidth(wr, self.dialog_rows[wr])) };
     }
 
-    /// Copy the current dialog selection to the system clipboard, joining
-    /// rendered rows with newlines (partial on the first/last row).
+    /// Copy the selected text, keeping source line breaks in the command log.
     fn copyDialogSelection(self: *App) !void {
         const r = self.dialogSelRange();
         var buf: std.ArrayList(u8) = .empty;
@@ -6713,9 +6824,18 @@ pub const App = struct {
         var wr = r.sr;
         while (wr <= r.er and wr < self.dialog_row_count) : (wr += 1) {
             const text = self.dialog_rows[wr];
-            const lo = @min(if (wr == r.sr) r.sc else 0, text.len);
-            const hi = @min(if (wr == r.er) r.ec else text.len, text.len);
-            if (hi > lo) try buf.appendSlice(self.allocator, text[lo..hi]);
+            const width = self.dialogRowWidth(wr, text);
+            const lo = @min(if (wr == r.sr) r.sc else 0, width);
+            const hi = @min(if (wr == r.er) r.ec else width, width);
+            if (self.commandLogDialogRow(wr)) |item| {
+                const row = item.row;
+                try appendDiffColumns(&buf, self.allocator, text, row.vis_start + lo, row.vis_start + hi);
+                if (self.commandLogDialogRow(wr + 1)) |next| {
+                    const entry_end = self.git.command_log.items[item.entry].text.len;
+                    if (next.entry == item.entry and next.row.start < entry_end and
+                        (next.row.start == row.start or next.row.start == row.end)) continue;
+                }
+            } else if (hi > lo) try buf.appendSlice(self.allocator, text[lo..hi]);
             if (wr != r.er) try buf.append(self.allocator, '\n');
         }
         if (buf.items.len == 0) {
@@ -6850,6 +6970,21 @@ pub const App = struct {
             count += 1;
         }
         return null;
+    }
+
+    pub fn advanceDonut(self: *App, io: std.Io) void {
+        const now: i96 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+        defer self.anim_last_ns = now;
+        if (self.anim_last_ns == 0) return; // first tick: just stamp the clock
+        var delta = now - self.anim_last_ns;
+        if (delta <= 0) return;
+        // A gap longer than a few frame periods means we were paused (lost focus,
+        // splash hidden, loop blocked), not merely jittery — clamp it so the spin
+        // resumes rather than jumping ahead by the whole idle duration.
+        const max_step: i96 = donut_frame_ms * std.time.ns_per_ms * 3;
+        if (delta > max_step) delta = max_step;
+        self.anim_accum_ns += delta;
+        self.anim_frame = @intCast(@divFloor(self.anim_accum_ns, donut_frame_ms * std.time.ns_per_ms));
     }
 
     pub fn handleRefreshTick(self: *App) !void {
@@ -8099,7 +8234,6 @@ pub const App = struct {
         self.resetCommitAiState();
         a.free(self.diff);
         self.diff = a.dupe(u8, "") catch &.{};
-        self.replaceShellOutput(&.{});
 
         a.free(self.file_filter);
         self.file_filter = a.dupe(u8, "") catch &.{};
@@ -8162,6 +8296,8 @@ pub const App = struct {
         if (push) try self.repo_stack.append(self.allocator, try self.allocator.dupe(u8, self.git.root));
 
         self.resetRepoState();
+        new_git.command_log = self.git.command_log;
+        self.git.command_log = .empty;
         self.git.deinit();
         self.git = new_git;
 
@@ -8928,7 +9064,7 @@ pub const App = struct {
     fn openDiffReview(self: *App) !void {
         if (self.staging_patch_mode)
             return self.setMessage("finish the custom patch before a side-by-side review", .{});
-        if (self.showStatusOutput() or self.splitRows().rows.len == 0)
+        if (self.showAboutSplash() or self.splitRows().rows.len == 0)
             return self.setMessage("no diff here to review side by side", .{});
         self.review_saved_scroll = self.main_scroll;
         self.review_saved_hscroll = self.main_hscroll;
@@ -9254,7 +9390,7 @@ pub const App = struct {
         else
             try self.git.discardStagingPatch(patch, staged);
         defer result.deinit(self.allocator);
-        self.captureCommandOutput("git apply", result);
+
         if (!result.ok()) {
             const stderr = std.mem.trim(u8, result.stderr, " \t\r\n");
             return self.setMessage("discard failed: {s}", .{if (stderr.len > 0) stderr else "git apply error"});
@@ -9527,7 +9663,7 @@ pub const App = struct {
 
     pub fn diffCursorLine(self: *const App) ?usize {
         if ((self.mode != .normal and self.mode != .rebase_plan) or self.focus != .main or
-            self.staging_active or self.showStatusOutput() or self.diff.len == 0 or self.previewSpinnerVisible()) return null;
+            self.staging_active or self.showAboutSplash() or self.diff.len == 0 or self.previewSpinnerVisible()) return null;
 
         // Keep the highlight visible when the wheel or a resize moves the viewport.
         const top = self.topSourceLine();
@@ -11444,7 +11580,7 @@ pub const App = struct {
                 if (!std.mem.eql(u8, old, value)) {
                     var result = try self.git.renameRemote(old, value);
                     defer result.deinit(self.allocator);
-                    self.captureCommandOutput("git remote rename", result);
+
                     if (!result.ok()) {
                         self.cancelTextPrompt("rename failed (name in use?)");
                         return;
@@ -13352,7 +13488,6 @@ pub const App = struct {
             try self.setMessage("a network operation is already running", .{});
             return;
         }
-        self.git.recordExternal(op.argv());
         self.async_requested = op;
         self.async_op = op;
         try self.setMessage("{s}...", .{op.gerund()});
@@ -13406,17 +13541,18 @@ pub const App = struct {
     }
 
     /// Called on the UI thread when an async op finishes. `result` is owned by
-    /// `result_allocator` (the async path's allocator); null means the command
-    /// failed to even start.
-    pub fn completeAsync(self: *App, op: AsyncOp, result_opt: ?git_mod.ExecResult, result_allocator: std.mem.Allocator) !void {
+    /// `result_allocator` (the async path's allocator).
+    pub fn completeAsync(self: *App, op: AsyncOp, outcome: anyerror!git_mod.ExecResult, failed_command: []const u8, result_allocator: std.mem.Allocator) !void {
         self.async_active = false;
-        if (result_opt) |result| {
+        const args = std.mem.join(self.allocator, " ", op.argv()) catch &.{};
+        defer self.allocator.free(args);
+        var command_buf: [128]u8 = undefined;
+        const command = std.fmt.bufPrint(&command_buf, "git {s}", .{args}) catch "git";
+        const label = git_mod.Git.gitAction(op.argv());
+        if (outcome) |result| {
             var mutable = result;
             defer mutable.deinit(result_allocator);
-            const args = std.mem.join(self.allocator, " ", op.argv()) catch &.{};
-            defer self.allocator.free(args);
-            var command_buf: [128]u8 = undefined;
-            self.captureCommandOutput(std.fmt.bufPrint(&command_buf, "git {s}", .{args}) catch "git", result);
+            self.git.recordCommandResult(label, command, false, result);
             if (mutable.ok()) {
                 // Network success stays silent (bottom bar).
                 try self.setMessage("{s} complete", .{op.label()});
@@ -13477,8 +13613,9 @@ pub const App = struct {
                     _ = try self.reportFailureOrLock(summary, raw, .{ .async_op = op });
                 }
             }
-        } else {
-            try self.setMessage("{s} failed to start", .{op.label()});
+        } else |err| {
+            self.git.recordCommandError(label, if (failed_command.len > 0) failed_command else command, false, err);
+            try self.setMessage("{s} failed: {s}", .{ op.label(), @errorName(err) });
         }
         // Refresh every view (matching what a fetch/pull/push can change — e.g. a
         // fetch may bring new tags). This is now non-blocking: the working tree
@@ -13504,13 +13641,13 @@ pub const App = struct {
         try self.beginOpFmt("git verify-commit {s}", .{commit.short_hash});
         var result = try self.git.verifyCommit(commit.hash);
         defer result.deinit(self.allocator);
-        self.captureCommandOutput(self.op_command, result);
+
         // gpg writes the verification to stderr; fall back to stdout if empty.
         const out = if (result.stderr.len > 0) result.stderr else result.stdout;
         if (result.ok()) {
-            try self.finishOp(true, "signature verified", out);
+            try self.finishOp(true, "signature verified", out, null);
         } else {
-            try self.finishOp(false, "signature check failed", out);
+            try self.finishOp(false, "signature check failed", out, null);
         }
     }
 
@@ -13536,13 +13673,15 @@ pub const App = struct {
     /// outcome; `raw` is the command's stdout/stderr (trimmed for display).
     /// Used for failures (always) and for successes only when
     /// `result_dialog = always`.
-    fn finishOp(self: *App, ok: bool, summary: []const u8, raw: []const u8) !void {
+    fn finishOp(self: *App, ok: bool, summary: []const u8, raw: []const u8, command: ?[]const u8) !void {
         // A slow op set op_command via beginOp; a fast op recovers the command
         // it just ran from the log so the dialog shows what executed.
-        if (!self.op_running) {
-            self.allocator.free(self.op_command);
+        if (command != null or !self.op_running) {
             const log = self.git.command_log.items;
-            self.op_command = try self.allocator.dupe(u8, if (log.len > 0) log[log.len - 1] else "");
+            const shown = command orelse if (log.len > 0) log[log.len - 1].command() else "";
+            const copy = try self.allocator.dupe(u8, shown);
+            self.allocator.free(self.op_command);
+            self.op_command = copy;
         }
         self.allocator.free(self.op_summary);
         self.op_summary = try self.allocator.dupe(u8, summary);
@@ -13572,7 +13711,7 @@ pub const App = struct {
     /// command's stdout, shown only in the dialog.
     fn reportSuccess(self: *App, summary: []const u8, raw: []const u8) !void {
         if (self.config.result_dialog == .always) {
-            try self.finishOp(true, summary, raw);
+            try self.finishOp(true, summary, raw, null);
             return;
         }
         self.dismissOpFrame();
@@ -13589,7 +13728,7 @@ pub const App = struct {
             try self.setMessage("{s}", .{if (line.len > 0) line else summary});
             return;
         }
-        try self.finishOp(false, summary, raw);
+        try self.finishOp(false, summary, raw, null);
     }
 
     /// Report a failed op, but if it failed on a leftover git lock (one that
@@ -13746,7 +13885,7 @@ pub const App = struct {
     pub fn runMutationScoped(self: *App, result: git_mod.ExecResult, scopes: ScopeSet, comptime success_fmt: []const u8, args: anytype) !void {
         var mutable = result;
         defer mutable.deinit(self.allocator);
-        if (result.command.len > 0) self.captureCommandOutput("", result);
+
         if (mutable.ok()) {
             const summary = try std.fmt.allocPrint(self.allocator, success_fmt, args);
             defer self.allocator.free(summary);
@@ -13784,9 +13923,7 @@ pub const App = struct {
     };
 
     /// Queue a slow mutation for the TUI loop to run off-thread. Refused if a
-    /// foreground op is already in flight. `command` (if any) is recorded in the
-    /// command log now, since the worker's log is discarded. On completion the
-    /// result is surfaced via reportSuccess/reportFailure + refresh.
+    /// foreground op is already in flight. The worker log is collected when it finishes.
     pub fn requestMutation(self: *App, mutation: Mutation, meta: MutationMeta, comptime success_fmt: []const u8, args: anytype) !void {
         if (self.foregroundBusy()) {
             try self.setMessage("operation in progress...", .{});
@@ -13799,7 +13936,6 @@ pub const App = struct {
         const command = try page_alloc.dupe(u8, if (meta.command.len > 0) meta.command else "git");
         errdefer page_alloc.free(command);
         try self.setMessage("{s}...", .{meta.gerund});
-        if (meta.command.len > 0) self.git.recordRaw(meta.command);
 
         if (self.mutation_requested) |old| old.deinit(page_alloc);
         page_alloc.free(self.mutation_msg);
@@ -13834,7 +13970,7 @@ pub const App = struct {
         if (result_opt) |result| {
             var mutable = result;
             defer mutable.deinit(gpa);
-            self.captureCommandOutput(self.mutation_command, result);
+
             if (mutable.ok()) {
                 if (std.meta.activeTag(job) != .stage_batch) self.git.amend_view = null;
                 // The commit landed: drop the preserved draft that submitCommit
@@ -13924,7 +14060,11 @@ pub const App = struct {
             }
         } else {
             self.select_commit_pending = null;
-            try self.reportFailure("command failed to start", "");
+            if (self.config.result_dialog == .never) {
+                try self.reportFailure("command failed to start", "");
+            } else {
+                try self.finishOp(false, "command failed to start", "", self.mutation_command);
+            }
         }
         self.refreshViews(self.mutation_refresh);
         // If the staging view is open (e.g. a commit/amend was started from it),
@@ -13943,17 +14083,20 @@ pub const App = struct {
         var run_buf: [256]u8 = undefined;
         const shown = std.fmt.bufPrint(&run_buf, "$ {s}", .{command}) catch command;
         try self.beginOp(shown);
-        var result = try self.git.runShell(command);
+        var result = self.git.runShell(command) catch |err| {
+            self.dismissOpFrame();
+            return self.setMessage("shell command failed: {s}", .{@errorName(err)});
+        };
         defer result.deinit(self.allocator);
-        self.captureCommandOutput(command, result);
+
         // Custom commands are usually run to read output, so by default show it
         // in the dialog; `command_output = silent` makes them follow the same
         // result_dialog policy as git actions.
         if (self.config.command_output == .show) {
             if (result.ok()) {
-                try self.finishOp(true, "", result.stdout);
+                try self.finishOp(true, "", result.stdout, null);
             } else {
-                try self.finishOp(false, "command failed", if (result.stderr.len > 0) result.stderr else result.stdout);
+                try self.finishOp(false, "command failed", if (result.stderr.len > 0) result.stderr else result.stdout, null);
             }
         } else if (result.ok()) {
             try self.reportSuccess("", result.stdout);
@@ -13961,56 +14104,6 @@ pub const App = struct {
             try self.reportFailure("command failed", if (result.stderr.len > 0) result.stderr else result.stdout);
         }
         self.refreshViews(Refresh.all);
-    }
-
-    pub fn captureCommandOutput(self: *App, command: []const u8, result: git_mod.ExecResult) void {
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        if (result.command.len > 0) {
-            out.writer.writeAll(result.command) catch return;
-        } else {
-            out.writer.print("$ {s}", .{command}) catch return;
-        }
-        for ([_][]const u8{ result.prior_stdout, result.stdout, result.prior_stderr, result.stderr }) |raw| {
-            const stream = std.mem.trimEnd(u8, raw, "\r\n");
-            if (stream.len == 0) continue;
-            out.writer.print("\n{s}", .{stream}) catch return;
-        }
-        switch (result.term) {
-            .exited => |code| if (code == 0)
-                out.writer.writeAll("\nok") catch return
-            else
-                out.writer.print("\nfailed({d})", .{code}) catch return,
-            .signal => |signal| {
-                if (comptime @typeInfo(std.posix.SIG) == .@"enum") {
-                    if (std.enums.tagName(std.posix.SIG, signal)) |name| {
-                        out.writer.print("\nterminated(SIG{s})", .{name}) catch return;
-                    } else {
-                        out.writer.print("\nterminated({d})", .{@backingInt(signal)}) catch return;
-                    }
-                } else out.writer.writeAll("\nterminated") catch return;
-            },
-            .stopped => out.writer.writeAll("\nstopped") catch return,
-            .unknown => out.writer.writeAll("\nunknown exit status") catch return,
-        }
-        const output = out.toOwnedSlice() catch return;
-        self.replaceShellOutput(output);
-        if (self.showStatusOutput()) {
-            self.diff_sel_active = false;
-            self.main_scroll = 0;
-            self.main_hscroll = 0;
-        }
-    }
-
-    fn replaceShellOutput(self: *App, output: []u8) void {
-        if (self.shell_output.len > 0) {
-            // The layout caches use buffer addresses, which can be reused.
-            deinitLineIndexCache();
-            deinitWrapCache();
-            width_cache = @splat(.{});
-        }
-        self.allocator.free(self.shell_output);
-        self.shell_output = output;
     }
 
     pub fn setMessage(self: *App, comptime fmt: []const u8, args: anytype) !void {
@@ -14922,26 +15015,6 @@ test "diff selection copies the highlighted span across lines" {
     try std.testing.expectEqualStrings("one\nline two", app.clipboard_request.?);
 }
 
-test "Status output can be copied from the main pane" {
-    const allocator = std.testing.allocator;
-    var no_files = [_]model.FileStatus{};
-    var app = try testApp(allocator, &no_files);
-    defer deinitTestApp(&app);
-
-    app.focus = .status;
-    app.shell_output = try allocator.dupe(u8, "$ git commit\n\x1b[31mé界 failed\x1b[m");
-    try app.enterMain();
-    try app.requestClipboardCopy();
-    try std.testing.expectEqualStrings("$ git commit\né界 failed", app.clipboard_request orelse "");
-
-    app.status_output_rect = .{ .focus = .main, .x = 20, .y = 12, .w = 30, .h = 1 };
-    app.main_scroll = 1;
-    try std.testing.expect(try app.handleMouse(.{ .col = 20, .row = 12, .type = .press, .button = .left, .mods = .{} }));
-    try std.testing.expect(try app.handleMouse(.{ .col = 23, .row = 12, .type = .drag, .button = .left, .mods = .{} }));
-    try std.testing.expect(try app.handleMouse(.{ .col = 23, .row = 12, .type = .release, .button = .left, .mods = .{} }));
-    try std.testing.expectEqualStrings("é界", app.clipboard_request orelse "");
-}
-
 test "selection copies from the staging panes, each its own text" {
     const allocator = std.testing.allocator;
     var no_files = [_]model.FileStatus{};
@@ -15184,8 +15257,7 @@ test "credential prompt collects username then password and queues a retry" {
     app.exe_path = try allocator.dupeSentinel(u8, "/path/to/ziggity", 0);
     // The retry records the command in the git log; a minimal Git suffices.
     app.git = .{ .allocator = allocator, .io = undefined, .environ = undefined, .root = undefined };
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     try credentials_mod.startCredentialPrompt(&app, .push);
     try std.testing.expectEqual(Mode.credential_prompt, app.mode);
@@ -15344,9 +15416,7 @@ test "paste-and-edit submits a cherry_pick_message mutation with the edited text
     var no_files = [_]model.FileStatus{};
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
-    // requestMutation records the command into git.command_log (testing alloc).
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     var commits = [_]model.Commit{
         .{ .hash = @constCast("aaaaaaa"), .short_hash = @constCast("aaa"), .author = @constCast("s"), .time = @constCast("now"), .refs = @constCast(""), .subject = @constCast("orig") },
@@ -15490,8 +15560,7 @@ test "new-tag prompt chains to an optional message, then creates an annotated ta
     defer deinitTestApp(&app);
 
     app.git = .{ .allocator = allocator, .io = undefined, .environ = undefined, .root = undefined };
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
     app.branches_tab = .tags;
     app.mode = .text_prompt;
     app.text_prompt_kind = .new_tag;
@@ -16039,8 +16108,7 @@ test "a failed commit keeps the message; a successful one clears it" {
     var no_files = [_]model.FileStatus{};
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     // Compose and submit a create-commit.
     app.commit_action = .create;
@@ -16077,8 +16145,7 @@ test "paste-and-edit keeps its message when the cherry-pick conflicts (issue #35
     var no_files = [_]model.FileStatus{};
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     // A commit copied for cherry-pick, and the edited message typed in the dialog.
     try app.copied_commits.append(allocator, try allocator.dupe(u8, "aaaaaaa"));
@@ -16149,9 +16216,7 @@ test "reword_on_amend submits the edited message as an amend_message mutation (i
     var staged = [_]model.FileStatus{.{ .path = @constCast("a.txt"), .short_status = .{ 'M', ' ' }, .has_staged = true, .has_unstaged = false, .tracked = true, .added = false, .deleted = false, .conflict = false }};
     var app = try testApp(allocator, &staged);
     defer deinitTestApp(&app);
-    // requestMutation records the command into git.command_log (testing alloc).
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     // The editor is open in amend mode (as startAmendReword leaves it) with an
     // edited subject; submitting folds the staged change in with the new message.
@@ -16174,8 +16239,7 @@ test "a amends the selected commit's author via a rebase exec todo" {
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
     app.git = .{ .allocator = allocator, .io = undefined, .environ = undefined, .root = undefined };
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     var p1 = [_][]u8{@constCast("2222222222222222222222222222222222222222")};
     var p2 = [_][]u8{@constCast("3333333333333333333333333333333333333333")};
@@ -16235,8 +16299,7 @@ test "N moves the current branch's commits onto a new branch" {
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
     app.git = .{ .allocator = allocator, .io = undefined, .environ = undefined, .root = undefined };
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     app.data.current_branch = @constCast("main");
     app.data.upstream = @constCast("origin/main"); // has an upstream
@@ -16263,8 +16326,7 @@ test "branch sort menu changes the sort order" {
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
     app.git = .{ .allocator = allocator, .io = undefined, .environ = undefined, .root = undefined };
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     try std.testing.expectEqual(model.BranchSortOrder.date, app.config.branch_sort_order);
     try app.runMenuAction(.sort_branches_alpha);
@@ -16278,8 +16340,7 @@ test "T on a local branch tags that branch, not HEAD" {
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
     app.git = .{ .allocator = allocator, .io = undefined, .environ = undefined, .root = undefined };
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     var branches = [_]model.Branch{.{ .name = @constCast("feature") }};
     app.data.branches = &branches;
@@ -16300,8 +16361,7 @@ test "checkout-by-name uses --track for a remote branch (avoids detached HEAD)" 
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
     app.git = .{ .allocator = allocator, .io = undefined, .environ = undefined, .root = undefined };
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     var remotes = [_]model.Branch{.{ .name = @constCast("origin/feature") }};
     var locals = [_]model.Branch{}; // no local "feature"
@@ -16324,8 +16384,7 @@ test "checkout-by-name switches to an existing local branch instead of --track" 
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
     app.git = .{ .allocator = allocator, .io = undefined, .environ = undefined, .root = undefined };
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     var remotes = [_]model.Branch{.{ .name = @constCast("origin/feature") }};
     var locals = [_]model.Branch{.{ .name = @constCast("feature") }};
@@ -16348,8 +16407,7 @@ test "T on the commits tab tags the selected commit, not HEAD" {
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
     app.git = .{ .allocator = allocator, .io = undefined, .environ = undefined, .root = undefined };
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     var commits = [_]model.Commit{.{
         .hash = @constCast("abcabcabcabcabcabcabcabcabcabcabcabcabca"),
@@ -16381,8 +16439,7 @@ test "creating a tag that already exists prompts to force-overwrite" {
     defer deinitTestApp(&app);
 
     app.git = .{ .allocator = allocator, .io = undefined, .environ = undefined, .root = undefined };
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
     var tags = [_]model.Tag{.{ .name = @constCast("v1.0") }};
     app.data.tags = &tags;
     app.branches_tab = .tags;
@@ -16422,8 +16479,7 @@ test "pushing a tag with a single remote targets it directly" {
     defer deinitTestApp(&app);
 
     app.git = .{ .allocator = allocator, .io = undefined, .environ = undefined, .root = undefined };
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
     var remotes = [_]model.Remote{.{ .name = @constCast("origin") }};
     var tags = [_]model.Tag{.{ .name = @constCast("v1.0") }};
     app.data.remotes = &remotes;
@@ -18230,8 +18286,7 @@ test "pushing a branch with no upstream prompts then sets upstream" {
     defer deinitTestApp(&app);
     // requestAsync records the command in the git log; a minimal Git suffices.
     app.git = .{ .allocator = allocator, .io = undefined, .environ = undefined, .root = undefined };
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     app.data.current_branch = @constCast("feature/x");
     try std.testing.expect(!app.currentBranchHasUpstream());
@@ -18298,8 +18353,7 @@ test "a stale remote-tracking ref collision offers git remote prune, then re-run
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
     app.git = .{ .allocator = allocator, .io = undefined, .environ = undefined, .root = @constCast("/repo") };
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     // Git reports the collision as "cannot lock ref", but no lock file exists.
     // It must not be mistaken for a stale lock (whose prompt would offer to
@@ -18337,7 +18391,7 @@ test "a stale remote-tracking ref collision offers git remote prune, then re-run
         .stderr = try allocator.dupe(u8, ""),
         .term = .{ .exited = 0 },
     };
-    try app.completeAsync(.prune_remote, ok, allocator);
+    try app.completeAsync(.prune_remote, ok, "", allocator);
     try std.testing.expectEqual(AsyncOp.pull, app.async_requested.?);
     try std.testing.expect(std.meta.activeTag(app.retry_action) == .none);
     app.async_requested = null;
@@ -18349,8 +18403,7 @@ test "a failed prune drops the op queued behind it" {
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
     app.git = .{ .allocator = allocator, .io = undefined, .environ = undefined, .root = @constCast("/repo") };
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     const raw = "error: cannot lock ref 'refs/remotes/origin/a/b': 'refs/remotes/origin/a' exists; cannot create 'refs/remotes/origin/a/b'";
     _ = try app.reportFailureOrLock("fetch failed", raw, .{ .async_op = .fetch });
@@ -18362,7 +18415,7 @@ test "a failed prune drops the op queued behind it" {
         .stderr = try allocator.dupe(u8, "fatal: unable to access 'https://example.com/repo/': Could not resolve host"),
         .term = .{ .exited = 128 },
     };
-    try app.completeAsync(.prune_remote, failed, allocator);
+    try app.completeAsync(.prune_remote, failed, "", allocator);
     try std.testing.expect(app.async_requested == null);
     try std.testing.expect(std.meta.activeTag(app.retry_action) == .none);
 }
@@ -18496,8 +18549,7 @@ test "pushing a branch that already tracks an upstream pushes directly" {
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
     app.git = .{ .allocator = allocator, .io = undefined, .environ = undefined, .root = undefined };
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     app.data.current_branch = @constCast("main");
     app.data.upstream = @constCast("origin/main");
@@ -18631,6 +18683,119 @@ test "command log closes on esc/enter/q, scrolls on j/k, ignores other keys" {
         try app.handleKey(.{ .codepoint = c });
         try std.testing.expectEqual(Mode.normal, app.mode);
     }
+}
+
+test "command log fullscreen toggle keeps the log open and preserves scroll" {
+    const a = std.testing.allocator;
+    var files = [_]model.FileStatus{};
+    var app = try testApp(a, &files);
+    defer deinitTestApp(&app);
+    app.mode = .command_log;
+    app.command_log_scroll = 4;
+    try app.handleKey(.{ .codepoint = 'z' });
+    try std.testing.expect(app.command_log_fullscreen);
+    try std.testing.expectEqual(Mode.command_log, app.mode);
+    try std.testing.expectEqual(@as(usize, 4), app.command_log_scroll);
+    try app.handleKey(.{ .codepoint = 'z' });
+    try std.testing.expect(!app.command_log_fullscreen);
+}
+
+test "command log shows its tail past 512 lines and anchors text after reflow" {
+    const a = std.testing.allocator;
+    var files = [_]model.FileStatus{};
+    var app = try testApp(a, &files);
+    defer deinitTestApp(&app);
+    defer app.git.clearCommandLog();
+    app.mode = .command_log;
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(a);
+    try output.appendNTimes(a, 'x', 70_000);
+    try output.appendSlice(a, "same-line-tail\n");
+    for (0..600) |_| try output.appendSlice(a, "This line needs to wrap in the narrow popup.\n");
+    try output.appendSlice(a, "last line");
+    app.git.recordCommandResult("Shell Command", "long output", true, .{
+        .stdout = output.items,
+        .stderr = &.{},
+        .term = .{ .exited = 0 },
+    });
+    app.command_log_scroll = std.math.maxInt(usize);
+    app.layoutCommandLog(25, 12);
+    const narrow = app.command_log_rows.items;
+    const text = app.git.command_log.items[0].text;
+    const tail = narrow[narrow.len - 1];
+    try std.testing.expectEqualStrings("last line", text[tail.row.start..tail.row.end]);
+    for (narrow) |item| {
+        const row = item.row;
+        if (std.mem.endsWith(u8, text[row.start..row.end], "same-line-tail") and row.vis_end == row.end - row.start) break;
+    } else return error.LogOmittedLongLineTail;
+
+    try app.handleKey(.{ .codepoint = 'k' });
+    const popup_scroll = app.command_log_scroll;
+    app.layoutCommandLog(100, 28);
+    try std.testing.expectEqual(app.command_log_max_scroll, app.command_log_scroll);
+    app.layoutCommandLog(25, 12);
+    try std.testing.expectEqual(popup_scroll, app.command_log_scroll);
+}
+
+test "command log separates entries with one blank line" {
+    const a = std.testing.allocator;
+    var files = [_]model.FileStatus{};
+    var app = try testApp(a, &files);
+    defer deinitTestApp(&app);
+    defer app.git.clearCommandLog();
+    app.mode = .command_log;
+    const result: git_mod.ExecResult = .{ .stdout = &.{}, .stderr = &.{}, .term = .{ .exited = 0 } };
+    app.git.recordCommandResult("Stage", "git add file", false, .{
+        .stdout = @constCast("staged"),
+        .stderr = &.{},
+        .term = .{ .exited = 0 },
+    });
+    app.layoutCommandLog(80, 20);
+    try std.testing.expectEqual(@as(usize, 4), app.command_log_rows.items.len);
+    app.git.recordCommandResult("Push", "git push", false, result);
+    app.layoutCommandLog(80, 20);
+
+    const rows = app.command_log_rows.items;
+    try std.testing.expectEqual(@as(usize, 8), rows.len);
+    app.beginDialogGrid(0, 0, rows.len);
+    for (rows, 0..) |item, i| {
+        app.setDialogRow(i, app.git.command_log.items[item.entry].text[item.row.start..item.row.end]);
+    }
+    app.dialog_sel_head_row = rows.len - 1;
+    app.dialog_sel_head_col = "Git output(0)".len;
+    try app.copyDialogSelection();
+    try std.testing.expectEqualStrings("Stage\n  git add file\nGit output(0)\nstaged\n\nPush\n  git push\nGit output(0)", app.clipboard_request.?);
+}
+
+test "command log copies wrapped output without changing its source lines" {
+    const a = std.testing.allocator;
+    var files = [_]model.FileStatus{};
+    var app = try testApp(a, &files);
+    defer deinitTestApp(&app);
+    defer app.git.clearCommandLog();
+    app.mode = .command_log;
+    const output = "0123456789abcdefghij\nnext line";
+    app.git.recordCommandResult("Shell Command", "sample", true, .{
+        .stdout = @constCast(output),
+        .stderr = &.{},
+        .term = .{ .exited = 0 },
+    });
+    app.layoutCommandLog(10, 20);
+    const log = app.git.command_log.items[0].text;
+    const rows = app.command_log_rows.items;
+    app.beginDialogGrid(1, 1, rows.len);
+    const output_start = std.mem.indexOf(u8, log, output).?;
+    var output_row: i16 = 0;
+    for (rows, 0..) |item, i| {
+        const row = item.row;
+        app.setDialogRow(i, log[row.start..row.end]);
+        if (row.start == output_start and row.vis_start == 0) output_row = @intCast(i + 1);
+    }
+    try std.testing.expect(output_row > 0);
+    _ = try app.handleMouse(.{ .col = 1, .row = output_row, .type = .press, .button = .left, .mods = .{} });
+    _ = try app.handleMouse(.{ .col = 10, .row = output_row + 2, .type = .drag, .button = .left, .mods = .{} });
+    _ = try app.handleMouse(.{ .col = 10, .row = output_row + 2, .type = .release, .button = .left, .mods = .{} });
+    try std.testing.expectEqualStrings(output, app.clipboard_request.?);
 }
 
 test "command log scroll-down does not overflow the open-at-bottom sentinel" {
@@ -19191,8 +19356,7 @@ test "stash message prompt queues stash creation off-thread" {
     var no_files = [_]model.FileStatus{};
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     app.mode = .text_prompt;
     app.text_prompt_kind = .stash_message;
@@ -19222,8 +19386,7 @@ test "stash selected file prompt copies the path into the queued mutation" {
     var no_files = [_]model.FileStatus{};
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     app.mode = .text_prompt;
     app.text_prompt_kind = .stash_message;
@@ -19249,8 +19412,7 @@ test "stash panel apply pop and drop queue off-thread mutations" {
     var no_files = [_]model.FileStatus{};
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     var stashes = [_]model.StashEntry{
         .{ .selector = @constCast("stash@{0}"), .hash = @constCast("0000"), .time = @constCast("now"), .message = @constCast("top"), .index = 0 },
@@ -19370,7 +19532,7 @@ test "operation dialog shows a running frame then its result" {
     try std.testing.expectEqualStrings("git rebase main", app.op_command);
 
     // Finishing flips to the result, preserving the running op's command.
-    try app.finishOp(true, "rebased onto main", "Successfully rebased.\n");
+    try app.finishOp(true, "rebased onto main", "Successfully rebased.\n", null);
     try std.testing.expect(!app.op_running);
     try std.testing.expect(app.op_ok);
     try std.testing.expectEqualStrings("git rebase main", app.op_command);
@@ -19833,8 +19995,7 @@ test "pull_mode routes p to a plain pull or the merge/rebase menu" {
     var no_files = [_]model.FileStatus{};
     var app = try testApp(a, &no_files);
     defer deinitTestApp(&app);
-    defer app.git.command_log.deinit(a);
-    defer for (app.git.command_log.items) |e| a.free(e);
+    defer app.git.clearCommandLog();
 
     // Default (git): p pulls straight away (git honours its own pull.rebase).
     app.config.pull_mode = .git;
@@ -20321,7 +20482,15 @@ test "completeMutation frees the page-allocated job with the page allocator (iss
     const job = try (Mutation{ .revert = "deadbeef" }).dupe(page_alloc);
     // Freeing it with `gpa` (here the checking allocator) would panic on the
     // page-allocated payload; the fix frees the job with the page allocator.
+    defer app.git.clearCommandLog();
+    app.git.recordCommandResult("Shell Command", "echo previous", true, .{
+        .stdout = &.{},
+        .stderr = &.{},
+        .term = .{ .exited = 0 },
+    });
+    app.mutation_command = try page_alloc.dupe(u8, "git revert");
     try app.completeMutation(job, null, a);
+    try std.testing.expectEqualStrings("git revert", app.op_command);
 }
 
 test "completeMutation lock-retry action is page-allocated, not gpa-owned (issue #19)" {
@@ -20769,43 +20938,27 @@ test "user-triggered network operations show both output streams" {
     var files = [_]model.FileStatus{};
     var app = try testApp(a, &files);
     defer deinitTestApp(&app);
-    app.focus = .status;
+    defer app.git.clearCommandLog();
     const result: git_mod.ExecResult = .{
         .stdout = try a.dupe(u8, "push output\n"),
         .stderr = try a.dupe(u8, "push progress\n"),
         .term = .{ .exited = 0 },
     };
-    try app.completeAsync(.push, result, a);
-    try std.testing.expectEqualStrings("$ git push\npush output\npush progress\nok", app.activeMainText());
+    try app.completeAsync(.push, result, "", a);
+    try std.testing.expectEqualStrings("Push\n  git push\nGit output(0)\npush output\npush progress\n", app.git.command_log.items[0].text);
 }
 
-test "silent commands replace previous Status output with their exit status" {
+test "a network command with no result still appears in the log" {
     const a = std.testing.allocator;
     var files = [_]model.FileStatus{};
     var app = try testApp(a, &files);
     defer deinitTestApp(&app);
-    app.focus = .status;
-
-    app.captureCommandOutput("git rebase --abort", .{ .stdout = &.{}, .stderr = &.{}, .term = .{ .exited = 0 } });
-    try std.testing.expectEqualStrings("$ git rebase --abort\nok", app.activeMainText());
-    app.captureCommandOutput("exit 7", .{ .stdout = &.{}, .stderr = &.{}, .term = .{ .exited = 7 } });
-    try std.testing.expectEqualStrings("$ exit 7\nfailed(7)", app.activeMainText());
-}
-
-test "Status keeps output from earlier steps when a Git batch ends silently" {
-    const a = std.testing.allocator;
-    var files = [_]model.FileStatus{};
-    var app = try testApp(a, &files);
-    defer deinitTestApp(&app);
-    app.focus = .status;
-    app.captureCommandOutput("git stash drop", .{
-        .stdout = &.{},
-        .stderr = &.{},
-        .prior_stdout = @constCast("Dropped stash@{1}\nDropped stash@{0}\n"),
-        .prior_stderr = @constCast("warning from an earlier step\n"),
-        .term = .{ .exited = 0 },
-    });
-    try std.testing.expectEqualStrings("$ git stash drop\nDropped stash@{1}\nDropped stash@{0}\nwarning from an earlier step\nok", app.activeMainText());
+    defer app.git.clearCommandLog();
+    try app.completeAsync(.fetch_remote, error.FileNotFound, "git fetch --prune testing", a);
+    try std.testing.expectEqual(@as(usize, 1), app.git.command_log.items.len);
+    try std.testing.expectEqualStrings("git fetch --prune testing", app.git.command_log.items[0].command());
+    const entry = app.git.command_log.items[0];
+    try std.testing.expectEqualStrings("Git output(unknown)\nFileNotFound", entry.text[entry.output_start..]);
 }
 
 test "built-in commit shows both streams from a failing pre-commit hook" {
@@ -20838,15 +20991,18 @@ test "built-in commit shows both streams from a failing pre-commit hook" {
     try app.requestMutation(.{ .commit = .{ .message = "test", .no_verify = false } }, .{ .command = "git commit" }, "commit created", .{});
     const job = app.takeMutation().?;
     var checkout_head: ?[]u8 = null;
-    const result = try job.run(a, io, app.git.environ, app.git.root, app.git.git_dir, null, &checkout_head);
+    var worker_git = git_mod.Git{ .allocator = a, .io = io, .environ = &env, .root = app.git.root, .git_dir = app.git.git_dir };
+    defer worker_git.clearCommandLog();
+    const result = try job.run(&worker_git, &checkout_head);
+    app.git.appendCommandLog(worker_git.command_log.items);
     try app.completeMutation(job, result, a);
     try std.testing.expect(!app.op_ok);
     app.focus = .status;
     try app.updatePreview();
-    try std.testing.expectEqualStrings("$ git --no-optional-locks commit -m test\nhook-output\nhook-error\nfailed(1)", app.activeMainText());
+    try std.testing.expectEqualStrings("Commit\n  git --no-optional-locks commit -m test\nGit output(1)\nhook-output\nhook-error\n", app.git.command_log.items[0].text);
 }
 
-test "shell prompt output remains available in Status after switching panels" {
+test "shell prompt history survives more commands and a repository switch" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -20865,19 +21021,28 @@ test "shell prompt output remains available in Status after switching panels" {
     defer app.git.deinit();
     app.focus = .files;
     try app.startTextPrompt(.shell);
-    const command = "printf 'standard output\\n'; printf 'standard error\\n' >&2; exit 7";
+    const diagnostic = "fatal: Unable to create 'index.lock': File exists.";
+    const command = "if test -e ran; then echo rerun; exit; fi; touch ran; printf 'standard output\\n'; echo \"" ++ diagnostic ++ "\" >&2; exit 7";
     try app.input_buffer.appendSlice(a, command);
     try app.submitTextPrompt();
     try std.testing.expect(app.focus == .files);
-    const expected = "$ " ++ command ++ "\nstandard output\nstandard error\nfailed(7)";
-    app.focus = .status;
-    try app.updatePreview();
-    try std.testing.expectEqualStrings(expected, app.activeMainText());
-    app.focus = .files;
-    try app.updatePreview();
-    app.focus = .status;
-    try app.updatePreview();
-    try std.testing.expectEqualStrings(expected, app.activeMainText());
+    try app.startTextPrompt(.shell);
+    const large_command = "head -c 16777217 /dev/zero; printf newer";
+    try app.input_buffer.appendSlice(a, large_command);
+    try app.submitTextPrompt();
+    var other = std.testing.tmpDir(.{});
+    defer other.cleanup();
+    var other_buf: [160]u8 = undefined;
+    const other_path = try std.fmt.bufPrint(&other_buf, ".zig-cache/tmp/{s}", .{other.sub_path});
+    try testRunSetup(a, io, &env, other_path, "git init -q");
+    try app.reRootTo(other_path, false);
+    const log = app.git.command_log.items;
+    try std.testing.expectEqual(@as(usize, 2), log.len);
+    try std.testing.expectEqualStrings("Shell Command\n  " ++ command ++ "\nShell output(7)\nstandard output\n" ++ diagnostic ++ "\n", log[0].text);
+    try std.testing.expectEqualStrings(large_command, log[1].command());
+    try std.testing.expect(log[1].text.len > 16 * 1024 * 1024);
+    try std.testing.expect(std.mem.startsWith(u8, log[1].text[log[1].output_start..], "Shell output(0)\n"));
+    try std.testing.expect(std.mem.endsWith(u8, log[1].text, "newer"));
 }
 
 test "the staging view picks up an external edit on the next refresh (e2e)" {
@@ -21002,6 +21167,7 @@ fn testApp(allocator: std.mem.Allocator, files: []model.FileStatus) !App {
 }
 
 fn deinitTestApp(app: *App) void {
+    app.command_log_rows.deinit(app.allocator);
     app.clearAiRequest(.title);
     app.clearAiRequest(.description);
     if (app.commit_ai_error) |e| app.allocator.free(e);
@@ -21015,7 +21181,6 @@ fn deinitTestApp(app: *App) void {
     app.allocator.free(app.op_command);
     app.allocator.free(app.op_summary);
     app.allocator.free(app.op_output);
-    app.allocator.free(app.shell_output);
     if (app.clipboard_request) |c| app.allocator.free(c);
     app.clearPrRequest();
     app.allocator.free(app.pr_doc_title);
@@ -21236,8 +21401,7 @@ test "reflog tab: space checks out the entry, n branches from it" {
     var app = try testApp(allocator, &no_files);
     defer deinitTestApp(&app);
     app.git = .{ .allocator = allocator, .io = undefined, .environ = undefined, .root = undefined };
-    defer app.git.command_log.deinit(allocator);
-    defer for (app.git.command_log.items) |e| allocator.free(e);
+    defer app.git.clearCommandLog();
 
     var reflog = [_]model.Commit{.{
         .hash = @constCast("3333333333333333333333333333333333333333"),
@@ -21705,9 +21869,8 @@ test "alt+k / alt+j defer the cursor move to the reorder's target index" {
     // The move queues a mutation and records its command into the git command
     // log; testApp's git is never deinit'd, so free that log by hand.
     const freeCmdLog = struct {
-        fn f(app: *App, a: std.mem.Allocator) void {
-            for (app.git.command_log.items) |e| a.free(e);
-            app.git.command_log.deinit(a);
+        fn f(app: *App, _: std.mem.Allocator) void {
+            app.git.clearCommandLog();
         }
     }.f;
 
@@ -21893,8 +22056,7 @@ test "issue #5: revert refreshes the branches scope so the ahead count updates" 
     // revert records its command into the git log; testApp's git is never
     // deinit'd, so free that log here.
     defer {
-        for (app.git.command_log.items) |e| allocator.free(e);
-        app.git.command_log.deinit(allocator);
+        app.git.clearCommandLog();
     }
 
     var commits = [_]model.Commit{

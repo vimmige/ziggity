@@ -52,7 +52,6 @@ pub fn createPatchFromSelectedStash(self: *App) !void {
     };
     var res = try self.git.stashShowPatch(entry.selector);
     defer res.deinit(self.allocator);
-    self.captureCommandOutput("git stash show", res);
     if (!res.ok()) {
         try self.setMessage("could not read the stash's diff", .{});
         return;

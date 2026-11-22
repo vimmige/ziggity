@@ -25,6 +25,7 @@ const credentials_mod = @import("credentials.zig");
 const diffmode_mod = @import("diffmode.zig");
 const filetree = @import("filetree.zig");
 const git_mod = @import("git.zig");
+const donut_mod = @import("donut.zig");
 const graphlanes_mod = @import("graphlanes.zig");
 const model = @import("model.zig");
 const patch_mod = @import("patch.zig");
@@ -64,6 +65,7 @@ const Event = union(enum) {
     paste_end,
     refresh_tick,
     spinner_tick,
+    anim_tick,
     fetch_tick,
     external_check_tick,
     worker_wake,
@@ -138,9 +140,12 @@ const AsyncJob = struct {
     /// or null to defer to the user's `fetch.prune` config. A static string (no
     /// allocation), appended to the fetch argv by the worker.
     fetch_prune_arg: ?[]const u8 = null,
-    result: ?git_mod.ExecResult = null,
+    result: anyerror!git_mod.ExecResult = error.CommandFailedToStart,
+    failed_command: []u8 = &.{},
 
-    fn freeTargets(self: *AsyncJob) void {
+    fn deinit(self: *AsyncJob) void {
+        if (self.cred_environ) |*env| env.deinit();
+        async_allocator.free(self.failed_command);
         if (self.upstream_remote) |r| async_allocator.free(r);
         if (self.upstream_branch) |b| async_allocator.free(b);
         self.upstream_remote = null;
@@ -187,21 +192,16 @@ fn asyncWorker(job: *AsyncJob) void {
         .argv = argv.items,
         .cwd = .{ .path = job.root },
         .environ_map = env,
-        .stdout_limit = .limited(16 * 1024 * 1024),
-        .stderr_limit = .limited(4 * 1024 * 1024),
-    }) catch {
-        if (job.cred_environ) |*e| {
-            e.deinit();
-            job.cred_environ = null;
-        }
-        return postDone(job);
-    };
+    });
 
     if (job.cred_environ) |*e| {
         e.deinit();
         job.cred_environ = null;
     }
-    job.result = git_mod.ExecResult.fromRun(async_allocator, result, argv.items);
+    job.result = if (result) |r| git_mod.ExecResult.fromRun(async_allocator, r, argv.items) else |err| blk: {
+        job.failed_command = git_mod.formatCommand(async_allocator, argv.items) catch &.{};
+        break :blk err;
+    };
     postDone(job);
 }
 
@@ -412,8 +412,7 @@ const CommitGraphRun = struct {
 fn commitGraphWorker(cr: *CommitGraphRun) void {
     var g = git_mod.Git{ .allocator = async_allocator, .io = cr.io, .environ = cr.environ, .root = cr.root, .git_dir = @constCast(cr.git_dir) };
     g.ensureCommitGraph();
-    for (g.command_log.items) |e| async_allocator.free(e);
-    g.command_log.deinit(async_allocator);
+    g.clearCommandLog();
     cr.completions.post(.commit_graph_done);
 }
 
@@ -437,19 +436,15 @@ fn prStatusWorker(pr: *PrStatusRun) void {
 /// page-allocator Git. Posts `.mutation_done` so the loop can surface the
 /// result and refresh on the UI thread.
 const MutationRun = struct {
-    io: std.Io,
+    git: git_mod.Git,
     completions: *WorkerCompletions,
-    root: []u8,
-    git_dir: []const u8,
-    environ: *std.process.Environ.Map,
     mutation: app_mod.Mutation,
     result: ?git_mod.ExecResult = null,
     checkout_head: ?[]u8 = null,
-    amend_view: ?git_mod.Git.AmendView = null,
 };
 
 fn mutationWorker(mr: *MutationRun) void {
-    mr.result = mr.mutation.run(async_allocator, mr.io, mr.environ, mr.root, mr.git_dir, mr.amend_view, &mr.checkout_head) catch null;
+    mr.result = mr.mutation.run(&mr.git, &mr.checkout_head) catch null;
     mr.completions.post(.mutation_done);
 }
 
@@ -545,6 +540,11 @@ const AiGenRun = struct {
     error_detail: ?[]u8 = null,
     command_output: ?git_mod.ExecResult = null,
 
+    fn recordOutput(self: *const AiGenRun, git: *git_mod.Git) void {
+        const label = if (self.field == .title) "AI commit title" else "AI commit description";
+        if (self.command_output) |output| git.recordCommandResult(label, self.command, true, output);
+    }
+
     fn free(self: *AiGenRun) void {
         async_allocator.free(self.command);
         async_allocator.free(self.current_title);
@@ -565,10 +565,7 @@ fn runAiGen(ag: *AiGenRun) void {
         .root = ag.root,
         .git_dir = @constCast(ag.git_dir),
     };
-    defer {
-        for (wgit.command_log.items) |e| async_allocator.free(e);
-        wgit.command_log.deinit(async_allocator);
-    }
+    defer wgit.clearCommandLog();
     const output = if (ag.capture_output) &ag.command_output else null;
     if (aiauthor_mod.generate(async_allocator, &wgit, ag.command, ag.field, ag.current_title, ag.limits, ag.source, &ag.error_detail, output)) |text| {
         ag.result = text;
@@ -608,6 +605,10 @@ const PrGenRun = struct {
     failed: bool = false,
     command_output: ?git_mod.ExecResult = null,
 
+    fn recordOutput(self: *const PrGenRun, git: *git_mod.Git) void {
+        if (self.command_output) |output| git.recordCommandResult("AI PR description", self.command, true, output);
+    }
+
     fn free(self: *PrGenRun) void {
         async_allocator.free(self.command);
         async_allocator.free(self.base);
@@ -630,10 +631,7 @@ fn prGenWorker(pr: *PrGenRun) void {
         .root = pr.root,
         .git_dir = @constCast(pr.git_dir),
     };
-    defer {
-        for (wgit.command_log.items) |e| async_allocator.free(e);
-        wgit.command_log.deinit(async_allocator);
-    }
+    defer wgit.clearCommandLog();
     const log: []const u8 = wgit.refLog(pr.base, pr.target, 200) catch "";
     defer if (log.len != 0) async_allocator.free(@constCast(log));
     const diff: []const u8 = wgit.refDiff(pr.base, pr.target, pr.three_dot) catch "";
@@ -738,8 +736,8 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
     var async_future: ?std.Io.Future(void) = null;
     defer if (async_future) |*f| {
         f.await(io);
-        if (async_job.result) |*r| r.deinit(async_allocator);
-        async_job.freeTargets();
+        if (async_job.result) |*r| r.deinit(async_allocator) else |_| {}
+        async_job.deinit();
     };
 
     var preview_run: PreviewRun = undefined;
@@ -794,6 +792,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
         f.await(io);
         if (mutation_run.result) |*r| r.deinit(async_allocator);
         if (mutation_run.checkout_head) |head| async_allocator.free(head);
+        mutation_run.git.clearCommandLog();
         // The mutation payload is page-allocated (see `requestMutation`); free it
         // with the page allocator, not the worker's smp allocator.
         mutation_run.mutation.deinit(std.heap.page_allocator);
@@ -873,6 +872,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
             // Fast tick while something works off-thread: advance the loading
             // spinner only. The worktree refresh rides the slower `.refresh_tick`.
             .spinner_tick => app.spinner_frame +%= 1,
+            .anim_tick => app.advanceDonut(io),
             .fetch_tick => {
                 app.bg_fetch_requested = true;
                 // Refresh PR status on the same cadence as the background fetch.
@@ -921,9 +921,10 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                     if (async_future) |*f| {
                         f.await(io);
                         async_future = null;
-                        async_job.freeTargets();
-                        try app.completeAsync(async_job.op, async_job.result, async_allocator);
-                        async_job.result = null;
+                        defer async_job.deinit();
+                        const failed_command = std.mem.cutPrefix(u8, async_job.failed_command, "$ ") orelse async_job.failed_command;
+                        try app.completeAsync(async_job.op, async_job.result, failed_command, async_allocator);
+                        async_job.result = error.CommandFailedToStart;
                     }
                 },
                 .preview_done => {
@@ -953,6 +954,8 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                             // The checkout already queues history, so mark its HEAD as seen.
                             if (head.len > 0) app.recordHead(head);
                         }
+                        app.git.appendCommandLog(mutation_run.git.command_log.items);
+                        mutation_run.git.clearCommandLog();
                         try app.completeMutation(mutation_run.mutation, mutation_run.result, async_allocator);
                         mutation_run.result = null;
                     }
@@ -1003,7 +1006,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                     if (ai_title_future) |*f| {
                         f.await(io);
                         ai_title_future = null;
-                        if (ai_title_run.command_output) |output| app.captureCommandOutput("AI commit title", output);
+                        ai_title_run.recordOutput(&app.git);
                         app.applyAiResult(.title, ai_title_run.dialog_generation, ai_title_run.revision, ai_title_run.staged_signature, if (ai_title_run.failed) null else ai_title_run.result, ai_title_run.error_detail) catch {};
                         ai_title_run.free();
                         render_needed = true;
@@ -1013,7 +1016,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                     if (ai_desc_future) |*f| {
                         f.await(io);
                         ai_desc_future = null;
-                        if (ai_desc_run.command_output) |output| app.captureCommandOutput("AI commit description", output);
+                        ai_desc_run.recordOutput(&app.git);
                         app.applyAiResult(.description, ai_desc_run.dialog_generation, ai_desc_run.revision, ai_desc_run.staged_signature, if (ai_desc_run.failed) null else ai_desc_run.result, ai_desc_run.error_detail) catch {};
                         ai_desc_run.free();
                         render_needed = true;
@@ -1023,7 +1026,7 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                     if (pr_gen_future) |*f| {
                         f.await(io);
                         pr_gen_future = null;
-                        if (pr_gen_run.command_output) |output| app.captureCommandOutput("AI PR description", output);
+                        pr_gen_run.recordOutput(&app.git);
                         app.applyPrDoc(pr_gen_run.generation, if (pr_gen_run.failed) null else pr_gen_run.title, if (pr_gen_run.failed) null else pr_gen_run.body) catch {};
                         pr_gen_run.free();
                         render_needed = true;
@@ -1111,16 +1114,19 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
             if (ai_title_future) |*f| {
                 f.cancel(io);
                 ai_title_future = null;
+                ai_title_run.recordOutput(&app.git);
                 ai_title_run.free();
             }
             if (ai_desc_future) |*f| {
                 f.cancel(io);
                 ai_desc_future = null;
+                ai_desc_run.recordOutput(&app.git);
                 ai_desc_run.free();
             }
             if (pr_gen_future) |*f| {
                 f.cancel(io);
                 pr_gen_future = null;
+                pr_gen_run.recordOutput(&app.git);
                 pr_gen_run.free();
                 app.pr_gen_active = false;
             }
@@ -1168,14 +1174,10 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
                 if (credentials_mod.gitCredentialsSet(app)) {
                     async_job.cred_environ = credentials_mod.buildCredentialEnv(app, async_allocator) catch null;
                 }
-                async_future = io.concurrent(asyncWorker, .{&async_job}) catch blk: {
-                    if (async_job.cred_environ) |*e| {
-                        e.deinit();
-                        async_job.cred_environ = null;
-                    }
-                    async_job.freeTargets();
+                async_future = io.concurrent(asyncWorker, .{&async_job}) catch |err| blk: {
+                    async_job.deinit();
                     app.async_active = false;
-                    try app.completeAsync(op, null, async_allocator);
+                    try app.completeAsync(op, err, "", async_allocator);
                     break :blk null;
                 };
                 render_needed = true;
@@ -1288,7 +1290,11 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
         // input gate keeps another mutation from being requested meanwhile.
         if (mutation_future == null) {
             if (app.takeMutation()) |mutation| {
-                mutation_run = .{ .io = io, .completions = &completions, .root = app.git.root, .git_dir = app.git.git_dir, .environ = app.git.environ, .mutation = mutation, .amend_view = app.git.amend_view, .result = null };
+                mutation_run = .{
+                    .git = .{ .allocator = async_allocator, .io = io, .environ = app.git.environ, .root = app.git.root, .git_dir = app.git.git_dir, .amend_view = app.git.amend_view },
+                    .completions = &completions,
+                    .mutation = mutation,
+                };
                 mutation_future = io.concurrent(mutationWorker, .{&mutation_run}) catch blk: {
                     try app.completeMutation(mutation, null, async_allocator);
                     break :blk null;
@@ -1435,6 +1441,8 @@ pub fn run(init: std.process.Init, app: *app_mod.App) !void {
         // foreground op runs OR a preview is still loading off-thread.
         app.busy_flag.store(app.foregroundBusy() or app.preview_loading or app.commitAiGenerating() or app.pr_gen_active, .release);
 
+        app.animate_flag.store(app.wantsAnimation(), .release);
+
         // Wall-clock time for the branches "time ago" column (unix seconds).
         app.now_unix = @intCast(@divFloor(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
 
@@ -1554,6 +1562,7 @@ fn refreshTickerRun(state: *RefreshTicker) void {
         // worktree refresh rides the slower cadence below, so a long preview load
         // can't turn every tick into a `git status` + file-list re-sort).
         if (busy) _ = state.loop.tryPostEvent(.spinner_tick) catch false;
+        if (state.app.animate_flag.load(.acquire)) _ = state.loop.tryPostEvent(.anim_tick) catch false;
         // The periodic working-tree refresh fires at the configured cadence
         // whether busy or idle: a long preview load neither starves it (it still
         // fires each interval) nor spams it (never per fast tick). A timed tick
@@ -1795,6 +1804,8 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
         return drawDiffReview(root, app);
     }
 
+    if (app.mode == .command_log and app.command_log_fullscreen) return drawCommandLog(root, app);
+
     // The footer wraps its hints onto extra rows when they overflow (see
     // `footer_hint_rows`). Its height is stable across navigation (sized to the
     // busiest panel, not the focused one), so only a resize reflows the body;
@@ -1844,7 +1855,6 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
     app.syncListView(.stash, stash_h -| 2);
 
     // Capture panel hit-boxes for mouse handling.
-    app.status_output_rect = null;
     app.panel_rects = .{
         .{ .focus = .status, .x = 0, .y = 0, .w = side_w, .h = status_h },
         .{ .focus = .files, .x = 0, .y = status_h, .w = side_w, .h = files_h },
@@ -1967,7 +1977,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
 
     // The main/diff panel is hidden in global full mode (main_w == 0).
     if (main_w > 0) {
-        const status_output = app.showStatusOutput();
+        const show_about = app.showAboutSplash();
         const main_title = if (app.staging_patch_mode)
             "Building patch (esc back)"
         else if (app.staging_active)
@@ -1995,7 +2005,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
                 scroll.selection = stagingPosition(app);
                 break :blk tabbedPanel(root, side_w, 0, main_w, body_h, null, &staging_tabs, @as(usize, if (app.staging_staged_view) 1 else 0), wrap_tag, app.focus == .main, scroll);
             } else blk: {
-                const frame = panelBorder(root, side_w, 0, main_w, body_h, app.focus == .main, if (status_output) null else scroll);
+                const frame = panelBorder(root, side_w, 0, main_w, body_h, app.focus == .main, if (show_about) null else scroll);
                 if (main_w >= 4 and body_h >= 3) {
                     drawDiffTitle(frame.raw, title_shown, if (app.diff_base != null) styles().warning else if (app.focus == .main) styles().active_title else styles().title);
                 }
@@ -2004,7 +2014,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
             app.main_view_height = main.height;
             app.main_view_width = stagingContentWidth(app, main.width);
             refreshOnDiffChange(vx, app);
-            if (status_output) drawStatusOutput(root, main, app) else drawDiff(main, app);
+            if (show_about) drawAboutSplash(main, app) else drawDiff(main, app);
         }
     }
     // Indent the footer by one column so it lines up with the panel content
@@ -2020,7 +2030,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
         .commit_prompt => drawCommitPopup(root, app),
         .text_prompt => drawTextPromptPopup(root, app),
         .credential_prompt => drawCredentialPopup(root, app),
-        .command_log => drawCommandLogPopup(root, app),
+        .command_log => drawCommandLog(root, app),
         .help => drawHelpPopup(root, app),
         .operation => drawOperationPopup(root, app),
         .commit_graph => drawCommitGraphPopup(root, app),
@@ -2422,7 +2432,7 @@ const help_lines = [_][]const u8{
     "  z              maximize the Diff panel to full screen (z or esc exits)",
     "  + / _          global screen mode: normal, half, full",
     "  } / {          focused panel size: collapsed, single, normal",
-    "  @              command log",
+    "  @              command log (z toggles fullscreen)",
     "  ?              this help",
     "  ctrl+z         undo the last operation (reflog reset)",
     "  ctrl+r         switch to a recently opened repository",
@@ -2836,50 +2846,32 @@ fn helpKeyEnd(text: []const u8) ?usize {
     return null;
 }
 
-fn drawCommandLogPopup(root: vaxis.Window, app: *app_mod.App) void {
+fn drawCommandLog(root: vaxis.Window, app: *app_mod.App) void {
     const st = styles();
-    const log = app.git.command_log.items;
-    const w: u16 = @min(@as(u16, 90), root.width -| 4);
-    const h: u16 = @min(@as(u16, 20), root.height -| 2);
+    const full = app.command_log_fullscreen;
+    const w = if (full) root.width else @min(@as(u16, 90), root.width -| 4);
+    const h = if (full) root.height else @min(@as(u16, 20), root.height -| 2);
     const win = popup(root, w, h, "Command log", null);
-    const px0: u16 = (root.width - w) / 2;
-    const py0: u16 = (root.height - h) / 2;
-    app.beginDialogGrid(px0 + 1, py0 + 1, win.height);
-    const footer_row: u16 = win.height -| 1;
-    if (log.len == 0) {
-        // Reset the scroll so the "open at bottom" sentinel (maxInt) can't
-        // linger and overflow the next scroll keypress.
-        app.command_log_max_scroll = 0;
-        app.command_log_scroll = 0;
+    const footer_row = win.height -| 1;
+    app.beginDialogGrid(@intCast(win.x_off), @intCast(win.y_off), footer_row);
+    app.layoutCommandLog(win.width, footer_row);
+    const rows = app.command_log_rows.items;
+    if (rows.len == 0) {
         print(win, 0, 0, "No commands run yet.", st.muted);
-        print(win, footer_row, 0, "enter/esc close", st.bottom_accent);
-        return;
-    }
-    // Wrap every command into visual lines (long ones wrap, not cut), then show
-    // a scrolled window of them with the newest at the bottom.
-    const cw = win.width;
-    var vis: [512][]const u8 = undefined;
-    var total: usize = 0;
-    for (log) |entry| {
-        var segs: [16][]const u8 = undefined;
-        const n = wrapText(entry, cw, &segs);
-        for (segs[0..n]) |s| {
-            if (total >= vis.len) break;
-            vis[total] = s;
-            total += 1;
+    } else {
+        const start = app.command_log_scroll;
+        for (rows[start..@min(start + footer_row, rows.len)], 0..) |item, y| {
+            const entry = app.git.command_log.items[item.entry];
+            const row = item.row;
+            const text = entry.text[row.start..row.end];
+            const base = if (row.start == 0) st.warning else if (row.start == entry.output_start) st.active_title else st.normal;
+            app.setDialogRow(y, text);
+            const selection = app.dialogRowSelection(y);
+            printAnsiEmph(win, @intCast(y), text, base, if (selection) |sel| sel.lo else 0, if (selection) |sel| sel.hi else 0, row.vis_start, &.{}, 0, row.vis_end - row.vis_start, false);
         }
+        drawScrollbarRange(root, @intCast(win.x_off + win.width), @intCast(win.y_off), footer_row, rows.len, start, true);
     }
-    const avail: usize = footer_row; // content rows above the footer
-    app.command_log_max_scroll = total -| avail;
-    app.command_log_scroll = @min(app.command_log_scroll, app.command_log_max_scroll);
-    var idx: usize = app.command_log_scroll;
-    var row: u16 = 0;
-    while (idx < total and row < footer_row) : (idx += 1) {
-        drawDialogRow(win, app, row, vis[idx], st.normal);
-        row += 1;
-    }
-    drawScrollbarRange(root, px0 + w - 1, py0 + 1, avail, total, app.command_log_scroll, true);
-    print(win, footer_row, 0, "up/down scroll   enter/esc close", st.bottom_accent);
+    print(win, footer_row, 0, if (full) "up/down scroll   z shrink   esc close" else "up/down scroll   z fullscreen   esc close", st.bottom_accent);
 }
 
 fn drawPrPreviewPopup(root: vaxis.Window, app: *app_mod.App) void {
@@ -3726,7 +3718,7 @@ fn drawDiffTitle(raw: vaxis.Window, text: []const u8, style: vaxis.Style) void {
         if (text[end] == '\n' or text[end] == '\r') {
             break;
         }
-        const cell = decodeCell(raw, text, end);
+        const cell = decodeCell(raw, text, end, false);
         const cell_width = if (text[end] == '\t') 4 else cell.width;
         if (cell_width > available - width) {
             const col = printSpan(raw, 0, 2, text[0..clipped_end], style);
@@ -4756,7 +4748,7 @@ fn drawStash(win: vaxis.Window, app: *const app_mod.App) void {
     }
 }
 
-// --- Status preview header ---
+// --- Status about splash ---
 
 /// 5-row block-font glyphs (each 5 columns, `#` = filled) for the banner word.
 fn bannerGlyph(c: u8) [5][]const u8 {
@@ -4871,10 +4863,9 @@ fn currentYear(now_unix: i64) u16 {
     return es.getEpochDay().calculateYearDay().year;
 }
 
-fn drawStatusOutput(root: vaxis.Window, pane: vaxis.Window, app: *app_mod.App) void {
+fn drawAboutSplash(win: vaxis.Window, app: *app_mod.App) void {
     const st = styles();
-    if (pane.width == 0 or pane.height == 0) return;
-    const win = pane.child(.{ .height = pane.height -| 3 });
+    if (win.width == 0 or win.height == 0) return;
     // Limit selection to the header's text rows.
     app.beginDialogGrid(@intCast(@max(win.x_off, 0)), @intCast(@max(win.y_off, 0)), win.height);
     var row: u16 = 1;
@@ -4882,7 +4873,7 @@ fn drawStatusOutput(root: vaxis.Window, pane: vaxis.Window, app: *app_mod.App) v
 
     // Banner (only when there's vertical room for it plus the text below). Drawn
     // with `print`, not registered — the block art isn't worth selecting.
-    if (win.height > banner_rows + 8 and win.width >= banner_width) {
+    if (win.height > banner_rows + 15 and win.width >= banner_width) {
         var buf: [256]u8 = undefined;
         var r: usize = 0;
         while (r < banner_rows) : (r += 1) {
@@ -4925,17 +4916,52 @@ fn drawStatusOutput(root: vaxis.Window, pane: vaxis.Window, app: *app_mod.App) v
     aboutLine(win, app, &row, &slot, std.fmt.bufPrint(&sbuf, "{d} changed  ({d} staged, {d} unstaged)", .{ app.data.files.len, app.data.stagedCount(), app.data.unstagedCount() }) catch "", st.normal);
     aboutLine(win, app, &row, &slot, std.fmt.bufPrint(&sbuf, "{d} branches  {d} stashes", .{ app.data.branches.len, app.data.stash.len }) catch "", st.normal);
 
-    const output_top = @min(row + 1, win.height);
-    app.dialog_row_count = @min(app.dialog_row_count, output_top);
-    const output = pane.child(.{ .y_off = output_top });
-    app.main_view_height = output.height;
-    app.main_scroll = @min(app.main_scroll, app.maxMainScroll());
-    if (app.shell_output.len == 0) {
-        print(output, 0, 0, "Run a command to see its result here", st.muted);
-    } else {
-        app.status_output_rect = .{ .focus = .main, .x = @intCast(output.x_off), .y = @intCast(output.y_off), .w = output.width, .h = output.height };
-        drawDiffContent(output, app, app.shell_output, .main);
-        drawScrollbarRange(root, @intCast(output.x_off + output.width), @intCast(output.y_off), output.height, app.mainContentLines(), app.main_scroll, app.focus == .main);
+    app.dialog_row_count = @min(app.dialog_row_count, row);
+    // The donut fills whatever vertical space is left (unregistered rows).
+    const donut_top = row + 1;
+    if (win.height > donut_top + 6) {
+        drawDonut(win, donut_top, win.width, win.height - donut_top, app.anim_frame);
+    }
+}
+
+const donut_max_w = 200;
+const donut_max_h = 80;
+// Frame-local scratch for donut_mod.render (UI thread only): shade level per
+// cell (0 = empty) and the z-buffer. Sized generously; larger panels clamp.
+var donut_cell: [donut_max_w * donut_max_h]u8 = undefined;
+var donut_depth: [donut_max_w * donut_max_h]f32 = undefined;
+
+fn shadeColor(level: usize) u8 {
+    // A dim-blue -> cyan -> white ramp, all basic ANSI (palette-safe).
+    return if (level < 3) 4 else if (level < 6) 6 else if (level < 9) 14 else 15;
+}
+
+/// Compute one donut frame (via `donut_mod`) and blit it into the panel at
+/// `(0, y0)` sized `w x h` (panel-relative columns/rows). The shade math lives in
+/// `donut.zig`; here we only map levels to a glyph + colour and write cells.
+fn drawDonut(win: vaxis.Window, y0: u16, w: u16, h: u16, frame: usize) void {
+    const cw: usize = @min(@as(usize, w), donut_max_w);
+    const ch: usize = @min(@as(usize, h), donut_max_h);
+    if (cw < 8 or ch < 6) return;
+    const cells = cw * ch;
+    donut_mod.render(frame, cw, ch, donut_depth[0..cells], donut_cell[0..cells]);
+
+    // ASCII shades map through the static table so the grapheme reference is
+    // stable for vaxis (which stores it by reference until the flush).
+    var yy: usize = 0;
+    while (yy < ch) : (yy += 1) {
+        var xx: usize = 0;
+        while (xx < cw) : (xx += 1) {
+            const level = donut_cell[yy * cw + xx];
+            if (level == 0) continue;
+            const col: u16 = @intCast(xx);
+            const rr: u16 = y0 + @as(u16, @intCast(yy));
+            if (rr >= win.height or col >= win.width) continue;
+            win.writeCell(col, rr, .{
+                .char = .{ .grapheme = ascii_table[donut_mod.shades[level - 1]][0..1], .width = 1 },
+                .style = .{ .fg = .{ .index = shadeColor(level - 1) }, .bold = true },
+            });
+        }
     }
 }
 
@@ -5008,7 +5034,7 @@ pub fn deinitWordCache() void {
 }
 
 fn refreshOnDiffChange(vx: *vaxis.Vaxis, app: *const app_mod.App) void {
-    const text = if (app.showStatusOutput()) app.shell_output else app.diff;
+    const text = app.diff;
     const addr = @intFromPtr(text.ptr);
     const spinner = app.previewSpinnerVisible();
     if (addr == last_diff_addr and text.len == last_diff_len and
@@ -5312,7 +5338,7 @@ fn wordBg(em: worddiff.Emph) u8 {
 /// selection are mapped onto each rendered segment.
 fn drawDiffContent(win: vaxis.Window, app: *const app_mod.App, text: []const u8, pane: app_mod.SelPane) void {
     const base = styles().normal;
-    const emph_lines = if (app.showStatusOutput()) &.{} else wordEmphasis(app.allocator, text);
+    const emph_lines = wordEmphasis(app.allocator, text);
     const sel = app.diffSelectionRangeFor(pane);
 
     const cursor = app.diffCursorLine();
@@ -5623,7 +5649,7 @@ fn drawBottom(win: vaxis.Window, app: *app_mod.App) void {
         return;
     }
     if (app.mode == .command_log) {
-        print(win, 0, 0, "command log  -  press any key to close", st.bottom_accent);
+        print(win, 0, 0, "command log", st.bottom_accent);
         return;
     }
     if (app.mode == .help) {
@@ -6162,7 +6188,7 @@ fn printSpan(win: vaxis.Window, row: u16, col: u16, text: []const u8, style: vax
             i += 1;
             continue;
         }
-        const dc = decodeCell(win, text, i);
+        const dc = decodeCell(win, text, i, true);
         emitRowCell(win, out_col, row, dc.grapheme, dc.width, style);
         out_col += dc.width;
         i += dc.len;
@@ -6370,7 +6396,7 @@ fn printAnsiEmph(win: vaxis.Window, row: u16, line: []const u8, base: vaxis.Styl
             i += 1;
             continue;
         }
-        const dc = decodeCell(win, line, i);
+        const dc = decodeCell(win, line, i, vis_col >= h_off);
         emit(win, vis_col, char_ord, h_off, row, dc.grapheme, dc.width, style, sel_lo, sel_hi, emph, emph_bg, ref_badge);
         vis_col += dc.width;
         char_ord += 1;
@@ -6547,12 +6573,12 @@ fn stashGrapheme(bytes: []const u8) ?[]const u8 {
 }
 
 /// One display cell decoded from `text` at byte `i`. An ASCII printable maps to
-/// the static table; a well-formed UTF-8 sequence is copied into the frame arena
-/// and measured with `gwidth`; anything else (a control byte, invalid UTF-8, or a
-/// full arena) becomes '?'. `len` is the bytes consumed, `width` the columns.
+/// the static table; a well-formed UTF-8 sequence is measured with `gwidth` and
+/// only copied into the frame arena when rendered. A control byte, invalid UTF-8, or a
+/// full arena becomes '?'. `len` is the bytes consumed, `width` the columns.
 const DecodedCell = struct { grapheme: []const u8, len: usize, width: u16 };
 
-fn decodeCell(win: vaxis.Window, text: []const u8, i: usize) DecodedCell {
+fn decodeCell(win: vaxis.Window, text: []const u8, i: usize, retain: bool) DecodedCell {
     const b = text[i];
     if (b < 0x80) {
         // ASCII printables use the static table (no arena, no lifetime worry);
@@ -6569,8 +6595,9 @@ fn decodeCell(win: vaxis.Window, text: []const u8, i: usize) DecodedCell {
     var it = vaxis.unicode.graphemeIterator(text[i..]);
     const g = it.next() orelse return .{ .grapheme = text[i .. i + first_len], .len = first_len, .width = 1 };
     const seq_len = if (g.len >= first_len) g.len else first_len;
-    const stored = stashGrapheme(text[i .. i + seq_len]) orelse return .{ .grapheme = "?", .len = seq_len, .width = 1 };
-    const w = win.gwidth(stored);
+    const grapheme = text[i .. i + seq_len];
+    const stored = if (retain) stashGrapheme(grapheme) orelse return .{ .grapheme = "?", .len = seq_len, .width = 1 } else grapheme;
+    const w = win.gwidth(grapheme);
     return .{ .grapheme = stored, .len = seq_len, .width = if (w == 0) 1 else w };
 }
 
@@ -7556,4 +7583,30 @@ test "help search ranks full matches then whole words then substrings" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "command log preserves Unicode near the end of a wrapped line" {
+    const a = std.testing.allocator;
+    var screen = try vaxis.Screen.init(a, .{ .cols = 90, .rows = 15, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(a);
+    const root: vaxis.Window = .{ .screen = &screen, .width = 90, .height = 15, .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0 };
+    var app: app_mod.App = .{
+        .allocator = a,
+        .git = .{ .allocator = a, .io = undefined, .root = undefined, .environ = undefined },
+        .mode = .command_log,
+        .command_log_fullscreen = true,
+        .config = .{},
+    };
+    defer app.git.clearCommandLog();
+    defer app.command_log_rows.deinit(a);
+    var output: [10_000]u8 = undefined;
+    for (0..5000) |i| @memcpy(output[i * 2 ..][0..2], "é");
+    app.git.recordCommandResult("Shell Command", "long Unicode", true, .{
+        .stdout = &output,
+        .stderr = &.{},
+        .term = .{ .exited = 0 },
+    });
+    resetGraphemeArena();
+    drawCommandLog(root, &app);
+    try std.testing.expectEqualStrings("é", root.readCell(1, 11).?.char.grapheme);
 }

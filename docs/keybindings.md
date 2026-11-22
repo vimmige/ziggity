@@ -40,7 +40,7 @@ the written reference. Every binding is remappable, see
   [comparison.md](comparison.md#jump-between-repositories))
 - `ctrl+w`: toggle soft-wrapping of long lines in the diff panels (see
   [comparison.md](comparison.md#wrap-long-lines-on-demand))
-- `@`: command log (recent git commands ziggity ran)
+- `@`: open the session command log for user-triggered Git and shell commands. Press `z` to toggle fullscreen and `Esc` to close.
 - `y`: copy the selection to the system clipboard. What it copies follows the
   focused panel: the file path (Files), a copy menu for the commit hash,
   subject or author (Commits), the branch, tag or remote branch name

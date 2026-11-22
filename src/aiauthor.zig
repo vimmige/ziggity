@@ -158,7 +158,7 @@ pub fn generate(allocator: std.mem.Allocator, git: *git_mod.Git, command: []cons
     };
     defer allocator.free(prompt);
 
-    var res = git.runAiCommand(command, prompt) catch return GenError.AiCommandFailed;
+    var res = git.runAiCommand(command, prompt, command_output != null) catch return GenError.AiCommandFailed;
     defer if (command_output) |output| {
         output.* = res;
     } else {
@@ -434,7 +434,7 @@ pub fn generatePrDoc(allocator: std.mem.Allocator, git: *git_mod.Git, command: [
     const prompt = try buildPrPrompt(allocator, ctx, title_instr, body_instr);
     defer allocator.free(prompt);
 
-    const res = git.runAiCommand(command, prompt) catch return GenError.AiCommandFailed;
+    const res = git.runAiCommand(command, prompt, true) catch return GenError.AiCommandFailed;
     command_output.* = res;
     if (!res.ok()) return GenError.AiCommandFailed;
     const out = std.mem.trim(u8, res.stdout, " \t\r\n");
@@ -771,4 +771,28 @@ test "normalizeBody keeps list items on their own lines" {
     const body = try normalizeBody(a, raw, 72);
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\n- first item\n") != null);
+}
+
+test "manual PR generation keeps diagnostics beyond the old capture limit" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("PATH", "/usr/bin:/bin");
+    try env.put("HOME", path);
+    var git: git_mod.Git = .{ .allocator = a, .io = io, .environ = &env, .root = @constCast(path), .git_dir = @constCast(path) };
+    var output: ?git_mod.ExecResult = null;
+    defer if (output) |*r| r.deinit(a);
+    var doc = try generatePrDoc(a, &git, "(cat >/dev/null; head -c 262145 /dev/zero >&2; printf 'Test title\\n\\nTest body')", .{
+        .subject = "test",
+        .commit_log = "",
+        .diff = "",
+    }, &output);
+    defer doc.deinit(a);
+    try std.testing.expectEqualStrings("Test title", doc.title);
+    try std.testing.expectEqual(@as(usize, 262145), output.?.stderr.len);
 }
