@@ -2421,7 +2421,7 @@ pub fn deinitSplitRowsCache() void {
 
 // ---- Hunk-header line index (read Diff panel navigation) -----------------
 //
-// The line indices of each hunk's `@@` header in the preview, so `J`/`K` can
+// The line indices of each hunk's `@@` header in the preview, so navigation can
 // jump between changes and `d` can target the hunk at the top. The preview is
 // git's coloured text, so the scan skips leading ANSI before matching `@@`.
 // Stripping ANSI does not add or drop lines, so these indices also index the
@@ -2527,7 +2527,7 @@ pub fn deinitHunkLinesCache() void {
 //
 // `git diff` with full context returns the whole file as one hunk, collapsing
 // every change into it. `=` instead keeps each change its own small hunk exactly
-// as the normal view has it (so it is still boxed and `J`/`K`-reachable), and
+// as the normal view has it (so it is still boxed and selectable), and
 // shows the unchanged lines between those hunks as plain "gap" hunks: context
 // that belongs to no change. A gap hunk is emitted as a change-free `@@` section;
 // the row builder then renders it without a header or box, so it reads as the
@@ -2679,7 +2679,7 @@ fn emitExpandedHunks(gpa: std.mem.Allocator, out: *std.ArrayList(u8), header: []
 // ---- Change-hunk line index (whole-file review navigation) ---------------
 //
 // The whole-file (`=`) view carries change-free gap hunks whose headers the row
-// builder hides. The review's `J`/`K` cursor and selection box must skip them,
+// builder hides. The review cursor and selection box must skip them,
 // so navigation runs over this index: the `@@` line of each hunk that actually
 // has a change. For a normal diff every hunk changes, so it equals
 // `diffHunkLines`; it is only ever narrower in the whole-file view.
@@ -2778,6 +2778,7 @@ pub const SplitVRow = struct {
     hoff: usize = 0,
     hlen: usize = 0,
     hline: usize = 0, // the header's diff line index (for the hunk-cursor highlight)
+    pair_row: usize = 0,
     left: SplitSeg = .{},
     right: SplitSeg = .{},
 };
@@ -2861,7 +2862,7 @@ fn buildSplitWrap(gpa: std.mem.Allocator, plain: []const u8, col_w: u16) ![]Spli
     const empty_segs: []const diffwrap.Row = &.{};
     var out: std.ArrayList(SplitVRow) = .empty;
     errdefer out.deinit(gpa);
-    for (sr.rows) |r| {
+    for (sr.rows, 0..) |r, pair_row| {
         if (r.kind == .spacer) {
             try out.append(gpa, .{ .spacer = true });
             continue;
@@ -2875,7 +2876,7 @@ fn buildSplitWrap(gpa: std.mem.Allocator, plain: []const u8, col_w: u16) ![]Spli
         const height = @max(@max(lsegs.len, rsegs.len), @as(usize, 1));
         var i: usize = 0;
         while (i < height) : (i += 1) {
-            var v: SplitVRow = .{};
+            var v: SplitVRow = .{ .pair_row = pair_row };
             if (i < lsegs.len) {
                 v.left = segFrom(r.left, lsegs[i]);
                 if (i == 0) v.left.old_no = r.left.old_no; // number the first wrap row
@@ -3000,6 +3001,8 @@ test "review line navigation skips separators and selects the hunk it enters" {
     app.main_view_height = 2;
     try app.openDiffReview();
     app.applyReviewPendingScroll();
+    try std.testing.expectEqual(@as(?usize, null), app.reviewCursorRow());
+    try app.handleKey(.{ .codepoint = 'a' });
     try std.testing.expectEqual(@as(?usize, 1), app.reviewCursorRow());
 
     try app.handleKey(.{ .codepoint = 'j' });
@@ -3008,7 +3011,13 @@ test "review line navigation skips separators and selects the hunk it enters" {
     try std.testing.expectEqual(@as(usize, 4), app.main_scroll);
     try std.testing.expectEqual(@as(?usize, 5), app.reviewCursorRow());
     try std.testing.expectEqual(@as(?usize, 1), app.currentDiffHunk());
-    try app.handleKey(.{ .codepoint = 'K' });
+    try app.handleKey(.{ .codepoint = 'a' });
+    try app.handleKey(.{ .codepoint = 'a' });
+    try std.testing.expectEqual(@as(?usize, 5), app.reviewCursorRow());
+    try app.handleKey(.{ .codepoint = 'a' });
+    try app.handleKey(.{ .codepoint = vaxis.Key.up });
+    try app.handleKey(.{ .codepoint = 'a' });
+    try std.testing.expectEqual(@as(?usize, 1), app.reviewCursorRow());
     try std.testing.expectEqual(@as(?usize, 0), app.currentDiffHunk());
     try app.handleKey(.{ .codepoint = vaxis.Key.end });
     try std.testing.expectEqual(@as(?usize, 1), app.currentDiffHunk());
@@ -3033,7 +3042,8 @@ test "narrow wrapped review skips change-free hunks for selection and discard" {
     app.review_whole_file = true;
     app.applyReviewPendingScroll();
 
-    for (0..4) |_| try app.handleKey(.{ .codepoint = 'j' });
+    try app.handleKey(.{ .codepoint = 'a' });
+    for (0..2) |_| try app.handleKey(.{ .codepoint = 'j' });
     try std.testing.expect(!app.reviewDiscardOffered());
     try app.handleKey(.{ .codepoint = 'd' });
     try std.testing.expectEqualStrings("", app.message);
@@ -3108,7 +3118,7 @@ test "the final change hunk is counted when the diff ends on it" {
     // end of the split with no gap hunk after it.
     try std.testing.expect(std.mem.indexOf(u8, split, "@@ -7,2 +7,2 @@") != null);
     // Both changes are counted; before the fix the final one was dropped (the view
-    // showed one fewer change than the compact view and `J`/`K` could not reach it).
+    // showed one fewer change than the compact view and navigation could not reach it).
     const changes = changeHunkLines(a, split);
     try std.testing.expectEqual(@as(usize, 2), changes.len);
 }
@@ -3199,6 +3209,7 @@ test "review wrap toggle keeps the selected diff line visible" {
     app.main_view_height = 4;
     try app.openDiffReview();
     app.applyReviewPendingScroll();
+    try app.handleKey(.{ .codepoint = 'a' });
     try app.handleKey(.{ .codepoint = 'j' });
     try app.handleKey(.{ .codepoint = 'j' });
     try std.testing.expectEqual(@as(?usize, 5), app.diffLineAtContentRow(app.reviewCursorRow().?));
@@ -3791,9 +3802,9 @@ pub const App = struct {
     staging_diff: []u8 = &.{},
     staging: ?diff_mod.ParsedDiff = null,
     staging_cursor: usize = 0,
+    staging_line_mode: bool = false,
     staging_anchor: ?usize = null,
-    // Split staging view: when on, the unstaged and staged diffs show side by
-    // side. The active side (`staging_staged_view`) is interactive; the other is
+    // Split staging stacks the diffs. The active side is interactive; the other is
     // a read-only preview. Each file opens with the config-decided layout
     // (`stagingLayoutForOpen`); `\` overrides it for that file only.
     staging_split: bool = false,
@@ -3836,7 +3847,7 @@ pub const App = struct {
     // or `esc`, independently of the global screen mode.
     diff_fullscreen: bool = false,
     // The hunk the side-by-side review's cursor is on (index into the preview's
-    // hunks). `J`/`K` move it and it is highlighted. Reset to 0 when the shown
+    // hunks). Reset to 0 when the shown
     // content changes; clamped to the hunk count when read.
     diff_hunk: usize = 0,
     // The main panel's scroll saved while the side-by-side review mode is open, so
@@ -3847,6 +3858,7 @@ pub const App = struct {
     // first frame, once the (full-screen) view size is known.
     review_pending_scroll: bool = false,
     review_line_cursor: ?usize = null,
+    review_line_mode: bool = false,
     // `=` in the review: show the entire file (the current diff re-run with full
     // context) instead of just the changed hunks. `review_whole_diff` holds that
     // expanded diff (owned); `activeMainText` returns it while the flag is on, so
@@ -5481,19 +5493,11 @@ pub const App = struct {
             if (km.new_branch.matches(key)) return self.startNewBranchFromCommit(); // n
         }
 
-        // In the staging view, shift+arrow (and J/K) jump by hunk rather than
-        // extending a range — the staging range is anchored with `v` instead, and
-        // shift+arrow does nothing else there. Handled before the list-panel
-        // range binding below so it takes precedence while staging.
         if (self.staging_active) {
             const km = self.config.keymap;
-            if (key.matches(vaxis.Key.down, .{ .shift = true }) or km.staging_next_hunk.matches(key)) {
-                staging_mod.moveStagingHunk(self, true);
-                return;
-            }
-            if (key.matches(vaxis.Key.up, .{ .shift = true }) or km.staging_prev_hunk.matches(key)) {
-                staging_mod.moveStagingHunk(self, false);
-                return;
+            if (!self.staging_patch_mode and km.diff_selection_toggle.matches(key)) {
+                staging_mod.toggleStagingSelection(self);
+                return self.setMessage("{s} selection", .{if (self.staging_line_mode) "line" else "hunk"});
             }
             // `d` discards the line/hunk under the cursor, mirroring `space` but
             // throwing the change away instead of staging it. Only in the real
@@ -6435,22 +6439,16 @@ pub const App = struct {
     }
 
     /// The screen rect of a selectable text pane, or null if it isn't on screen.
-    /// In the split staging view the main area is halved (active | read-only);
+    /// In the split staging view the main area is split into two rows;
     /// otherwise the whole main area is the `.main` pane and there is no `.other`.
     pub fn paneRectFor(self: *const App, pane: SelPane) ?PanelRect {
         if (self.showStatusOutput()) return if (pane == .main) self.status_output_rect else null;
         const m = self.mainRect() orelse return null;
         if (self.staging_active and self.staging_split) {
-            const left_w = m.w / 2;
-            const left: PanelRect = .{ .focus = .main, .x = m.x, .y = m.y, .w = left_w, .h = m.h };
-            const right: PanelRect = .{ .focus = .main, .x = m.x + left_w, .y = m.y, .w = m.w - left_w, .h = m.h };
-            // The active pane (`staging_diff`) is the unstaged (left) side unless
-            // the staged side is the one being edited.
-            const active_left = !self.staging_staged_view;
-            return switch (pane) {
-                .main => if (active_left) left else right,
-                .other => if (active_left) right else left,
-            };
+            const top_h = m.h / 2;
+            const top: PanelRect = .{ .focus = .main, .x = m.x, .y = m.y, .w = m.w, .h = top_h };
+            const bottom: PanelRect = .{ .focus = .main, .x = m.x, .y = m.y + top_h, .w = m.w, .h = m.h - top_h };
+            return if ((pane == .main) == self.staging_staged_view) bottom else top;
         }
         return switch (pane) {
             .main => m,
@@ -6509,9 +6507,10 @@ pub const App = struct {
     fn diffPointFor(self: *const App, pane: SelPane, r: PanelRect, col: u16, row: u16) DiffPoint {
         const border: u16 = if (self.showStatusOutput()) 0 else 1;
         const content_top = r.y + border;
-        const content_left = r.x + border;
+        const gutter: u16 = if (self.staging_active and !self.staging_patch_mode and r.w >= 7) 1 else 0;
+        const content_left = r.x + border + gutter;
         const content_h = r.h -| (2 * border);
-        const content_w = r.w -| (2 * border);
+        const content_w = r.w -| (2 * (border + gutter));
         const rel_row: u16 = if (row <= content_top) 0 else @min(row - content_top, content_h -| 1);
         const screen_col: usize = if (col <= content_left) 0 else @min(col - content_left, content_w);
 
@@ -8895,7 +8894,7 @@ pub const App = struct {
         return self.paneText(.main);
     }
 
-    /// The `@@` hunks the review's `J`/`K` cursor steps through. In the whole-file
+    /// The `@@` hunks the review cursor steps through. In the whole-file
     /// (`=`) view the change-free gap hunks are skipped, so navigation and the box
     /// land only on real changes; a normal diff has no gaps, so this equals
     /// `diffHunkLines`.
@@ -8939,6 +8938,7 @@ pub const App = struct {
         self.clearReviewWholeFile();
         self.clearReviewSelection();
         self.review_pending_scroll = true;
+        self.review_line_mode = false;
         self.review_line_cursor = null;
         self.mode = .diff_review;
     }
@@ -9000,6 +9000,8 @@ pub const App = struct {
         else
             0;
 
+        const saved_line = self.reviewFileLine();
+
         if (self.review_whole_file) {
             self.clearReviewWholeFile();
             try self.setMessage("whole file: off", .{});
@@ -9014,12 +9016,35 @@ pub const App = struct {
 
         const hunks = self.reviewHunkLines();
         self.diff_hunk = if (hunks.len == 0) 0 else @min(self.diff_hunk, hunks.len - 1);
-        self.review_line_cursor = null;
         self.main_hscroll = 0;
         self.main_scroll = if (hunks.len == 0)
             0
         else
             @min(self.diffHunkRow(self.diff_hunk) -| offset, self.maxMainScroll());
+        self.restoreReviewPosition(.{ .top = null, .cursor = if (saved_line) |line| self.reviewSourceLine(line) else null });
+    }
+
+    const ReviewFileLine = struct { number: usize, right: bool };
+
+    fn reviewFileLine(self: *const App) ?ReviewFileLine {
+        const row = self.reviewCursorRow() orelse self.review_line_cursor orelse return null;
+        const line = self.diffLineAtContentRow(row) orelse return null;
+        for (self.splitRows().rows) |pair| {
+            if (pair.left.old_no != 0 and pair.left.line == line)
+                return .{ .number = pair.left.old_no, .right = false };
+            if (pair.right.new_no != 0 and pair.right.line == line)
+                return .{ .number = pair.right.new_no, .right = true };
+        }
+        return null;
+    }
+
+    fn reviewSourceLine(self: *const App, saved: ReviewFileLine) ?usize {
+        for (self.splitRows().rows) |pair| {
+            const cell = if (saved.right) pair.right else pair.left;
+            const number = if (saved.right) cell.new_no else cell.old_no;
+            if (number == saved.number) return cell.line;
+        }
+        return null;
     }
 
     /// Build the whole-file diff for the current review source: the file's diff
@@ -9077,8 +9102,11 @@ pub const App = struct {
             return;
         }
         const page: isize = @intCast(if (self.main_view_height == 0) 20 else self.main_view_height);
-        if (km.down.matches(key) or key.matches(vaxis.Key.down, .{})) return self.moveReviewLine(true);
-        if (km.up.matches(key) or key.matches(vaxis.Key.up, .{})) return self.moveReviewLine(false);
+        if (km.diff_selection_toggle.matches(key)) return self.toggleReviewSelection();
+        if (km.down.matches(key) or key.matches(vaxis.Key.down, .{}))
+            return if (self.review_line_mode) self.moveReviewLine(true) else self.moveDiffHunk(true);
+        if (km.up.matches(key) or key.matches(vaxis.Key.up, .{}))
+            return if (self.review_line_mode) self.moveReviewLine(false) else self.moveDiffHunk(false);
         if (key.matches(vaxis.Key.page_down, .{})) return self.scrollMain(page);
         if (key.matches(vaxis.Key.page_up, .{})) return self.scrollMain(-page);
         if (key.matches(vaxis.Key.home, .{})) {
@@ -9091,14 +9119,12 @@ pub const App = struct {
         }
         // `space` recentres the view on the selected hunk after scrolling away.
         if (key.matches(' ', .{})) return self.refocusDiffHunk();
-        if (km.staging_next_hunk.matches(key) or key.matches(vaxis.Key.down, .{ .shift = true })) return self.moveDiffHunk(true);
-        if (km.staging_prev_hunk.matches(key) or key.matches(vaxis.Key.up, .{ .shift = true })) return self.moveDiffHunk(false);
         if (km.toggle_wrap.matches(key)) return self.toggleWrapDiff();
         if (km.scroll_left.matches(key) or key.matches(vaxis.Key.left, .{ .shift = true })) return self.scrollMainHorizontal(-@as(i32, horizontal_scroll_step));
         if (km.scroll_right.matches(key) or key.matches(vaxis.Key.right, .{ .shift = true })) return self.scrollMainHorizontal(@as(i32, horizontal_scroll_step));
         if (self.reviewWholeFileAvailable() and key.matches('=', .{})) return self.toggleReviewWholeFile();
         if (km.discard.matches(key)) {
-            if (self.reviewDiscardTarget()) |hunk| return self.discardReviewHunk(hunk);
+            if (self.reviewDiscardTarget()) |hunk| return self.discardReviewSelection(hunk);
         }
     }
 
@@ -9122,6 +9148,15 @@ pub const App = struct {
     fn reviewDiscardTarget(self: *const App) ?usize {
         if (!self.reviewDiscardSourceAllowed() or self.foregroundBusy()) return null;
         const hunk = self.currentDiffHunk() orelse return null;
+        if (!self.review_line_mode) {
+            const top = self.diffHunkRow(hunk);
+            const height = if (self.main_view_height == 0) 20 else self.main_view_height;
+            const visible = if (top >= self.main_scroll)
+                top - self.main_scroll < height
+            else
+                self.changeHunkAtRow(self.main_scroll) == hunk;
+            return if (visible) hunk else null;
+        }
         const row = self.reviewCursorRow() orelse return null;
         if (self.selectedHunkRowBox()) |box| {
             return if (row >= box.top and row <= box.bottom) hunk else null;
@@ -9129,12 +9164,42 @@ pub const App = struct {
         return if (self.changeHunkAtRow(row) == hunk) hunk else null;
     }
 
-    /// `d` in the review: discard the whole hunk the cursor is on. From staging it
-    /// applies to the active side (and the review refreshes in place); from a
-    /// working-tree file's review it discards from the working tree and returns to
-    /// the Diff panel. Immediate, like the staging view's `d` — the highlighted
-    /// hunk is the deliberate target.
-    fn discardReviewHunk(self: *App, ci: usize) !void {
+    const ReviewDiscardRow = struct { line: usize, deletion: ?diff_mod.DeletionPlacement = null };
+
+    fn reviewDiscardRow(self: *const App, row: usize) ?ReviewDiscardRow {
+        if (self.splitActive()) {
+            const pair_row = if (self.wrap_diff) self.splitWrapRows()[row].pair_row else row;
+            const rows = self.splitRows().rows;
+            const pair = rows[pair_row];
+            if (pair.right.kind == .add) {
+                const deletion: ?diff_mod.DeletionPlacement = if (pair.left.kind == .del)
+                    .{ .line = pair.left.line, .before = pair.right.line }
+                else
+                    null;
+                return .{ .line = pair.right.line, .deletion = deletion };
+            }
+            if (pair.left.kind == .del) {
+                var earlier = pair_row;
+                while (earlier > 0) {
+                    earlier -= 1;
+                    const previous = rows[earlier];
+                    if (previous.kind != .pair or previous.left.kind != .del) break;
+                    // Restore a deletion-only row below the additions already paired above it.
+                    if (previous.right.kind == .add) {
+                        return .{
+                            .line = pair.left.line,
+                            .deletion = .{ .line = pair.left.line, .before = previous.right.line + 1 },
+                        };
+                    }
+                }
+                return .{ .line = pair.left.line };
+            }
+            return null;
+        }
+        return .{ .line = self.diffLineAtContentRow(row) orelse return null };
+    }
+
+    fn discardReviewSelection(self: *App, ci: usize) !void {
         const src = self.activeMainText();
         // The cursor indexes change hunks; in the whole-file view the diff also
         // carries change-free gap hunks, so map the cursor to the parsed-hunk
@@ -9156,11 +9221,39 @@ pub const App = struct {
         var parsed = diff_mod.parse(self.allocator, clean) catch return self.setMessage("could not parse the diff", .{});
         defer parsed.deinit(self.allocator);
         if (hi >= parsed.hunks.len) return self.setMessage("no hunk to discard", .{});
-        const patch = diff_mod.buildHunkPatch(self.allocator, clean, parsed, hi) catch return self.setMessage("could not build the patch", .{});
+        const selected = if (self.review_line_mode)
+            self.reviewDiscardRow(self.reviewCursorRow() orelse return) orelse return self.setMessage("selection contains no change", .{})
+        else
+            null;
+        const forward = selected != null and diff_mod.isNewFileDiff(clean, parsed);
+        const patch = if (selected) |row| blk: {
+            const start = target_line + 1;
+            if (row.line < start) return self.setMessage("selection contains no change", .{});
+            const body_line = row.line - start;
+            const built = if (row.deletion) |deletion| aligned: {
+                if (deletion.line < start or deletion.before < start)
+                    return self.setMessage("selection contains no change", .{});
+                break :aligned diff_mod.buildAlignedDiscardPatch(self.allocator, clean, parsed, hi, body_line, .{
+                    .line = deletion.line - start,
+                    .before = deletion.before - start,
+                });
+            } else if (forward)
+                diff_mod.buildNewFileDiscardPatch(self.allocator, clean, parsed, hi, body_line, body_line)
+            else
+                diff_mod.buildLinePatch(self.allocator, clean, parsed, hi, body_line, body_line, true);
+            break :blk built catch |err| switch (err) {
+                error.EmptySelection => return self.setMessage("selection contains no change", .{}),
+                error.NoNewlineHunk => return self.setMessage("discard the whole hunk for no-newline changes (press a for hunks)", .{}),
+                else => return err,
+            };
+        } else try diff_mod.buildHunkPatch(self.allocator, clean, parsed, hi);
         defer self.allocator.free(patch);
 
         const staged = self.staging_active and self.staging_staged_view;
-        var result = try self.git.discardStagingPatch(patch, staged);
+        var result = if (forward)
+            try self.git.discardForwardPatch(patch, staged)
+        else
+            try self.git.discardStagingPatch(patch, staged);
         defer result.deinit(self.allocator);
         self.captureCommandOutput("git apply", result);
         if (!result.ok()) {
@@ -9168,10 +9261,10 @@ pub const App = struct {
             return self.setMessage("discard failed: {s}", .{if (stderr.len > 0) stderr else "git apply error"});
         }
         self.clearReviewSelection();
+        self.review_line_cursor = null;
 
         if (self.staging_active) {
-            // Reload the active side in place; stay in the review unless it empties.
-            staging_mod.loadStaging(self, true) catch {};
+            try staging_mod.loadStagingSide(self, true, false);
             // Rebuild the whole-file view from the updated side so it keeps showing
             // the file with the hunk gone (fall back to hunks-only if it fails).
             if (self.review_whole_file) {
@@ -9216,7 +9309,7 @@ pub const App = struct {
                 self.refocusDiffHunk(); // bring the now-current hunk into view
             }
         }
-        try self.setMessage("hunk discarded", .{});
+        try self.setMessage("{s} discarded", .{if (selected == null) "hunk" else "line"});
     }
 
     /// Number of digits in the widest line number of the current split preview
@@ -9247,6 +9340,11 @@ pub const App = struct {
         return sideBySideWrapRows(self.allocator, self.splitRows().plain, self.splitColWidth(w));
     }
 
+    fn unifiedDiffWidth(self: *const App) u16 {
+        const width = if (self.main_view_width == 0) 80 else self.main_view_width;
+        return if (self.mode == .diff_review and width >= 5 and self.currentDiffHunk() != null) width - 2 else width;
+    }
+
     /// Total displayed rows of the main panel: source lines when truncating, or
     /// wrapped visual rows when `wrap_diff` is on. `main_scroll` is an index into
     /// these, so the two models share one scroll field. Drives the scrollbar and
@@ -9266,7 +9364,7 @@ pub const App = struct {
             const offs = lineOffsets(self.allocator, text);
             return if (offs.len > 0 or text.len == 0) offs.len else diffLineCount(text);
         }
-        const width: u16 = if (self.main_view_width == 0) 80 else self.main_view_width;
+        const width = self.unifiedDiffWidth();
         return wrapRowsFor(self.allocator, text, width).len;
     }
 
@@ -9284,17 +9382,17 @@ pub const App = struct {
     fn sourceLineAtVisualRow(self: *const App, row: usize) usize {
         const text = self.activeMainText();
         if (!self.wrap_diff) return @min(row, self.mainVisualRows() -| 1);
-        const width: u16 = if (self.main_view_width == 0) 80 else self.main_view_width;
+        const width = self.unifiedDiffWidth();
         const rows = wrapRowsFor(self.allocator, text, width);
         return if (rows.len == 0) 0 else rows[@min(row, rows.len - 1)].line;
     }
 
     /// The visual-row index where source line `line` first appears, under the
     /// *current* wrap mode (the inverse of `topSourceLine`).
-    fn firstVisualRowOfLine(self: *const App, line: usize) usize {
+    pub fn firstVisualRowOfLine(self: *const App, line: usize) usize {
         if (!self.wrap_diff) return line;
         const text = self.activeMainText();
-        const width: u16 = if (self.main_view_width == 0) 80 else self.main_view_width;
+        const width = self.unifiedDiffWidth();
         const rows = wrapRowsFor(self.allocator, text, width);
         const beforeLine = struct {
             fn f(target: usize, row: diffwrap.Row) bool {
@@ -9340,7 +9438,7 @@ pub const App = struct {
     fn reviewPosition(self: *const App) ReviewPosition {
         return .{
             .top = if (self.splitActive()) self.splitTopLine() else self.topSourceLine(),
-            .cursor = if (self.reviewCursorRow()) |row| self.diffLineAtContentRow(row) else null,
+            .cursor = if (self.reviewCursorRow() orelse self.review_line_cursor) |row| self.diffLineAtContentRow(row) else null,
         };
     }
 
@@ -9355,7 +9453,8 @@ pub const App = struct {
             const mapped: ?usize = if (split) self.splitRowOfLine(line) else self.firstVisualRowOfLine(line);
             if (mapped) |row| {
                 const body = if (split and !self.isReviewLine(row) and row + 1 < self.mainVisualRows() and self.isReviewLine(row + 1)) row + 1 else row;
-                return self.setReviewCursor(body);
+                if (self.review_line_mode) return self.setReviewCursor(body);
+                self.review_line_cursor = body;
             }
         }
         self.syncReviewCursor();
@@ -9433,13 +9532,37 @@ pub const App = struct {
     }
 
     fn isReviewLine(self: *const App, row: usize) bool {
-        if (!self.splitActive()) return true;
+        if (!self.splitActive()) {
+            const line = self.sourceLineAtVisualRow(row);
+            const hunks = cachedHunkLines(self.allocator, self.activeMainText()).lines;
+            return std.sort.binarySearch(usize, hunks, line, struct {
+                fn compare(target: usize, item: usize) std.math.Order {
+                    return std.math.order(target, item);
+                }
+            }.compare) == null;
+        }
         if (!self.wrap_diff) return self.splitRows().rows[row].kind == .pair;
         const wrapped = self.splitWrapRows()[row];
         return !wrapped.header and !wrapped.spacer;
     }
 
+    fn toggleReviewSelection(self: *App) void {
+        if (self.review_line_mode) {
+            self.review_line_cursor = self.reviewCursorRow();
+            self.review_line_mode = false;
+            return;
+        }
+        self.review_line_mode = true;
+        if (self.review_line_cursor) |row| return self.setReviewCursor(row);
+        const hunk = self.currentDiffHunk() orelse return self.syncReviewCursor();
+        const start = self.diffHunkRow(hunk);
+        for (start..self.mainVisualRows()) |row| {
+            if (self.isReviewLine(row)) return self.setReviewCursor(row);
+        }
+    }
+
     pub fn reviewCursorRow(self: *const App) ?usize {
+        if (!self.review_line_mode) return null;
         const first = self.main_scroll + @intFromBool(self.stickyHeaderRow() != null);
         const end = @min(self.main_scroll + self.main_view_height, self.mainVisualRows());
         if (first >= end) return null;
@@ -9532,6 +9655,12 @@ pub const App = struct {
         // keeps the current selection.
         const content_row = self.main_scroll + inner;
         const hi = self.changeHunkAtRow(content_row) orelse return false;
+        if (!self.review_line_mode) {
+            if (hi == self.diff_hunk) return false;
+            self.diff_hunk = hi;
+            self.review_line_cursor = null;
+            return true;
+        }
         self.review_line_cursor = if (!self.isReviewLine(content_row) and content_row > 0 and self.changeHunkAtRow(content_row - 1) == hi)
             content_row - 1
         else
@@ -9673,22 +9802,15 @@ pub const App = struct {
         }
     }
 
-    /// The line range `[start, end)` of the cursor's hunk (its `@@` header through
-    /// the line before the next header), for highlighting it. Null when no hunks.
+    /// The selected hunk's source line range, with an exclusive end.
     pub fn currentDiffHunkRange(self: *const App) ?struct { start: usize, end: usize } {
-        const hunks = self.reviewHunkLines();
-        if (hunks.len == 0) return null;
-        const i = @min(self.diff_hunk, hunks.len - 1);
-        const start = hunks[i];
-        // The range is in diff LINE indices (what the cells carry). For the last
-        // hunk, end is the diff's line count — not `mainVisualRows`, which in
-        // side-by-side counts the (fewer) paired rows and would cut the hunk off.
-        const end = if (i + 1 < hunks.len) hunks[i + 1] else lineOffsets(self.allocator, self.activeMainText()).len;
-        return .{ .start = start, .end = end };
+        const change = self.currentDiffHunk() orelse return null;
+        const start = self.reviewHunkLines()[change];
+        const hunks = cachedHunkLines(self.allocator, self.activeMainText());
+        const idx = std.mem.indexOfScalar(usize, hunks.lines, start) orelse return null;
+        return .{ .start = start, .end = hunks.ends[idx] };
     }
 
-    /// `J`/`K` in the read Diff panel: move the hunk cursor to the next or previous
-    /// change and scroll it into view. A no-op at the first / last hunk.
     fn moveDiffHunk(self: *App, forward: bool) !void {
         const hunks = self.reviewHunkLines();
         if (hunks.len == 0) return;
@@ -9698,6 +9820,7 @@ pub const App = struct {
         else
             (if (cur > 0) cur - 1 else return);
         self.diff_hunk = next;
+        self.review_line_cursor = null;
         self.scrollDiffHunkToTop(self.diffHunkRow(next));
         try self.setMessage("hunk {d}/{d}", .{ next + 1, hunks.len });
     }
@@ -9724,7 +9847,6 @@ pub const App = struct {
     /// the top of the view, so selecting a change lands you at its start with the
     /// body below it. Clamped so the final hunks do not scroll past the end.
     fn scrollDiffHunkToTop(self: *App, row: usize) void {
-        self.review_line_cursor = row;
         self.main_scroll = @min(row, self.maxMainScroll());
         self.main_hscroll = 0;
     }
@@ -9764,8 +9886,7 @@ pub const App = struct {
             return cachedMaxVisibleWidth(self.splitRows().plain) -| self.splitColWidth(w);
         }
         if (self.wrap_diff) return 0; // nothing overflows horizontally while wrapping
-        const view: u16 = if (self.main_view_width == 0) 80 else self.main_view_width;
-        return self.mainContentWidth() -| view;
+        return self.mainContentWidth() -| self.unifiedDiffWidth();
     }
 
     /// Horizontal counterpart of `scrollMain`: shift the diff left/right by
@@ -18021,6 +18142,7 @@ test "clicking a staging line moves the line cursor, clamped to the hunk area" {
     app.staging = try diff_mod.parse(allocator, diff);
     app.staging_active = true;
     app.main_view_height = 10;
+    try app.handleKey(.{ .codepoint = 'a' });
 
     // A click on a body line lands the cursor exactly there.
     try staging_mod.clickStagingLine(&app, .main, 3);
@@ -18028,7 +18150,7 @@ test "clicking a staging line moves the line cursor, clamped to the hunk area" {
 
     // A click above the first hunk clamps down to the first selectable line.
     try staging_mod.clickStagingLine(&app, .main, 0);
-    try std.testing.expectEqual(staging_mod.stagingFirstLine(&app), app.staging_cursor);
+    try std.testing.expectEqual(@as(usize, 2), app.staging_cursor);
 
     // A click past the end clamps to the last line.
     try staging_mod.clickStagingLine(&app, .main, 999);
@@ -20251,6 +20373,263 @@ fn testFindChange(text: []const u8, from: usize, last: bool) ?usize {
     return found;
 }
 
+test "review discards only the selected replacement row (e2e)" {
+    const a = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [160]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&pbuf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try testGitEnv(&env, dir_path);
+    try testRunSetup(a, tio, &env, dir_path,
+        \\set -e
+        \\git init -q
+        \\git config user.email t@t
+        \\git config user.name t
+        \\git config commit.gpgsign false
+        \\git config core.filemode true
+        \\printf 'before\nold first\nold second\nafter\n' > f.txt
+        \\git add f.txt
+        \\git commit -qm init
+        \\printf 'before\nnew first\nnew second\nafter\n' > f.txt
+        \\chmod +x f.txt
+    );
+
+    var app = try testApp(a, &.{});
+    defer deinitTestApp(&app);
+    app.git = try git_mod.Git.initAt(a, tio, &env, dir_path);
+    defer app.git.deinit();
+    defer app.data.deinit(a);
+
+    try app.refreshFiles();
+    try staging_mod.openStaging(&app);
+    app.main_view_width = 120;
+    app.main_view_height = 10;
+    try app.openDiffReview();
+    app.applyReviewPendingScroll();
+    try app.handleKey(.{ .codepoint = 'a' });
+    for (0..2) |_| try app.handleKey(.{ .codepoint = vaxis.Key.down });
+    try app.handleKey(.{ .codepoint = 'd' });
+
+    const fresh = try app.git.rawFileDiff("f.txt", false, app.config.diff_context);
+    defer a.free(fresh);
+    try std.testing.expect(std.mem.indexOf(u8, fresh, "new mode 100755") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fresh, " old second") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fresh, "-old first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fresh, "+new first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fresh, "+new second") == null);
+
+    try app.handleKey(.{ .codepoint = 'a' });
+    try app.handleKey(.{ .codepoint = 'd' });
+    const after_hunk = try app.git.rawFileDiff("f.txt", false, app.config.diff_context);
+    defer a.free(after_hunk);
+    try std.testing.expectEqualStrings("", after_hunk);
+}
+
+test "whole-file toggle preserves the selected line" {
+    const a = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [160]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&pbuf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try testGitEnv(&env, dir_path);
+    try testRunSetup(a, tio, &env, dir_path,
+        \\set -e
+        \\git init -q
+        \\git config user.email t@t
+        \\git config user.name t
+        \\git config commit.gpgsign false
+        \\printf '1\n2\n3\n4\n5\n6\n7\n8\nbefore\nold first\nold second\nafter\n' > f.txt
+        \\git add f.txt
+        \\git commit -qm init
+        \\printf '1\n2\n3\n4\n5\n6\n7\n8\nbefore\nnew first\nnew second\nafter\n' > f.txt
+    );
+
+    var app = try testApp(a, &.{});
+    defer deinitTestApp(&app);
+    app.git = try git_mod.Git.initAt(a, tio, &env, dir_path);
+    defer app.git.deinit();
+    defer app.data.deinit(a);
+
+    try app.refreshFiles();
+    try staging_mod.openStaging(&app);
+    app.main_view_width = 120;
+    app.main_view_height = 10;
+    try app.openDiffReview();
+    app.applyReviewPendingScroll();
+
+    try app.handleKey(.{ .codepoint = 'a' });
+    for (0..4) |_| try app.handleKey(.{ .codepoint = vaxis.Key.down });
+    const original = app.reviewCursorRow().?;
+    try std.testing.expectEqual(@as(usize, 11), app.splitRows().rows[original].left.old_no);
+    try app.handleKey(.{ .codepoint = 'a' });
+    try app.handleKey(.{ .codepoint = '=' });
+    try app.handleKey(.{ .codepoint = 'a' });
+    defer deinitChangeHunksCache();
+    defer app.closeDiffReview();
+    const expanded = app.reviewCursorRow().?;
+    try std.testing.expect(expanded != original);
+    try std.testing.expectEqual(@as(usize, 11), app.splitRows().rows[expanded].left.old_no);
+    try app.handleKey(.{ .codepoint = '=' });
+    try std.testing.expectEqual(@as(?usize, original), app.reviewCursorRow());
+}
+
+test "deletion-only row restores below the paired row" {
+    const a = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [160]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&pbuf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try testGitEnv(&env, dir_path);
+    try testRunSetup(a, tio, &env, dir_path,
+        \\set -e
+        \\git init -q
+        \\git config user.email t@t
+        \\git config user.name t
+        \\git config commit.gpgsign false
+        \\printf 'before\nold first\nold second\nafter\n' > f.txt
+        \\git add f.txt
+        \\git commit -qm init
+        \\printf 'before\nnew first\nafter\n' > f.txt
+    );
+
+    var app = try testApp(a, &.{});
+    defer deinitTestApp(&app);
+    app.git = try git_mod.Git.initAt(a, tio, &env, dir_path);
+    defer app.git.deinit();
+    defer app.data.deinit(a);
+
+    try app.refreshFiles();
+    try staging_mod.openStaging(&app);
+    app.main_view_width = 120;
+    app.main_view_height = 10;
+    try app.openDiffReview();
+    app.applyReviewPendingScroll();
+
+    try app.handleKey(.{ .codepoint = 'a' });
+    for (0..2) |_| try app.handleKey(.{ .codepoint = vaxis.Key.down });
+    try app.handleKey(.{ .codepoint = 'd' });
+    const actual = try app.git.rawFileDiff("f.txt", false, app.config.diff_context);
+    defer a.free(actual);
+    try std.testing.expect(std.mem.indexOf(u8, actual, "+new first\n old second") != null);
+}
+
+test "discarding unstaged line preserves staged side" {
+    const a = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [160]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&pbuf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try testGitEnv(&env, dir_path);
+    try testRunSetup(a, tio, &env, dir_path,
+        \\set -e
+        \\git init -q
+        \\git config user.email t@t
+        \\git config user.name t
+        \\git config commit.gpgsign false
+        \\printf 'one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n' > f.txt
+        \\git add f.txt
+        \\git commit -qm init
+        \\printf 'ONE\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n' > f.txt
+        \\git add f.txt
+        \\printf 'nine\n' >> f.txt
+    );
+
+    var app = try testApp(a, &.{});
+    defer deinitTestApp(&app);
+    app.git = try git_mod.Git.initAt(a, tio, &env, dir_path);
+    defer app.git.deinit();
+    defer app.data.deinit(a);
+
+    try app.refreshFiles();
+    try staging_mod.openStaging(&app);
+    app.main_view_width = 120;
+    app.main_view_height = 10;
+    try app.openDiffReview();
+    app.applyReviewPendingScroll();
+
+    try std.testing.expect(!app.staging_staged_view);
+    try app.handleKey(.{ .codepoint = 'a' });
+    for (0..3) |_| try app.handleKey(.{ .codepoint = vaxis.Key.down });
+    try app.handleKey(.{ .codepoint = 'd' });
+    try app.handleKey(.{ .codepoint = 'd' });
+    const actual = try app.git.rawFileDiff("f.txt", true, app.config.diff_context);
+    defer a.free(actual);
+    try std.testing.expect(std.mem.indexOf(u8, actual, "+ONE") != null);
+    try std.testing.expectEqual(Mode.normal, app.mode);
+    try std.testing.expect(!app.staging_staged_view);
+}
+
+test "reverse discard anchors at the selected duplicate" {
+    const a = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [160]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&pbuf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try testGitEnv(&env, dir_path);
+    try testRunSetup(a, tio, &env, dir_path,
+        \\set -e
+        \\git init -q
+        \\git config user.email t@t
+        \\git config user.name t
+        \\git config commit.gpgsign false
+        \\i=1
+        \\while [ "$i" -lt 45 ]; do
+        \\    case "$i" in
+        \\        20|30) echo a1 ;;
+        \\        21|31) echo a2 ;;
+        \\        22|32) echo a3 ;;
+        \\        23) echo NEW ;;
+        \\        33) echo OLD ;;
+        \\        24|34) echo b1 ;;
+        \\        25|35) echo b2 ;;
+        \\        26|36) echo b3 ;;
+        \\        *) echo "filler $i" ;;
+        \\    esac
+        \\    i=$((i + 1))
+        \\done > f.txt
+        \\git add f.txt
+        \\git commit -qm init
+        \\{ i=1; while [ "$i" -le 10 ]; do echo "$i"; i=$((i + 1)); done; sed s/OLD/NEW/ f.txt; } > f.new
+        \\mv f.new f.txt
+    );
+    var app = try testApp(a, &.{});
+    defer deinitTestApp(&app);
+    app.git = try git_mod.Git.initAt(a, tio, &env, dir_path);
+    defer app.git.deinit();
+    defer app.data.deinit(a);
+
+    try app.refreshFiles();
+    try staging_mod.openStaging(&app);
+    app.main_view_width = 120;
+    app.main_view_height = 10;
+    try app.openDiffReview();
+    app.applyReviewPendingScroll();
+
+    try app.handleKey(.{ .codepoint = vaxis.Key.down });
+    try app.handleKey(.{ .codepoint = 'a' });
+    for (0..3) |_| try app.handleKey(.{ .codepoint = vaxis.Key.down });
+    try app.handleKey(.{ .codepoint = 'd' });
+    const actual = try app.git.rawFileDiff("f.txt", false, app.config.diff_context);
+    defer a.free(actual);
+    try std.testing.expect(std.mem.indexOf(u8, actual, "@@ -1,3 +1,13 @@") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, actual, "\n@@ "));
+}
+
 test "staging a line advances the cursor past context to the next change (e2e)" {
     const a = std.testing.allocator;
     const tio = std.testing.io;
@@ -20287,12 +20666,17 @@ test "staging a line advances the cursor past context to the next change (e2e)" 
     try std.testing.expectEqual(@as(usize, 1), app.data.files.len);
     app.file_index = 0;
     try staging_mod.openStaging(&app);
+    try std.testing.expect(app.staging_split);
+    try std.testing.expectEqualStrings("", app.staging_other_diff);
+    try app.handleKey(.{ .codepoint = 'a' });
 
     // Put the cursor on the first change (a `+` line) and stage just it.
     const first_change = testFindChange(app.staging_diff, staging_mod.stagingFirstLine(&app), false).?;
     app.staging_cursor = first_change;
     try std.testing.expectEqual(@as(u8, '+'), testLineLead(app.staging_diff, first_change));
     try staging_mod.applyStagingSelection(&app);
+    try std.testing.expect(app.staging_split);
+    try std.testing.expect(std.mem.indexOf(u8, app.staging_other_diff, "+NEW1") != null);
 
     // Cursor landed on the remaining change (not stranded on the new context),
     // and the staged line left the unstaged side while the other change remains.
@@ -20337,6 +20721,7 @@ test "staging the last change falls back to the change above (e2e)" {
     try app.refreshFiles();
     app.file_index = 0;
     try staging_mod.openStaging(&app);
+    try app.handleKey(.{ .codepoint = 'a' });
     try std.testing.expect(app.staging.?.hunks.len == 2); // two hunks
 
     // Stage the lower insertion (the last change line).
@@ -20559,7 +20944,9 @@ test "staging a whole hunk moves the cursor to the next hunk header (e2e)" {
 
     // Put the cursor on the SECOND hunk's `@@` header and stage the whole hunk.
     app.staging_cursor = app.staging.?.hunks[1].start_line;
-    try staging_mod.applyStagingSelection(&app);
+    try app.handleKey(.{ .codepoint = 'a' });
+    try app.handleKey(.{ .codepoint = 'a' });
+    try app.handleKey(.{ .codepoint = ' ' });
 
     // The lower hunk is gone; the cursor sits on the remaining hunk's `@@` header
     // (hunk-level workflow preserved), not stranded on context.
@@ -20985,7 +21372,7 @@ test "staging cursor navigation clamps, ranges, and tears down cleanly" {
     try std.testing.expectEqual(@as(usize, 3), app.staging_cursor);
 
     // The cursor's hunk is found for body lines.
-    staging_mod.moveStagingCursor(&app, 1);
+    try app.handleKey(.{ .codepoint = 'a' });
     try std.testing.expectEqual(@as(usize, 4), app.staging_cursor);
     try std.testing.expectEqual(@as(?usize, 0), staging_mod.stagingHunkAt(&app, app.staging_cursor));
 
@@ -21501,7 +21888,7 @@ test "issue #5: revert refreshes the branches scope so the ahead count updates" 
     try std.testing.expect(app.mutation_refresh.contains(.status));
 }
 
-test "issue #4: shift/J-K jump the staging cursor by hunk" {
+test "staging uses arrow keys in the selected mode" {
     const allocator = std.testing.allocator;
     var no_files = [_]model.FileStatus{};
     var app = try testApp(allocator, &no_files);
@@ -21519,28 +21906,21 @@ test "issue #4: shift/J-K jump the staging cursor by hunk" {
     app.staging_cursor = staging_mod.stagingFirstLine(&app);
     try std.testing.expectEqual(@as(usize, 3), app.staging_cursor); // hunk 0 header
 
-    // Next hunk -> hunk 1 header (line 7).
-    staging_mod.moveStagingHunk(&app, true);
-    try std.testing.expectEqual(@as(usize, 7), app.staging_cursor);
-    // Already at the last hunk: next is a no-op.
-    staging_mod.moveStagingHunk(&app, true);
-    try std.testing.expectEqual(@as(usize, 7), app.staging_cursor);
-
-    // Previous from a header -> the earlier hunk's header (line 3).
-    staging_mod.moveStagingHunk(&app, false);
+    try app.handleKey(.{ .codepoint = 'J' });
     try std.testing.expectEqual(@as(usize, 3), app.staging_cursor);
-
-    // From a body line, "previous" snaps to that hunk's own header first.
-    app.staging_cursor = 5; // body of hunk 0
-    staging_mod.moveStagingHunk(&app, false);
-    try std.testing.expectEqual(@as(usize, 3), app.staging_cursor);
-    // At the first hunk's header: previous is a no-op.
-    staging_mod.moveStagingHunk(&app, false);
-    try std.testing.expectEqual(@as(usize, 3), app.staging_cursor);
-
-    // Hunk jump drops any in-progress range selection.
-    app.staging_anchor = 4;
-    staging_mod.moveStagingHunk(&app, true);
-    try std.testing.expectEqual(@as(?usize, null), app.staging_anchor);
+    try app.handleKey(.{ .codepoint = vaxis.Key.down });
     try std.testing.expectEqual(@as(usize, 7), app.staging_cursor);
+    try app.handleKey(.{ .codepoint = 'a' });
+    try std.testing.expectEqual(@as(usize, 8), app.staging_cursor);
+    try app.handleKey(.{ .codepoint = vaxis.Key.down });
+    try std.testing.expectEqual(@as(usize, 9), app.staging_cursor);
+    try app.handleKey(.{ .codepoint = 'a' });
+    try app.handleKey(.{ .codepoint = 'a' });
+    try std.testing.expectEqual(@as(usize, 9), app.staging_cursor);
+    try app.handleKey(.{ .codepoint = 'a' });
+    try app.handleKey(.{ .codepoint = vaxis.Key.up });
+    try app.handleKey(.{ .codepoint = 'a' });
+    try std.testing.expectEqual(@as(usize, 4), app.staging_cursor);
+    for (0..3) |_| try app.handleKey(.{ .codepoint = vaxis.Key.down });
+    try std.testing.expectEqual(@as(usize, 8), app.staging_cursor);
 }

@@ -288,17 +288,13 @@ point, with demos:
 
 ## Features
 
-- **Staging down to the line**: open a file and stage single lines or whole
-  hunks. `d` discards at the same granularity, so one bad line goes away
-  without touching the rest of the file, and a split view can show unstaged
-  and staged side by side.
-- **Review a diff side by side**: press `|` for a full-screen view with the old
-  file on the left and the new on the right, lines aligned, numbered down each
-  side, and the changed words picked out. `J`/`K` step between the changes, each
-  framed in its own rounded panel whose header stays pinned as you scroll through
-  it; `=` fills the rest of the file in around the changes, `d` discards a hunk,
-  and dragging over either column copies just that side. It works on a working
-  tree file, the staging view, or a single file from any commit.
+- **Staging down to the line**. Open a file to stage by hunk. Press `a` to switch
+  between hunks and lines. `d` discards the selection. The split view stacks
+  Unstaged above Staged.
+- **Review a diff side by side**. Press `|` for a full-screen diff. Move by
+  hunk or press `a` to switch to line selection. `=` fills in the rest of
+  the file and `d` discards the selection for uncommitted changes. Drag over
+  either column to copy its text.
 - **Interactive rebase you compose first**: mark drop, squash, fixup, edit
   and reword across a range of commits in a plan editor, then run the lot as
   one rebase. Cherry picking, autosquash, custom patch building and

@@ -142,7 +142,7 @@ expanded_side_panel_weight = 2
 # operation, a merge, rebase, or bisect in progress, an active diffing base, or
 # while you have it focused. Default off.
 collapse_status = false
-staging_split = auto               # staging layout: off | on | auto (default)
+staging_split = on                 # staging layout: off | on (default) | auto
 
 # Open the file lists (the Files panel and a commit's or branch's changed
 # files) in directory-tree mode instead of a flat list, so you don't have to
@@ -314,14 +314,14 @@ bindings.
 ## Staging Layout (`staging_split`)
 
 The staging view (`enter` or `tab` on a file) shows one pane (the active
-side) or two side by side (Unstaged | Staged). `staging_split` decides how
+side) or two stacked panes (Unstaged above Staged). `staging_split` decides how
 each file opens:
 
 | `staging_split` | File with one side | File with staged **and** unstaged |
 |---|---|---|
 | `off` | single | single |
-| `on` | split | split |
-| **`auto`** *(default)* | single | **split** |
+| **`on`** *(default)* | split | split |
+| `auto` | single | split |
 
 `\` toggles split or single for the **current file only**. It is not
 remembered, so the next file always opens with the layout above. The layout
@@ -332,16 +332,13 @@ is chosen when a file opens and not redecided mid edit.
 The Diff panel is unified (one column with `-` and `+` lines). To read a change
 side by side, press `|` to open a full-screen review: the old file on the left
 and the new on the right, lines aligned, file line numbers down each side, and
-the changed words emphasized. Inside it, `j`/`k` (or `PageUp`/`PageDown`,
-`Home`/`End`) scroll, `J`/`K` jump to the next and previous change, bringing its
-header to the top, and `space` recentres on the selected hunk after you scroll away.
-The current change is framed in a rounded panel titled with its hunk header, so
-you can see at a glance which hunk `d` acts on; that header stays pinned to the
-top while you scroll through the hunk. Clicking a line or the frame selects its
-hunk (a common line between hunks selects nothing), `d` discards the
-whole current hunk, `=` fills in the rest of a single file around its changes
-(every unchanged line is shown, and each change stays its own boxed hunk that
-`J`/`K` steps between), `^w` soft-wraps both columns kept line for line, `H`/`L`
+the changed words emphasized. `j`/`k` or the arrows select hunks by default.
+Press `a` to switch between hunk and line movement. The hunk border follows
+the line selection as it moves. `PageUp`/`PageDown` and `Home`/`End` scroll,
+and `space` brings the selected hunk's header back into view. The header
+stays pinned while you scroll through the selected hunk. `d` discards the
+selected hunk or line for uncommitted changes. `=` fills in the rest of a
+single file around its changes, `^w` wraps both columns, `H`/`L`
 pan, and `esc` returns. Both act on a single file, so `=` is offered for a
 working-tree file, the staging view, or one file drilled into a commit, while `d`
 (which changes the working tree) is offered only for the not-yet-committed cases;

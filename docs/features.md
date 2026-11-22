@@ -14,12 +14,10 @@ resolution.
 
 ### Staging by Hunk and Line
 
-`enter` a file to open the staging view. Stage or unstage single lines or
-whole hunks (`space`), with an optional split showing both sides at once.
-Press `d` to discard instead of stage: it uses the same selection as `space`,
-so `d` on a line throws that line away and `d` on a `@@` header throws away the
-whole hunk. On the staged side `d` drops the change from the index as well, so
-it is gone for good.
+`enter` opens the staging view with hunk selection. Press `a` to switch to
+lines and `v` to select a range. `space` stages or unstages the selection and
+`d` discards it. The split view shows Unstaged above Staged. On the staged
+side, discard removes the selected changes from the index and working tree.
 
 ![Line level staging view](screenshots/02-staging.png)
 
@@ -189,11 +187,9 @@ The animation itself is in the [README](../README.md).
 
 - Files and Staged panels from `git status --porcelain -z`; stage or unstage a file
   (`space`) or everything (`a`).
-- Staging by hunk and line: `enter` opens a staging view to stage or unstage
-  single lines (`v` for a range) or whole hunks (`tab` switches the unstaged
-  and staged sides; `\` toggles the split view, see
-  [Staging layout](configuration.md#staging-layout-staging_split)). `d`
-  discards the selected line(s) or hunk instead of staging them.
+- Staging by hunk and line. `enter` opens hunk staging and `a` switches between
+  hunks and lines. `v` selects a line range, `d` discards the selection, and
+  `\` toggles the [staging layout](configuration.md#staging-layout-staging_split).
 - Directory tree view (`` ` ``) for working tree files **and** a commit's or
   branch's file list: a `/` root, collapsible folders (`enter`), single child
   chains compressed to `a/b/c`. Selecting a folder shows the combined diff
@@ -409,12 +405,10 @@ The animation itself is in the [README](../README.md).
   blame).
 - Side-by-side review: `|` opens a full-screen view of the current diff with the
   old file on the left and the new on the right, lines aligned, file line numbers
-  down each side, and the changed words emphasized. `j`/`k` scroll, `J`/`K` jump
-  between changes, bringing each one's header to the top (the current change is
-  framed in a rounded panel titled with its hunk header), `d` discards the whole
-  current hunk, `=` fills in the rest of a single file around its changes (each
-  change stays its own boxed hunk), `^w` soft-wraps both columns kept line for
-  line, and `esc` returns. A terminal too narrow for two columns falls back to
+  down each side, and the changed words emphasized. Use `j`/`k` or arrows to
+  move between hunks. Press `a` to switch between hunks and lines. `d` discards
+  the selection for uncommitted changes. `=` fills in the rest of the file,
+  `^w` wraps both columns, and `esc` returns. Narrow terminals fall back to
   unified.
 
   ![Side-by-side review, the selected change boxed with its header pinned](screenshots/27-side-by-side-review.png)

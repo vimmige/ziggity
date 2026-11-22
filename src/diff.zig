@@ -87,10 +87,10 @@ pub fn buildHunkPatch(allocator: std.mem.Allocator, diff: []const u8, parsed: Pa
     return patch;
 }
 
-/// The old-side start line from a hunk's `@@ -A,B +C,D @@` header.
-fn parseOldStart(at_line: []const u8) ?usize {
-    const dash = std.mem.indexOfScalar(u8, at_line, '-') orelse return null;
-    var i = dash + 1;
+/// The start line after the side marker in a hunk header.
+fn parseHunkStart(at_line: []const u8, side: u8) ?usize {
+    const marker = std.mem.indexOfScalar(u8, at_line, side) orelse return null;
+    var i = marker + 1;
     var value: usize = 0;
     var any = false;
     while (i < at_line.len and at_line[i] >= '0' and at_line[i] <= '9') : (i += 1) {
@@ -118,12 +118,38 @@ pub fn buildLinePatch(
     /// deletions are absent (dropped) — the opposite of the staging direction.
     reverse: bool,
 ) ![]u8 {
+    return buildSelectedLinePatch(allocator, diff, parsed, hunk_index, sel_first, sel_last, reverse, null);
+}
+
+pub const DeletionPlacement = struct { line: usize, before: usize };
+
+pub fn buildAlignedDiscardPatch(
+    allocator: std.mem.Allocator,
+    diff: []const u8,
+    parsed: ParsedDiff,
+    hunk_index: usize,
+    selected: usize,
+    deletion: DeletionPlacement,
+) ![]u8 {
+    return buildSelectedLinePatch(allocator, diff, parsed, hunk_index, selected, selected, true, deletion);
+}
+
+fn buildSelectedLinePatch(
+    allocator: std.mem.Allocator,
+    diff: []const u8,
+    parsed: ParsedDiff,
+    hunk_index: usize,
+    sel_first: usize,
+    sel_last: usize,
+    reverse: bool,
+    placement: ?DeletionPlacement,
+) ![]u8 {
     if (hunk_index >= parsed.hunks.len) return error.InvalidHunk;
     const hunk = parsed.hunks[hunk_index];
     const header = diff[0..parsed.header_end];
     const hunk_text = diff[hunk.start..hunk.end];
     const nl = std.mem.indexOfScalar(u8, hunk_text, '\n') orelse return error.InvalidHunk;
-    const old_start = parseOldStart(hunk_text[0..nl]) orelse return error.InvalidHunk;
+    const input_start = parseHunkStart(hunk_text[0..nl], if (reverse) '+' else '-') orelse return error.InvalidHunk;
 
     var body: std.Io.Writer.Allocating = .init(allocator);
     defer body.deinit();
@@ -132,11 +158,29 @@ pub fn buildLinePatch(
     var old_count: usize = 0;
     var new_count: usize = 0;
     var changed = false;
+    var deletion: ?[]const u8 = null;
 
     var lines = std.mem.splitScalar(u8, hunk_text[nl + 1 ..], '\n');
     var j: usize = 0;
-    while (lines.next()) |line| : (j += 1) {
-        if (line.len == 0) break; // trailing element after the final newline
+    while (true) : (j += 1) {
+        if (placement) |pos| {
+            if (pos.before == j) {
+                const old_line = deletion orelse return error.InvalidHunk;
+                try w.print("{s}\n", .{old_line});
+                deletion = null;
+                old_count += 1;
+                changed = true;
+            }
+        }
+        const line = lines.next() orelse break;
+        if (line.len == 0) break;
+        if (placement) |pos| {
+            if (pos.line == j) {
+                if (line[0] != '-') return error.InvalidHunk;
+                deletion = line;
+                continue;
+            }
+        }
         const selected = j >= sel_first and j <= sel_last;
         switch (line[0]) {
             ' ' => {
@@ -180,6 +224,7 @@ pub fn buildLinePatch(
         }
     }
 
+    if (deletion != null) return error.InvalidHunk;
     if (!changed) return error.EmptySelection;
 
     const body_bytes = try body.toOwnedSlice();
@@ -187,8 +232,17 @@ pub fn buildLinePatch(
 
     var patch: std.Io.Writer.Allocating = .init(allocator);
     errdefer patch.deinit();
-    try patch.writer.writeAll(header);
-    try patch.writer.print("@@ -{d},{d} +{d},{d} @@\n", .{ old_start, old_count, old_start, new_count });
+    var header_lines = std.mem.tokenizeScalar(u8, header, '\n');
+    while (header_lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "old mode ") or std.mem.startsWith(u8, line, "new mode ")) continue;
+        try patch.writer.print("{s}\n", .{line});
+    }
+    // Empty ranges name the line before the change. Anchor both sides on the file Git will read.
+    const input_count = if (reverse) new_count else old_count;
+    const before = input_start -| @intFromBool(input_count > 0);
+    const old_start = before + @intFromBool(old_count > 0);
+    const new_start = before + @intFromBool(new_count > 0);
+    try patch.writer.print("@@ -{d},{d} +{d},{d} @@\n", .{ old_start, old_count, new_start, new_count });
     try patch.writer.writeAll(body_bytes);
     return patch.toOwnedSlice();
 }
@@ -320,7 +374,7 @@ pub fn buildPartialFilePatch(
     for (parsed.hunks) |hunk| {
         const hunk_text = diff[hunk.start..hunk.end];
         const nl = std.mem.indexOfScalar(u8, hunk_text, '\n') orelse return error.InvalidHunk;
-        const old_start = parseOldStart(hunk_text[0..nl]) orelse return error.InvalidHunk;
+        const old_start = parseHunkStart(hunk_text[0..nl], '-') orelse return error.InvalidHunk;
 
         var body: std.Io.Writer.Allocating = .init(allocator);
         defer body.deinit();
@@ -657,6 +711,26 @@ test "buildLinePatch reverse (unstage) drops unselected deletions" {
         "-a\n" ++
         " c\n";
     try std.testing.expectEqualStrings(expected, patch);
+}
+
+test "line patches leave file permissions untouched" {
+    const a = std.testing.allocator;
+    const diff =
+        "diff --git a/f b/f\n" ++
+        "old mode 100644\n" ++
+        "new mode 100755\n" ++
+        "index e69de29..d68dd40\n" ++
+        "--- a/f\n" ++
+        "+++ b/f\n" ++
+        "@@ -1 +1,2 @@\n" ++
+        " a\n" ++
+        "+b\n";
+    var parsed = try parse(a, diff);
+    defer parsed.deinit(a);
+    const patch = try buildLinePatch(a, diff, parsed, 0, 1, 1, true);
+    defer a.free(patch);
+    try std.testing.expect(std.mem.indexOf(u8, patch, "mode ") == null);
+    try std.testing.expect(std.mem.endsWith(u8, patch, " a\n+b\n"));
 }
 
 test "buildLinePatch refuses a hunk with a no-newline marker" {

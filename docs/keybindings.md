@@ -86,14 +86,10 @@ the written reference. Every binding is remappable, see
   main panel is a special case handled only by `z`, never by `+`/`-`
 - `|`: open the full-screen side-by-side review of the current diff (old file
   left, new file right, lines aligned, file line numbers down each side, changed
-  words emphasized). `j`/`k` or arrows move the line highlight. The selected
-  hunk follows the highlighted line as it moves or scrolls into another hunk.
-  `PageUp`/`PageDown` and `Home`/`End` scroll. `J`/`K` jump to the next/previous
-  change, bringing its header to the top
-  (the current change is framed in a rounded panel titled with its hunk header,
-  and that header stays pinned while you scroll the hunk), `space` jumps to
-  the start of the selected hunk, `d` discards the whole current hunk
-  when the line cursor is inside it, and `=`
+  words emphasized). `a` toggles between hunk and line selection.
+  `j`/`k` or arrows move the selection, and the border follows the current
+  hunk. `PageUp`/`PageDown` and `Home`/`End` scroll. `space` jumps to the
+  selected hunk's start, `d` discards the selection for uncommitted changes, and `=`
   fills in the rest of a single file around its changes (each change stays its own
   boxed hunk), `^w` soft-wraps both columns kept line for line, `H`/`L` pan, and
   `esc` returns. A terminal too narrow for two columns falls back to the unified view (see
@@ -117,11 +113,11 @@ the written reference. Every binding is remappable, see
 - `enter`: open the selection; on a commit (Commits, Reflog or Divergence),
   drill into its changed files; on a working-tree file, open the staging view.
   On a remote, open its branches; on a worktree, switch into it (also `space`)
-- `enter` on a file opens the staging view: `j` and `k` by line, `J` and `K`
-  (or shift+arrows) jump to the next/previous hunk, `v` range, `space` stage
-  the line(s) or hunk, `d` discard the line(s) or hunk instead, `[` and `]`
-  switch side, `\` split view, `|` side-by-side review of the active side, `c`
-  and `A` commit or amend, `esc` back
+- `enter` on a file opens hunk staging. `j`/`k` or arrows move the selection.
+  `a` switches between hunks and lines, `v` selects a line range,
+  `space` stages or unstages, `d` discards, `[`/`]` switches panes,
+  `\` toggles the stacked layout, `|` reviews the active diff side by side,
+  `c`/`A` commits or amends, and `esc` goes back.
 - `space`: stage in Files, unstage in Staged · switch worktrees · checkout a branch ·
   apply a stash (by focus)
 - `e`: open the file under view in your editor (Files, a commit's files, the

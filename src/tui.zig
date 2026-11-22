@@ -1982,7 +1982,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
         app.main_scroll = @min(app.main_scroll, app.maxMainScroll());
         app.main_hscroll = @min(app.main_hscroll, app.maxMainHScroll());
         if (app.staging_active and app.staging_split and !app.staging_patch_mode) {
-            // Split staging view: two panes (Unstaged | Staged) fill the main area.
+            // Stack Unstaged above Staged.
             drawStagingSplit(root, app, side_w, 0, main_w, body_h);
         } else {
             const scroll: ScrollInfo = .{ .len = app.mainContentLines(), .pos = app.main_scroll };
@@ -2001,7 +2001,7 @@ fn render(vx: *vaxis.Vaxis, app: *app_mod.App) void {
                 break :blk frame.inner;
             };
             app.main_view_height = main.height;
-            app.main_view_width = main.width;
+            app.main_view_width = stagingContentWidth(app, main.width);
             refreshOnDiffChange(vx, app);
             if (status_output) drawStatusOutput(root, main, app) else drawDiff(main, app);
         }
@@ -2046,7 +2046,7 @@ fn drawDiffReview(root: vaxis.Window, app: *app_mod.App) void {
     app.main_scroll = @min(app.main_scroll, app.maxMainScroll());
     app.main_hscroll = @min(app.main_hscroll, app.maxMainHScroll());
     const scroll: ScrollInfo = .{ .len = app.mainContentLines(), .pos = app.main_scroll };
-    // Title carries the change count and which one the `J`/`K` cursor is on, since
+    // Title carries the selected hunk and the change count, since
     // the review has no message bar to report it. It must live in a module buffer
     // (not the stack): `panel` stores the title by reference until the frame flush.
     const base_title: []const u8 = if (app.currentDiffHunk()) |h|
@@ -2059,25 +2059,40 @@ fn drawDiffReview(root: vaxis.Window, app: *app_mod.App) void {
     const wrap_tag: []const u8 = if (app.wrap_diff) "  \u{21A9} wrap" else "";
     const title = std.fmt.bufPrint(&main_title_wrap_buf, "{s}{s}{s}", .{ base_title, full_tag, wrap_tag }) catch base_title;
     const main = panel(root, 0, 0, root.width, body_h, title, true, scroll);
-    if (app.splitActive()) drawSideBySide(main, app) else drawDiffContent(main, app, app.activeMainText(), .main);
-    if (app.reviewCursorRow()) |cursor_row| {
-        const row: u16 = @intCast(cursor_row - app.main_scroll);
-        for (0..main.width) |x| {
-            const col: u16 = @intCast(x);
-            var cell = main.readCell(col, row) orelse continue;
-            if (cell.style.bg != .default) continue;
-            applySel(&cell.style, .active);
-            main.writeCell(col, row, cell);
+    const split = app.splitActive();
+    const unified_hunk = if (!split and main.width >= 5) app.currentDiffHunkRange() else null;
+    const content = if (unified_hunk != null) main.child(.{ .x_off = 1, .width = main.width - 2 }) else main;
+    if (split) {
+        drawSideBySide(main, app);
+    } else {
+        drawDiffContent(content, app, app.activeMainText(), .main);
+        if (unified_hunk) |hunk| {
+            const plain = app.splitRows().plain;
+            const offsets = app_mod.lineOffsets(app.allocator, plain);
+            if (hunk.start < offsets.len) {
+                const header = plain[offsets[hunk.start]..];
+                const title_line = header[0 .. std.mem.indexOfScalar(u8, header, '\n') orelse header.len];
+                drawUnifiedHunkFrame(main, app, hunk.start, hunk.end, title_line);
+            }
         }
     }
-    // The hints after "J/K change" are conditional: "= whole file" when a single
-    // file can be expanded, and "d discard hunk" only for uncommitted changes.
+    if (app.reviewCursorRow()) |cursor_row| {
+        const row: u16 = @intCast(cursor_row - app.main_scroll);
+        for (0..content.width) |x| {
+            const col: u16 = @intCast(x);
+            var cell = content.readCell(col, row) orelse continue;
+            if (cell.style.bg != .default) continue;
+            applySel(&cell.style, .active);
+            content.writeCell(col, row, cell);
+        }
+    }
     const whole = if (app.reviewWholeFileAvailable())
         (if (app.review_whole_file) "  = hunks only" else "  = whole file")
     else
         "";
-    const discard = if (app.reviewDiscardOffered()) "  d discard hunk" else "";
-    const footer = std.fmt.bufPrint(&review_footer_buf, "  j/k line  J/K change{s}  space hunk start{s}  ^w wrap  H/L pan  esc back  q quit", .{ discard, whole }) catch "  j/k line  J/K change  space hunk start  ^w wrap  H/L pan  esc back  q quit";
+    const unit = if (app.review_line_mode) "line" else "hunk";
+    const discard = if (app.reviewDiscardOffered()) "  d discard" else "";
+    const footer = std.fmt.bufPrint(&review_footer_buf, "  j/k {s}  a toggle selection{s}  space hunk start{s}  ^w wrap  H/L pan  esc back  q quit", .{ unit, discard, whole }) catch "  a line/hunk  esc back";
     print(root, footer_row, 0, footer, st.bottom_accent);
 }
 
@@ -2397,7 +2412,7 @@ const help_lines = [_][]const u8{
     "  L, shift+right   scroll the focused panel right (long rows)",
     "  ctrl+w         wrap long lines in the diff panels instead of scrolling",
     "  |              open the full-screen side-by-side review of the diff",
-    "                 (read-only: j/k line, J/K next/prev change, ^w wrap,",
+    "                 (j/k move, a line/hunk, ^w wrap,",
     "                 H/L pan, esc back)",
     "  [              previous tab (or staging side)",
     "  ]              next tab (or staging side)",
@@ -2483,16 +2498,15 @@ const help_lines = [_][]const u8{
     "                 the parent repo)",
     "",
     "Staging view",
-    "  j, k           move by line",
-    "  J, shift+down  jump to the next hunk",
-    "  K, shift+up    jump to the previous hunk",
-    "  v              toggle range selection",
-    "  space          stage/unstage the line(s); on a @@ header the whole hunk",
+    "  j, k           move by hunk or line",
+    "  a              toggle hunk/line selection",
+    "  v              toggle range selection in line mode",
+    "  space          stage/unstage the selected hunk or line(s)",
     "  d              discard the line(s)/hunk (same selection as space); on the",
     "                 staged side it drops the change from the index too",
     "  [              switch to the unstaged side",
     "  ]              switch to the staged side",
-    "  \\              toggle split view (unstaged | staged)",
+    "  \\              toggle stacked view (Unstaged above Staged)",
     "  c              new commit; same as C in amend view",
     "  C              amend and edit message (includes staged changes)",
     "  A              open amend view; press again to amend and keep the message",
@@ -5358,17 +5372,55 @@ fn drawDiffContent(win: vaxis.Window, app: *const app_mod.App, text: []const u8,
 /// per line; the `active` pane shows the line/range highlight and scrolls with
 /// `main_scroll`, while an inactive pane (the read-only side in split view)
 /// renders from the top with no highlight.
-fn drawStagingPane(win: vaxis.Window, app: *const app_mod.App, text: []const u8, active: bool, empty_msg: []const u8, pane: app_mod.SelPane) void {
+fn drawUnifiedHunkFrame(frame: vaxis.Window, app: *const app_mod.App, start_line: usize, end_line: usize, title: []const u8) void {
+    const start = app.firstVisualRowOfLine(start_line);
+    const end = app.firstVisualRowOfLine(end_line);
+    const right = frame.width - 1;
+    const first = @max(start, app.main_scroll);
+    const last = @min(end, app.main_scroll + frame.height);
+    for (first..@max(first, last)) |visual| {
+        const row: u16 = @intCast(visual - app.main_scroll);
+        if (visual == start) {
+            drawHunkBoxTop(frame, row, title, right);
+        } else if (visual + 1 == end) {
+            print(frame, row, 0, box_bl, styles().active_border);
+            print(frame, row, right, box_br, styles().active_border);
+        } else drawHunkBoxSides(frame, row, right);
+    }
+}
+
+fn stagingContentWidth(app: *const app_mod.App, width: u16) u16 {
+    return if (app.staging_active and !app.staging_patch_mode and width >= 5) width - 2 else width;
+}
+
+fn drawStagingPane(frame: vaxis.Window, app: *const app_mod.App, text: []const u8, active: bool, empty_msg: []const u8, pane: app_mod.SelPane) void {
     if (text.len == 0) {
-        print(win, 0, 0, empty_msg, styles().muted);
+        print(frame, 0, 0, empty_msg, styles().muted);
         return;
     }
+    const width = stagingContentWidth(app, frame.width);
+    const win = if (width == frame.width) frame else frame.child(.{ .x_off = 1, .width = width });
+    const selected_hunk = if (active and !app.staging_patch_mode)
+        if (staging_mod.stagingHunkAt(app, app.staging_cursor)) |idx| app.staging.?.hunks[idx] else null
+    else
+        null;
+    defer if (width != frame.width) {
+        if (selected_hunk) |hunk| {
+            const header = text[hunk.start..hunk.end];
+            const title_line = header[0 .. std.mem.indexOfScalar(u8, header, '\n') orelse header.len];
+            drawUnifiedHunkFrame(frame, app, hunk.start_line, hunk.end_line, title_line);
+        }
+    };
     var hl_start: usize = 0;
     var hl_end: usize = 0;
-    if (active) {
+    if (active and (app.staging_line_mode or app.staging_patch_mode)) {
         const anchor = app.staging_anchor orelse app.staging_cursor;
         hl_start = @min(anchor, app.staging_cursor);
         hl_end = @max(anchor, app.staging_cursor) + 1;
+        if (selected_hunk) |hunk| {
+            hl_start = @max(hl_start, hunk.start_line + 1);
+            hl_end = @min(hl_end, hunk.end_line);
+        }
     }
     const scroll: usize = if (active) app.main_scroll else 0;
     // Only the active pane scrolls horizontally; the read-only side stays at the
@@ -5387,7 +5439,7 @@ fn drawStagingPane(win: vaxis.Window, app: *const app_mod.App, text: []const u8,
             {
                 style.bg = .{ .index = 22 };
             }
-            if (act and abs_line >= hs and abs_line < he) style.bg = .{ .index = 8 };
+            if (act and abs_line >= hs and abs_line < he) applySel(&style, .active);
             return style;
         }
     }.f;
@@ -5445,36 +5497,42 @@ fn drawStagingPane(win: vaxis.Window, app: *const app_mod.App, text: []const u8,
     }
 }
 
-/// Split staging view: Unstaged on the left, Staged on the right, with the
+/// Split staging view: Unstaged above Staged, with the
 /// active side bordered as focused. The active side is `app.staging_diff`; the
 /// other is the read-only `app.staging_other_diff`.
 fn drawStagingSplit(root: vaxis.Window, app: *app_mod.App, x: u16, y: u16, w: u16, h: u16) void {
-    const left_w = w / 2;
+    const top_h = h / 2;
     const unstaged_active = !app.staging_staged_view;
     const unstaged_text = if (unstaged_active) app.staging_diff else app.staging_other_diff;
     const staged_text = if (unstaged_active) app.staging_other_diff else app.staging_diff;
     const focused = app.focus == .main;
-    // The active pane scrolls with main_scroll; the read-only one shows the top.
-    const unstaged_pos: usize = if (unstaged_active) app.main_scroll else 0;
-    const staged_pos: usize = if (unstaged_active) 0 else app.main_scroll;
     // Scrollbar length is visual rows when wrapping, source lines otherwise.
     const rowsOf = struct {
         fn f(a: *app_mod.App, text: []const u8, panel_w: u16) usize {
             // Cached line index / wrap rows, not a fresh per-frame scan.
             if (!a.wrap_diff) return app_mod.lineOffsets(a.allocator, text).len;
-            return app_mod.wrapRowsFor(a.allocator, text, panel_w -| 2).len;
+            return app_mod.wrapRowsFor(a.allocator, text, stagingContentWidth(a, panel_w -| 2)).len;
         }
     }.f;
-    const left = panel(root, x, y, left_w, h, titleWithWrap(app, "Unstaged", &main_title_wrap_buf), focused and unstaged_active, .{ .len = rowsOf(app, unstaged_text, left_w), .pos = unstaged_pos });
-    const right = panel(root, x + left_w, y, w - left_w, h, titleWithWrap(app, "Staged", &split_title_buf), focused and !unstaged_active, .{ .len = rowsOf(app, staged_text, w - left_w), .pos = staged_pos });
-    app.main_view_height = if (unstaged_active) left.height else right.height;
-    app.main_view_width = if (unstaged_active) left.width else right.width;
+    const top = panel(root, x, y, w, top_h, titleWithWrap(app, "Unstaged", &main_title_wrap_buf), focused and unstaged_active, null);
+    const bottom = panel(root, x, y + top_h, w, h - top_h, titleWithWrap(app, "Staged", &split_title_buf), focused and !unstaged_active, null);
+    const active = if (unstaged_active) top else bottom;
+    const width = stagingContentWidth(app, active.width);
+    const resized = active.height < app.main_view_height or (app.wrap_diff and width != app.main_view_width);
+    app.main_view_height = active.height;
+    app.main_view_width = width;
+    if (resized and active.height > 0) staging_mod.scrollToStagingCursor(app);
+    if (w >= 4) {
+        const right = x + w - 1;
+        drawScrollbarRange(root, right, y + 1, top.height, rowsOf(app, unstaged_text, w), if (unstaged_active) app.main_scroll else 0, focused and unstaged_active);
+        drawScrollbarRange(root, right, y + top_h + 1, bottom.height, rowsOf(app, staged_text, w), if (unstaged_active) 0 else app.main_scroll, focused and !unstaged_active);
+    }
     // The active side (`staging_diff`) is the `.main` selection pane; the
     // read-only side is `.other` — matching `App.paneRectFor`.
-    const left_pane: app_mod.SelPane = if (unstaged_active) .main else .other;
-    const right_pane: app_mod.SelPane = if (unstaged_active) .other else .main;
-    drawStagingPane(left, app, unstaged_text, unstaged_active, "No unstaged changes", left_pane);
-    drawStagingPane(right, app, staged_text, !unstaged_active, "No staged changes", right_pane);
+    const top_pane: app_mod.SelPane = if (unstaged_active) .main else .other;
+    const bottom_pane: app_mod.SelPane = if (unstaged_active) .other else .main;
+    drawStagingPane(top, app, unstaged_text, unstaged_active, "No unstaged changes", top_pane);
+    drawStagingPane(bottom, app, staged_text, !unstaged_active, "No staged changes", bottom_pane);
 }
 
 fn drawBottom(win: vaxis.Window, app: *app_mod.App) void {
@@ -5909,7 +5967,7 @@ fn fileFooterHints(c: FooterCtx, comptime global: []const u8) []const u8 {
             inline for (.{ false, true }) |rebasing| {
                 if (c.rebasing == rebasing) {
                     const rebase = if (rebasing) "m continue/abort  " else "";
-                    if (c.staging) break :blk rebase ++ "j/k line  J/K hunk  v range  space stage/unstage  d discard (@@=hunk)  [/] staged/unstaged  \\ split  | side-by-side  " ++ commit ++ amend ++ "  e edit  esc back" ++ global;
+                    if (c.staging) break :blk rebase ++ "j/k move  a line/hunk  v range  space stage/unstage  d discard  [/] staged/unstaged  \\ split  | side-by-side  " ++ commit ++ amend ++ "  e edit  esc back" ++ global;
                     if (c.focus == .staged) break :blk rebase ++ "space unstage  a unstage all  " ++ commit ++ amend ++ "  enter hunks  ` tree  ~ fold tree" ++ exit_amend ++ global;
                     break :blk rebase ++ "space stage  a all  " ++ commit ++ amend ++ no_verify ++ "  e edit  d discard  i ignore/exclude  y copy  ^f fixup-base  s stash  / filter  ` tree  enter hunks  [/] tabs" ++ exit_amend ++ global;
                 }
@@ -6588,6 +6646,86 @@ test "reflog rows show Git's selectors and actions even for the same commit" {
     }
 }
 
+test "stacked staging keeps the hunk border in both selection modes" {
+    const allocator = std.testing.allocator;
+    defer app_mod.deinitLineIndexCache();
+    defer deinitWordCache();
+    var screen = try vaxis.Screen.init(allocator, .{ .cols = 60, .rows = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(allocator);
+    const root: vaxis.Window = .{
+        .screen = &screen,
+        .width = screen.width,
+        .height = screen.height,
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+    };
+    var diff = "diff --git a/x b/x\n@@ -1 +1,2 @@\n context\n+added\n".*;
+    var parsed = try @import("diff.zig").parse(allocator, &diff);
+    defer parsed.deinit(allocator);
+    var app: app_mod.App = .{
+        .allocator = allocator,
+        .git = undefined,
+        .config = .{},
+        .focus = .main,
+        .staging_active = true,
+        .staging_split = true,
+        .staging = parsed,
+        .staging_diff = &diff,
+        .staging_cursor = 2,
+    };
+    app.panel_rects[0] = .{ .focus = .main, .x = 0, .y = 0, .w = root.width, .h = root.height };
+    app.panel_rect_count = 1;
+    drawStagingSplit(root, &app, 0, 0, root.width, root.height);
+    try std.testing.expectEqualStrings("U", root.readCell(2, 0).?.char.grapheme);
+    try std.testing.expectEqualStrings("S", root.readCell(2, 10).?.char.grapheme);
+    try std.testing.expect(app.paneRectFor(.other).?.contains(2, 11));
+    try std.testing.expectEqualStrings("╭", root.readCell(1, 2).?.char.grapheme);
+    try std.testing.expectEqualStrings("│", root.readCell(1, 3).?.char.grapheme);
+    try std.testing.expectEqual(vaxis.Color.default, root.readCell(3, 3).?.style.bg);
+
+    staging_mod.toggleStagingSelection(&app);
+    drawStagingSplit(root, &app, 0, 0, root.width, root.height);
+    try std.testing.expectEqualStrings("│", root.readCell(1, 3).?.char.grapheme);
+    try std.testing.expectEqual(vaxis.Color{ .index = ui_theme.selected_bg }, root.readCell(3, 3).?.style.bg);
+}
+
+test "stacked staging reveals a selection visible in single view" {
+    const allocator = std.testing.allocator;
+    defer app_mod.deinitLineIndexCache();
+    defer deinitWordCache();
+    var screen = try vaxis.Screen.init(allocator, .{ .cols = 60, .rows = 20, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(allocator);
+    const root: vaxis.Window = .{
+        .screen = &screen,
+        .width = screen.width,
+        .height = screen.height,
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+    };
+    var diff = ("diff --git a/x b/x\n@@ -1 +1,13 @@\n context\n" ++ "+added\n+added\n+added\n+added\n+added\n+added\n+added\n+added\n+added\n+added\n+added\n+added\n" ++ "@@ -30 +42,2 @@\n context\n+last\n").*;
+    var parsed = try @import("diff.zig").parse(allocator, &diff);
+    defer parsed.deinit(allocator);
+    var app: app_mod.App = .{
+        .allocator = allocator,
+        .git = undefined,
+        .config = .{},
+        .focus = .main,
+        .staging_active = true,
+        .staging_split = true,
+        .staging = parsed,
+        .staging_diff = &diff,
+        .staging_cursor = 15,
+        .main_view_height = 20,
+    };
+    drawStagingSplit(root, &app, 0, 0, root.width, root.height);
+    const cursor = app.firstVisualRowOfLine(app.staging_cursor);
+    try std.testing.expect(cursor >= app.main_scroll and cursor < app.main_scroll + app.main_view_height);
+}
+
 test "narrow review highlights the cursor without reversing the hunk header" {
     const allocator = std.testing.allocator;
     defer app_mod.deinitHunkLinesCache();
@@ -6618,15 +6756,16 @@ test "narrow review highlights the cursor without reversing the hunk header" {
             .main_view_width = 98,
             .main_view_height = 7,
             .review_line_cursor = 2,
+            .review_line_mode = true,
             .wrap_diff = wrap,
         };
         try std.testing.expect(app.splitActive());
         const narrow = root.child(.{ .width = 60 });
         drawDiffReview(narrow, &app);
         try std.testing.expect(!app.splitActive());
-        try std.testing.expectEqualStrings("@", narrow.readCell(1, 2).?.char.grapheme);
-        try std.testing.expectEqualStrings("-", narrow.readCell(1, 4).?.char.grapheme);
-        try std.testing.expectEqual(vaxis.Color{ .index = ui_theme.selected_bg }, narrow.readCell(1, 4).?.style.bg);
+        try std.testing.expectEqualStrings("╭", narrow.readCell(1, 2).?.char.grapheme);
+        try std.testing.expectEqualStrings("-", narrow.readCell(2, 4).?.char.grapheme);
+        try std.testing.expectEqual(vaxis.Color{ .index = ui_theme.selected_bg }, narrow.readCell(2, 4).?.style.bg);
         try std.testing.expect(!narrow.readCell(1, 2).?.style.reverse);
     }
 }

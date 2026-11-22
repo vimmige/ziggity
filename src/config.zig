@@ -96,10 +96,7 @@ pub const KeyMap = struct {
     // Open the AI-generate menu on the Branches/Commits panels (PR description).
     // Only acts when `ai_command` is set. Mirrors the commit dialog's ctrl+g.
     ai_generate: Binding = .{ .codepoint = 'g', .ctrl = true },
-    // In the staging view: jump the cursor to the next / previous hunk header.
-    // shift+down / shift+up trigger these too (see the key handler).
-    staging_next_hunk: Binding = .{ .codepoint = 'J' },
-    staging_prev_hunk: Binding = .{ .codepoint = 'K' },
+    diff_selection_toggle: Binding = .{ .codepoint = 'a' },
     // In the commit-graph viewer: jump the cursor to the current commit's first parent.
     graph_first_parent: Binding = .{ .codepoint = 'p' },
     // In the commit-graph viewer: jump the cursor to the current commit (HEAD).
@@ -386,7 +383,7 @@ pub const Config = struct {
     /// Default staging-view layout: `off`, `on`, or `auto` (the default — split
     /// only when a file has both staged and unstaged changes). `\` toggles the
     /// view at runtime; see README for the full remember-vs-reset behavior.
-    staging_split: StagingSplitMode = .auto,
+    staging_split: StagingSplitMode = .on,
     result_dialog: ResultDialog = .on_error,
     command_output: CommandOutput = .show,
     /// Seconds between idle background working-tree refreshes (`git status` off
@@ -817,7 +814,7 @@ test "config parser applies result-dialog, command-output, and skip-confirm flag
     try std.testing.expectEqual(ResultDialog.on_error, cfg.result_dialog);
     try std.testing.expectEqual(CommandOutput.show, cfg.command_output);
     try std.testing.expectEqual(model.BranchSortOrder.date, cfg.branch_sort_order);
-    try std.testing.expectEqual(StagingSplitMode.auto, cfg.staging_split); // auto by default
+    try std.testing.expectEqual(StagingSplitMode.on, cfg.staging_split);
     try std.testing.expect(!cfg.skip_confirm.discard_all);
     try std.testing.expect(!cfg.skip_confirm.amend); // amend confirms by default
     try std.testing.expectEqual(model.CommitGraphMode.on, cfg.commit_graph); // graph on by default

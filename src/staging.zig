@@ -125,6 +125,7 @@ pub fn loadStagingSide(app: *App, keep_cursor: bool, allow_flip: bool) !void {
     } else {
         app.staging_cursor = stagingFirstLine(app);
     }
+    if (app.staging_line_mode) moveOffHunkHeader(app);
     scrollToStagingCursor(app);
 }
 
@@ -154,7 +155,22 @@ pub fn toggleStagingSplit(app: *App) !void {
     try app.setMessage("{s} staging view", .{if (app.staging_split) "split" else "single"});
 }
 
+pub fn toggleStagingSelection(app: *App) void {
+    app.staging_line_mode = !app.staging_line_mode;
+    app.staging_anchor = null;
+    if (app.staging_line_mode) moveOffHunkHeader(app);
+    scrollToStagingCursor(app);
+}
+
+fn moveOffHunkHeader(app: *App) void {
+    const idx = stagingHunkAt(app, app.staging_cursor) orelse return;
+    const hunk = app.staging.?.hunks[idx];
+    if (app.staging_cursor == hunk.start_line and hunk.start_line + 1 < hunk.end_line)
+        app.staging_cursor += 1;
+}
+
 pub fn toggleStagingRange(app: *App) void {
+    if (!app.staging_line_mode and !app.staging_patch_mode) return;
     app.staging_anchor = if (app.staging_anchor == null) app.staging_cursor else null;
 }
 
@@ -172,6 +188,8 @@ pub fn stagingLastLine(app: *const App) usize {
 }
 
 pub fn moveStagingCursor(app: *App, delta: i8) void {
+    if (!app.staging_line_mode and !app.staging_patch_mode)
+        return moveStagingHunk(app, delta > 0);
     const first = stagingFirstLine(app);
     const last = stagingLastLine(app);
     if (delta < 0) {
@@ -179,30 +197,25 @@ pub fn moveStagingCursor(app: *App, delta: i8) void {
     } else if (app.staging_cursor < last) {
         app.staging_cursor += 1;
     }
+    if (!app.staging_patch_mode) {
+        if (stagingHunkAt(app, app.staging_cursor)) |idx| {
+            const header = app.staging.?.hunks[idx].start_line;
+            if (app.staging_cursor == header) {
+                if (delta < 0 and header > first) app.staging_cursor -= 1 else moveOffHunkHeader(app);
+            }
+        }
+    }
     scrollToStagingCursor(app);
 }
 
-/// Jump the cursor to the `@@` header of the previous or next hunk, so you can
-/// skip whole hunks instead of stepping line by line. From inside a hunk,
-/// "previous" lands on that hunk's own header first, then earlier ones. A no-op
-/// past the first/last hunk. Drops any in-progress range (this is navigation).
-pub fn moveStagingHunk(app: *App, forward: bool) void {
+fn moveStagingHunk(app: *App, forward: bool) void {
     const parsed = app.staging orelse return;
-    if (parsed.hunks.len == 0) return;
-    const cur = stagingHunkAt(app, app.staging_cursor) orelse 0;
-    var target: usize = cur;
-    if (forward) {
-        if (cur + 1 >= parsed.hunks.len) return; // already at the last hunk
-        target = cur + 1;
-    } else if (app.staging_cursor > parsed.hunks[cur].start_line) {
-        target = cur; // from a body line, snap to this hunk's header
-    } else {
-        if (cur == 0) return; // already at the first hunk's header
-        target = cur - 1;
-    }
+    const cur = stagingHunkAt(app, app.staging_cursor) orelse return;
+    const target = if (forward) cur + 1 else cur -| 1;
+    if (target == cur or target >= parsed.hunks.len) return;
     app.staging_anchor = null;
     app.staging_cursor = parsed.hunks[target].start_line;
-    scrollToStagingCursor(app);
+    app.main_scroll = app.firstVisualRowOfLine(app.staging_cursor);
 }
 
 /// Move the line cursor to a mouse-clicked line. `pane` says which diff pane was
@@ -214,17 +227,26 @@ pub fn clickStagingLine(app: *App, pane: app_mod.SelPane, line: usize) !void {
     if (pane == .other) try toggleStagingSide(app);
     const first = stagingFirstLine(app);
     const last = stagingLastLine(app);
-    app.staging_anchor = null; // a plain click starts a fresh single-line selection
-    app.staging_cursor = if (line < first) first else if (line > last) last else line;
+    const clicked = std.math.clamp(line, first, last);
+    app.staging_anchor = null;
+    if (app.staging_line_mode or app.staging_patch_mode) {
+        app.staging_cursor = clicked;
+        if (app.staging_line_mode) moveOffHunkHeader(app);
+    } else if (stagingHunkAt(app, clicked)) |idx| {
+        if (stagingHunkAt(app, app.staging_cursor) != idx)
+            app.staging_cursor = app.staging.?.hunks[idx].start_line;
+    }
     scrollToStagingCursor(app);
 }
 
 pub fn scrollToStagingCursor(app: *App) void {
+    if (app.mode == .diff_review) return;
     const height: usize = if (app.main_view_height == 0) 20 else app.main_view_height;
-    if (app.staging_cursor < app.main_scroll) {
-        app.main_scroll = app.staging_cursor;
-    } else if (app.staging_cursor >= app.main_scroll + height) {
-        app.main_scroll = app.staging_cursor + 1 - height;
+    const row = app.firstVisualRowOfLine(app.staging_cursor);
+    if (row < app.main_scroll) {
+        app.main_scroll = row;
+    } else if (row >= app.main_scroll + height) {
+        app.main_scroll = row + 1 - height;
     }
 }
 
@@ -321,27 +343,23 @@ pub fn applyStagingSelection(app: *App) !void {
         return;
     };
     const hunk = parsed.hunks[hunk_index];
-    // Whether the cursor was on the `@@` header (whole-hunk stage) — captured
-    // before the reload clamps the cursor, since it drives the message scope and
-    // whether we auto-advance to the next change afterwards.
-    const on_header = app.staging_cursor == hunk.start_line;
-
-    // On the `@@` header line, stage the whole hunk; otherwise the lines.
-    const patch = if (on_header)
+    const whole_hunk = !app.staging_line_mode;
+    if (!whole_hunk and app.staging_cursor == hunk.start_line) return app.setMessage("selection contains no change", .{});
+    const patch = if (whole_hunk)
         try diff_mod.buildHunkPatch(app.allocator, app.staging_diff, parsed, hunk_index)
     else blk: {
         const lo_abs = @min(app.staging_anchor orelse app.staging_cursor, app.staging_cursor);
         const hi_abs = @max(app.staging_anchor orelse app.staging_cursor, app.staging_cursor);
         const body_first = hunk.start_line + 1;
         const lo = (@max(lo_abs, body_first)) - body_first;
-        const hi = (@min(hi_abs, hunk.end_line - 1)) - body_first;
+        const hi = @min(hi_abs, hunk.end_line - 1) -| body_first;
         break :blk diff_mod.buildLinePatch(app.allocator, app.staging_diff, parsed, hunk_index, lo, hi, app.staging_staged_view) catch |err| switch (err) {
             error.EmptySelection => {
                 try app.setMessage("selection contains no change", .{});
                 return;
             },
             error.NoNewlineHunk => {
-                try app.setMessage("stage the whole hunk for no-newline changes (enter on @@)", .{});
+                try app.setMessage("stage the whole hunk for no-newline changes (press a for hunks)", .{});
                 return;
             },
             error.InvalidHunk => {
@@ -362,9 +380,10 @@ pub fn applyStagingSelection(app: *App) !void {
         return;
     }
     const verb = if (app.staging_staged_view) "unstaged" else "staged";
-    const scope = if (on_header) "hunk" else "selection";
+    const scope = if (whole_hunk) "hunk" else "selection";
     try app.setMessage("{s} {s}", .{ verb, scope });
     app.staging_anchor = null;
+    if (whole_hunk) app.staging_cursor = hunk.start_line;
     // Staging a line only touches the index — scoped (fast) reload. Keep the
     // cursor where it is so repeated space keeps staging the lines that shift up
     // into its position, and don't flip to the other side when this one empties.
@@ -374,15 +393,11 @@ pub fn applyStagingSelection(app: *App) !void {
     // of stalling: a line stage moves to the next change (context between changes,
     // or the last change below now gone, would otherwise strand it); a whole-hunk
     // stage moves to the next hunk header, staying in the hunk-level workflow.
-    if (on_header) advanceToNextHunk(app) else advanceToNextStageable(app);
+    if (whole_hunk) advanceToNextHunk(app) else advanceToNextStageable(app);
 }
 
-/// `d` in the staging view: discard the change under the cursor instead of
-/// staging it. Selection works exactly like `space` — on a `@@` header the
-/// whole hunk goes, otherwise the selected line(s). The active side decides the
-/// target: on the unstaged side the change is dropped from the working tree; on
-/// the staged side it is dropped from both the index and the working tree, so it
-/// is gone entirely. Destructive and immediate (no confirmation), like `space`.
+/// Discard follows the same selection as staging. On the staged side it
+/// removes the change from both the index and the working tree.
 pub fn discardStagingSelection(app: *App) !void {
     const parsed = app.staging orelse return;
     if (parsed.hunks.len == 0) {
@@ -394,7 +409,7 @@ pub fn discardStagingSelection(app: *App) !void {
         return;
     };
     const hunk = parsed.hunks[hunk_index];
-    const whole_hunk = app.staging_cursor == hunk.start_line;
+    const whole_hunk = !app.staging_line_mode;
 
     // The discard patch is oriented against the current file state (the working
     // tree on the unstaged side, the index on the staged side), which already
@@ -406,6 +421,7 @@ pub fn discardStagingSelection(app: *App) !void {
     // "new file ... depends on old contents". The whole-hunk case is unaffected
     // (reversing the full creation just removes the file).
     var forward = false;
+    if (!whole_hunk and app.staging_cursor == hunk.start_line) return app.setMessage("selection contains no change", .{});
     const patch = if (whole_hunk)
         try diff_mod.buildHunkPatch(app.allocator, app.staging_diff, parsed, hunk_index)
     else blk: {
@@ -413,7 +429,7 @@ pub fn discardStagingSelection(app: *App) !void {
         const hi_abs = @max(app.staging_anchor orelse app.staging_cursor, app.staging_cursor);
         const body_first = hunk.start_line + 1;
         const lo = (@max(lo_abs, body_first)) - body_first;
-        const hi = (@min(hi_abs, hunk.end_line - 1)) - body_first;
+        const hi = @min(hi_abs, hunk.end_line - 1) -| body_first;
         const new_file = diff_mod.isNewFileDiff(app.staging_diff, parsed);
         forward = new_file;
         const built = if (new_file)
@@ -426,7 +442,7 @@ pub fn discardStagingSelection(app: *App) !void {
                 return;
             },
             error.NoNewlineHunk => {
-                try app.setMessage("discard the whole hunk for no-newline changes (enter on @@)", .{});
+                try app.setMessage("discard the whole hunk for no-newline changes (press a for hunks)", .{});
                 return;
             },
             error.InvalidHunk => {
@@ -452,6 +468,7 @@ pub fn discardStagingSelection(app: *App) !void {
     const scope = if (whole_hunk) "hunk" else "selection";
     try app.setMessage("discarded {s}", .{scope});
     app.staging_anchor = null;
+    if (whole_hunk) app.staging_cursor = hunk.start_line;
     // Discarding rewrites the working tree (and, on the staged side, the index),
     // so refresh the file list and reload the staging diff. Keep the cursor put
     // so repeated `d` keeps discarding whatever shifts into its position, and
@@ -483,6 +500,7 @@ pub fn clearStaging(app: *App) void {
     app.allocator.free(app.staging_path);
     app.staging_path = &.{};
     app.staging_active = false;
+    app.staging_line_mode = false;
     app.staging_staged_view = false;
     app.staging_cursor = 0;
     app.staging_anchor = null;
